@@ -1,78 +1,47 @@
-# NetNinja 🥷
-**The Ultimate Stealth Browser & High-Speed Proxy Tunnel**
+# NetNinja Proxy 🥷 
+**The High-Speed Stealth Proxy Tunnel with Built-in DNS Security**
 
-NetNinja is a dual-mode content access solution designed to bypass DNS filters, firewalls, and network restrictions while maintaining high performance for gaming (y8.com) and streaming.
+NetNinja is a lightweight, high-performance proxy solution designed to bypass DNS filters and network restrictions. It's optimized for stability, lower latency, and ease of use on devices like iPads and iPhones.
 
-## 🚀 Modes
+## ✨ Key Features
 
-### 1. HTTP/HTTPS Proxy Tunnel (Best for Gaming)
-A lightweight, high-performance proxy that offloads DNS resolution to the server while allowing your local device (iPad/PC) to render content natively.
-*   **Zero Lag**: Games run on your device's GPU.
-*   **Stealth**: Looks like normal HTTPS traffic.
-*   **Multi-User**: Share access with friends via unique credentials.
+*   **⚡ High-Speed Connection**: Optimization for lower latency (Nagle's Algorithm off), making it ideal for gaming and streaming.
+*   **🔒 Secure DNS**: Automatically bypasses local DNS filters by using **Google DNS (8.8.8.8)** and **Cloudflare (1.1.1.1)** for all name resolutions.
+*   **🔓 Open Access**: No authentication required! Just connect and browse instantly without any password prompts.
+*   **🕵️ Stealth Mode**: Offloads DNS resolution to the server, so your local device only makes simple proxy connections.
 
-### 2. Remote Browser (Best for Privacy/Security)
-A full cloud-hosted Chrome instance that streams the display to your device.
-*   **Total Isolation**: No code runs on your device.
-*   **Persistent Session**: Downloads/Games continue even if you disconnect.
-*   **480p Turbo**: Optimized for low-bandwidth connections.
-
----
-
-## 🛠️ Quick Start (Proxy Mode)
+## 🛠️ Quick Start
 
 ### Prerequisites
 *   Node.js (v18+)
-*   A VPS or PC to run the server
 
-### Installation
-1.  Clone the repository
+### Installation & Run
+1.  Clone the repository.
 2.  Install dependencies:
     ```bash
     npm install
     ```
-3.  Configure `.env` (Create file if not exists):
-    ```env
-    PORT=8080
-    # Format: user:pass,user2:pass2
-    PROXY_USERS=admin:1234,friend:5678
-    ```
-4.  Run the proxy:
+3.  Run the proxy:
     ```bash
     node proxy.js
     ```
 
-### Client Setup (iPad/iPhone)
+---
+
+## 📱 Client Setup (iPad/iPhone)
+
 1.  Go to **Settings** > **Wi-Fi**.
-2.  Tap **(i)** next to your Wi-Fi name.
-3.  Scroll to **HTTP Proxy** > **Configure Proxy**.
-4.  Select **Manual**:
+2.  Tap the **(i)** next to your connected Wi-Fi.
+3.  Scroll down to **HTTP Proxy** and select **Configure Proxy**.
+4.  Choose **Manual**:
     *   **Server**: `<YOUR_SERVER_IP>`
-    *   **Port**: `8080`
-    *   **Authentication**: On
-    *   **Username/Password**: (Use values from `.env`)
+    *   **Port**: `8080` (or the port displayed in the console)
+    *   **Authentication**: **OFF**
+5.  Save and start browsing!
 
 ---
 
-## 🖥️ Quick Start (Remote Browser Mode)
-
-### Usage
-1.  Run the browser server:
-    ```bash
-    node server.js
-    ```
-2.  Open `http://<YOUR_SERVER_IP>:3000` in any browser.
-3.  Enjoy full persistent browsing!
-
----
-
-## ☁️ Deployment (Render.com / VPS)
-
-### Render.com
-1.  Push code to GitHub.
-2.  Create new **Web Service**.
-3.  Set Start Command: `node proxy.js`.
-4.  Add Environment Variables from `.env`.
+## ☁️ Deployment
 
 ### VPS (DigitalOcean / AWS)
 Use PM2 to keep it running 24/7:
@@ -82,6 +51,8 @@ pm2 start proxy.js --name "netninja-proxy"
 pm2 save
 pm2 startup
 ```
+
+---
 
 ## ⚠️ Disclaimer
 This tool is for educational purposes and authorized network testing only.
