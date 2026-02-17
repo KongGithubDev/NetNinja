@@ -2,57 +2,38 @@ require('dotenv').config();
 const http = require('http');
 const net = require('net');
 const url = require('url');
+const dns = require('dns');
+
+// Configure custom DNS (Google and Cloudflare)
+dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1']);
+
+/**
+ * Resolves a hostname to an IPv4 address using custom DNS servers.
+ */
+function resolveHost(hostname) {
+    return new Promise((resolve, reject) => {
+        if (net.isIP(hostname)) return resolve(hostname);
+        dns.resolve4(hostname, (err, addresses) => {
+            if (err || !addresses || addresses.length === 0) {
+                dns.lookup(hostname, { family: 4 }, (err2, address) => {
+                    if (err2 || !address) return reject(err2 || new Error('Host resolution failed'));
+                    resolve(address);
+                });
+                return;
+            }
+            resolve(addresses[0]);
+        });
+    });
+}
 
 const PORT = process.env.PORT || 8080;
 
-// Security: Load Users
-const users = new Map();
-
-// 1. Load from PROXY_USERS (user1:pass1,user2:pass2)
-if (process.env.PROXY_USERS) {
-    process.env.PROXY_USERS.split(',').forEach(pair => {
-        const [u, p] = pair.trim().split(':');
-        if (u && p) users.set(u, p);
-    });
-}
-// 2. Load legacy single user (fallback)
-if (process.env.PROXY_USER && process.env.PROXY_PASS) {
-    users.set(process.env.PROXY_USER, process.env.PROXY_PASS);
-}
-
-if (users.size === 0) {
-    console.warn("WARNING: No users configured! Proxy is open or broken.");
-} else {
-    console.log(`Loaded ${users.size} users.`);
-}
-
-function checkAuth(req, res) {
-    const auth = req.headers['proxy-authorization'];
-    if (!auth) return false;
-
-    // auth is "Basic base64string"
-    const [scheme, credentials] = auth.split(' ');
-    if (scheme !== 'Basic' || !credentials) return false;
-
-    const [user, pass] = Buffer.from(credentials, 'base64').toString().split(':');
-    return users.has(user) && users.get(user) === pass;
-}
-
-function requestAuth(res) {
-    res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="Internet Access"' });
-    res.end('Proxy Authentication Required');
-}
-
 const server = http.createServer((req, res) => {
-    // Render.com Health Check (Bypass Auth)
+    // Render.com Health Check (Base route)
     if (req.url === '/healthz' || req.url === '/') {
         res.writeHead(200);
-        res.end('Proxy Active');
+        res.end('NetNinja Proxy: Active (Open Mode)');
         return;
-    }
-
-    if (!checkAuth(req, res)) {
-        return requestAuth(res);
     }
 
     // Handle standard HTTP requests
@@ -64,35 +45,37 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    const proxyReq = http.request({
-        host: parsedUrl.hostname,
-        port: parsedUrl.port || 80,
-        path: parsedUrl.path,
-        method: req.method,
-        headers: req.headers
-    }, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res);
-    });
+    // Resolve host using custom DNS
+    resolveHost(parsedUrl.hostname).then(ip => {
+        const proxyReq = http.request({
+            host: ip,
+            port: parsedUrl.port || 80,
+            path: parsedUrl.path,
+            method: req.method,
+            headers: {
+                ...req.headers,
+                'Host': parsedUrl.hostname
+            }
+        }, (proxyRes) => {
+            res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            proxyRes.pipe(res);
+        });
 
-    req.pipe(proxyReq);
+        req.pipe(proxyReq);
 
-    proxyReq.on('error', (e) => {
-        console.error('HTTP Proxy Error:', e.message);
-        res.end();
+        proxyReq.on('error', (e) => {
+            console.error('HTTP Proxy Error:', e.message);
+            res.end();
+        });
+    }).catch(err => {
+        console.error('DNS Error (HTTP):', err.message);
+        res.writeHead(502);
+        res.end('DNS Resolution Failed');
     });
 });
 
-// Handle HTTPS CONNECT Tunneling (The most important part for Y8/Modern Web)
+// Handle HTTPS CONNECT Tunneling
 server.on('connect', (req, clientSocket, head) => {
-    if (!checkAuth(req)) {
-        clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\n' +
-            'Proxy-Authenticate: Basic realm="Node Proxy"\r\n' +
-            '\r\n');
-        clientSocket.end();
-        return;
-    }
-
     const { port, hostname } = url.parse(`//${req.url}`, false, true);
 
     if (!hostname || !port) {
@@ -102,64 +85,49 @@ server.on('connect', (req, clientSocket, head) => {
 
     console.log(`Tunneling: ${hostname}:${port}`);
 
-    // 1. Error handling MUST be attached immediately to clientSocket
-    clientSocket.on('error', (e) => {
-        if (!serverSocket || serverSocket.destroyed) return;
-        serverSocket.end();
+    clientSocket.on('error', () => {
+        if (serverSocket) serverSocket.end();
     });
 
     let serverSocket;
-    try {
-        serverSocket = net.connect(port, hostname, () => {
-            // Standard Tunnel Response (Stealth Mode)
-            clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    resolveHost(hostname).then(ip => {
+        try {
+            serverSocket = net.connect(port, ip, () => {
+                clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+                serverSocket.write(head);
+                serverSocket.pipe(clientSocket);
+                clientSocket.pipe(serverSocket);
+            });
 
-            serverSocket.write(head);
-            serverSocket.pipe(clientSocket);
-            clientSocket.pipe(serverSocket);
-        });
+            clientSocket.setNoDelay(true);
+            serverSocket.setNoDelay(true);
 
-        // Optimization: Disable Nagle's algorithm for lower latency (Y8/Gaming)
-        clientSocket.setNoDelay(true);
-        serverSocket.setNoDelay(true);
-
-        // 2. Error handling MUST be attached immediately to serverSocket
-        serverSocket.on('error', (e) => {
-            if (!clientSocket.destroyed) clientSocket.end();
-        });
-    } catch (err) {
-        clientSocket.end();
-    }
+            serverSocket.on('error', () => {
+                if (!clientSocket.destroyed) clientSocket.end();
+            });
+        } catch (err) {
+            clientSocket.end();
+        }
+    }).catch(err => {
+        console.error('DNS Error (CONNECT):', err.message);
+        clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    });
 });
 
-// Prevent crashes from random socket errors
+// Crash prevention
 process.on('uncaughtException', (err) => {
-    if (err.code === 'ECONNRESET' || err.code === 'EPIPE' || err.code === 'ETIMEDOUT') {
-        // These are normal network disconnects, ignore them
-        return;
-    }
+    if (['ECONNRESET', 'EPIPE', 'ETIMEDOUT'].includes(err.code)) return;
     console.error('UNCAUGHT EXCEPTION:', err);
 });
 
 server.on('clientError', (err, socket) => {
-    if (err.code === 'ECONNRESET' || !socket.writable) {
-        return;
-    }
+    if (err.code === 'ECONNRESET' || !socket.writable) return;
     socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n=== HTTP Proxy Server Running on Port ${PORT} ===`);
-    console.log(`Please configure your iPad Wi-Fi Proxy to:`);
-    const { networkInterfaces } = require('os');
-    const nets = networkInterfaces();
-    for (const name of Object.keys(nets)) {
-        for (const net of nets[name]) {
-            if (net.family === 'IPv4' && !net.internal) {
-                console.log(`SERVER: ${net.address}`);
-                console.log(`PORT:   ${PORT}`);
-            }
-        }
-    }
+    console.log(`\n=== NetNinja Open Proxy Running on Port ${PORT} ===`);
+    console.log(`Security: Open Bypass (No Authentication Required)`);
+    console.log(`DNS: Specialized (Google 8.8.8.8 / Cloudflare 1.1.1.1)`);
     console.log('==============================================\n');
 });
