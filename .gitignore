@@ -1,0 +1,45 @@
+# User credentials (NEVER COMMIT THIS!)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Editor Directories
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Render / Build
+dist/
+build/
+coverage/
+tsc_output/
+
+# Testing
+playwright-report/
+test-results/

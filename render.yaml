@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: y8-proxy-bypass
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node proxy.js
+    envVars:
+      - key: PROXY_USER
+        value: admin
+      - key: PROXY_PASS
+        generateValue: true
+      - key: PORT
+        value: 10000
