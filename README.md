@@ -1,64 +1,103 @@
 # NetNinja Proxy
 
-High-performance HTTP/HTTPS forward proxy built in Go. Bypasses DNS filters using Google & Cloudflare DNS servers.
+High-performance DNS-bypass proxy written in Go. Routes traffic through Google/Cloudflare DNS to bypass DNS filters while allowing specific domains (e.g. GeForce Now) to connect directly.
 
 ## Features
 
-- ⚡ **Go-powered** — goroutine-per-connection, handles thousands of concurrent connections
-- 🌐 **HTTP Forwarding** — with connection pooling (200 idle conns)
-- 🔒 **HTTPS CONNECT Tunneling** — full TLS passthrough
-- 🛡️ **Custom DNS** — Google (8.8.8.8) & Cloudflare (1.1.1.1), bypasses DNS-level blocking
-- 📦 **Single binary** — no dependencies, no `npm install`
-- 🚀 **Render.com ready** — deploy with one click
+- **DNS Bypass** — Uses Google (8.8.8.8) / Cloudflare (1.1.1.1) DNS
+- **HTTPS CONNECT** — Full HTTPS tunneling support
+- **PAC File** — Auto-generated proxy auto-config for selective routing
+- **HTTPS/TLS** — Optional Let's Encrypt auto-cert
+- **GFN Bypass** — GeForce Now / NVIDIA traffic goes DIRECT (no proxy overhead)
+- **Zero Dependencies** — Single Go binary, cross-platform
 
 ## Quick Start
 
-### Windows
-```batch
-run.bat
-```
-
-### Manual
+### Local (HTTP)
 ```bash
 # Build
 go build -o proxy.exe proxy.go
 
-# Run (default port 8080)
-set PORT=5987
-proxy.exe
+# Run
+PORT=5987 ./proxy.exe
 ```
 
-### Use as Proxy
-Set your Wi-Fi / browser proxy settings to:
+### VPS (HTTPS with Let's Encrypt)
+```bash
+DOMAIN=proxy.yourdomain.com ./proxy
 ```
-HTTP Proxy: localhost
-Port: 5987
-```
+Requires port 80 + 443 open. DNS A record must point to VPS IP (Cloudflare DNS-only/gray cloud).
 
-## Deploy (Render.com)
+## Endpoints
 
-1. Push to GitHub
-2. Connect repo on [Render.com](https://render.com)
-3. `render.yaml` auto-configures everything (Go runtime, port 10000)
+| Path | Description |
+|------|-------------|
+| `/proxy.pac` | PAC file for auto-proxy config |
+| `/status` | Status page + connectivity test |
+| `/` | Health check |
+
+## iPad Setup
+
+1. **Settings** → **Wi-Fi** → **(i)** → **Configure Proxy** → **Automatic**
+2. URL: `http://YOUR_IP:5987/proxy.pac`
+3. Save
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `proxy.go` | Main proxy server (Go) — HTTP/HTTPS |
+| `proxy.js` | Node.js proxy with PAC support |
+| `debug.js` | Debug proxy with detailed IN/OUT logging |
+| `dns.go` | DNS-over-HTTPS forwarder |
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT`   | `8080`  | Proxy listen port |
+| `PORT` | `8080` | HTTP listen port |
+| `DOMAIN` | _(empty)_ | Set to enable HTTPS with Let's Encrypt |
+| `CERT_DIR` | `certs` | TLS certificate cache directory |
 
-## Architecture
+## PAC Bypass Domains
 
+Domains in `directDomains` go DIRECT (skip proxy):
+- `*.geforcenow.nvidiagrid.net`
+- `*.nvidia.com`
+- `*.nvidiagrid.net`
+
+Edit `directDomains` in `proxy.go` to add/remove.
+
+## Deploy
+
+### Windows VPS
+```powershell
+git clone https://github.com/KongGithubDev/NetNinja.git
+cd NetNinja
+go build -o proxy.exe proxy.go
+$env:DOMAIN="proxy.yourdomain.com"; .\proxy.exe
 ```
-Client ──► NetNinja Proxy ──► Custom DNS (8.8.8.8/1.1.1.1) ──► Target Server
-              │
-              ├─ HTTP:    Forward with connection pooling
-              └─ HTTPS:   CONNECT tunnel (TCP pipe)
+
+### Linux VPS
+```bash
+git clone https://github.com/KongGithubDev/NetNinja.git
+cd NetNinja
+go build -o proxy proxy.go
+sudo DOMAIN=proxy.yourdomain.com ./proxy
 ```
 
-## Tech Stack
+### Systemd Service (Linux)
+```ini
+[Unit]
+Description=NetNinja Proxy
+After=network.target
 
-- **Go** (stdlib only, zero dependencies)
-- `net/http` — HTTP server & transport
-- `net` — TCP tunneling with `TCP_NODELAY`
-- Custom `net.Resolver` — DNS bypass
+[Service]
+Type=simple
+Environment=DOMAIN=proxy.yourdomain.com
+ExecStart=/home/ubuntu/NetNinja/proxy
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```

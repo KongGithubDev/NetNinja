@@ -80,8 +80,7 @@ func main() {
 
 	fmt.Println()
 	fmt.Println("=== NetNinja Go Proxy Running on Port " + port + " ===")
-	fmt.Println("Security: Open Bypass (No Authentication Required)")
-	fmt.Println("DNS: Specialized (Google 8.8.8.8 / Cloudflare 1.1.1.1)")
+	fmt.Println("DNS: Google 8.8.8.8 / Cloudflare 1.1.1.1")
 	fmt.Println("Engine: Go (High-Performance Goroutine-based)")
 	fmt.Println("==============================================")
 	fmt.Println()
@@ -113,25 +112,113 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		handleHTTP(w, r)
 	} else if r.URL.Path == "/proxy.pac" {
 		servePAC(w, r)
-	} else if r.URL.Path == "/status" {
-		// Status page — open from iPad Safari to verify connectivity
-		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(`<html><body style="font-family:sans-serif;text-align:center;padding:50px;background:#121212;color:#e0e0e0">
-			<h1 style="color:#4caf50">✅ NetNinja Proxy Active</h1>
-			<p>PAC URL: <code>http://` + r.Host + `/proxy.pac</code></p>
-			<p>Set this in iPad Wi-Fi > Auto Proxy</p>
-		</body></html>`))
-	} else {
+	} else if r.URL.Path == "/status" || r.URL.Path == "/" {
 		active := atomic.LoadInt64(&activeConns)
 		total := atomic.LoadInt64(&totalRequests)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(fmt.Sprintf("NetNinja Proxy: Active\nConnections: %d\nRequests: %d", active, total)))
+
+		proxyAddr := os.Getenv("PROXY_ADDR")
+		if proxyAddr == "" {
+			proxyAddr = r.Host
+		}
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		pacURL := fmt.Sprintf("%s://%s/proxy.pac", scheme, r.Host)
+
+		var bypassHTML string
+		for _, d := range directDomains {
+			bypassHTML += fmt.Sprintf(`<span class="tag">%s</span>`, d)
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NetNinja Proxy</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.container{max-width:520px;width:100%%;padding:20px}
+.card{background:linear-gradient(145deg,#12121a,#1a1a2e);border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:32px;margin-bottom:16px;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
+.header{text-align:center;margin-bottom:24px}
+.logo{font-size:42px;margin-bottom:8px}
+h1{font-size:22px;font-weight:600;background:linear-gradient(135deg,#00d4aa,#7c4dff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.status-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(0,212,170,0.1);border:1px solid rgba(0,212,170,0.3);color:#00d4aa;padding:6px 14px;border-radius:20px;font-size:13px;font-weight:500;margin-top:12px}
+.pulse{width:8px;height:8px;background:#00d4aa;border-radius:50%%;animation:pulse 2s infinite}
+@keyframes pulse{0%%,100%%{opacity:1}50%%{opacity:0.3}}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:20px 0}
+.stat{background:rgba(255,255,255,0.03);border-radius:12px;padding:16px;text-align:center}
+.stat-value{font-size:28px;font-weight:700;color:#fff}
+.stat-label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.section{margin-top:20px}
+.section-title{font-size:12px;color:#666;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:10px;font-weight:600}
+.pac-url{background:rgba(124,77,255,0.08);border:1px solid rgba(124,77,255,0.2);border-radius:10px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.pac-url code{font-size:12px;color:#b388ff;word-break:break-all;flex:1}
+.copy-btn{background:rgba(124,77,255,0.2);border:1px solid rgba(124,77,255,0.3);color:#b388ff;padding:6px 12px;border-radius:8px;cursor:pointer;font-size:12px;white-space:nowrap;transition:all 0.2s}
+.copy-btn:hover{background:rgba(124,77,255,0.4)}
+.copy-btn:active{transform:scale(0.95)}
+.tags{display:flex;flex-wrap:wrap;gap:6px}
+.tag{background:rgba(255,152,0,0.1);border:1px solid rgba(255,152,0,0.2);color:#ffb74d;padding:4px 10px;border-radius:6px;font-size:11px;font-family:monospace}
+.info{background:rgba(255,255,255,0.02);border-radius:10px;padding:14px 16px;margin-top:12px}
+.info-row{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}
+.info-label{color:#666}
+.info-value{color:#aaa;font-family:monospace;font-size:12px}
+.setup{margin-top:16px;padding:16px;background:rgba(0,212,170,0.04);border:1px solid rgba(0,212,170,0.1);border-radius:10px}
+.setup p{font-size:12px;color:#888;line-height:1.6}
+.setup b{color:#00d4aa}
+footer{text-align:center;margin-top:16px;font-size:11px;color:#333}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="card">
+ <div class="header">
+  <div class="logo">🥷</div>
+  <h1>NetNinja Proxy</h1>
+  <div class="status-badge"><span class="pulse"></span> Online</div>
+ </div>
+ <div class="stats">
+  <div class="stat"><div class="stat-value">%d</div><div class="stat-label">Active</div></div>
+  <div class="stat"><div class="stat-value">%d</div><div class="stat-label">Total</div></div>
+ </div>
+ <div class="section">
+  <div class="section-title">PAC Auto-Proxy URL</div>
+  <div class="pac-url">
+   <code id="pac">%s</code>
+   <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('pac').textContent);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)">Copy</button>
+  </div>
+ </div>
+ <div class="section">
+  <div class="section-title">Bypass Domains (DIRECT)</div>
+  <div class="tags">%s</div>
+ </div>
+ <div class="info">
+  <div class="info-row"><span class="info-label">Proxy Address</span><span class="info-value">%s</span></div>
+  <div class="info-row"><span class="info-label">DNS</span><span class="info-value">8.8.8.8 / 1.1.1.1</span></div>
+  <div class="info-row"><span class="info-label">Engine</span><span class="info-value">Go (Goroutine)</span></div>
+ </div>
+ <div class="setup">
+  <div class="section-title">📱 iPad Setup</div>
+  <p>Settings → Wi-Fi → <b>(i)</b> → Configure Proxy → <b>Automatic</b><br>URL: paste the PAC URL above</p>
+ </div>
+</div>
+<footer>NetNinja Proxy — High Performance DNS Bypass</footer>
+</div>
+</body>
+</html>`, active, total, pacURL, bypassHTML, proxyAddr)))
 	}
 }
 
 // servePAC — default PROXY, GFN domains go DIRECT
 func servePAC(w http.ResponseWriter, r *http.Request) {
-	proxyHost := r.Host
+	// PROXY_ADDR overrides the proxy address in PAC (useful when behind Caddy/nginx)
+	proxyHost := os.Getenv("PROXY_ADDR")
+	if proxyHost == "" {
+		proxyHost = r.Host
+	}
 	if proxyHost == "" {
 		proxyHost = "localhost"
 	}
