@@ -1,14 +1,10 @@
 services:
   - type: web
-    name: y8-proxy-bypass
-    env: node
+    name: netninja-proxy
+    runtime: go
     plan: free
-    buildCommand: npm install
-    startCommand: node proxy.js
+    buildCommand: go build -o proxy proxy.go
+    startCommand: ./proxy
     envVars:
-      - key: PROXY_USER
-        value: admin
-      - key: PROXY_PASS
-        generateValue: true
       - key: PORT
         value: 10000
