@@ -8,10 +8,49 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 )
+
+// Buffer pool — reuse 64KB buffers to reduce GC pressure
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 64*1024)
+		return &buf
+	},
+}
+
+// DNS cache — avoid repeated lookups for same host
+type dnsEntry struct {
+	ip     string
+	expiry time.Time
+}
+
+var dnsCache sync.Map // map[string]dnsEntry
+
+func cachedResolve(ctx context.Context, host string) (string, error) {
+	// check cache
+	if v, ok := dnsCache.Load(host); ok {
+		entry := v.(dnsEntry)
+		if time.Now().Before(entry.expiry) {
+			return entry.ip, nil
+		}
+		dnsCache.Delete(host)
+	}
+	// resolve
+	ips, err := customResolver.LookupHost(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return "", fmt.Errorf("dns: %s: %v", host, err)
+	}
+	// cache for 5 min
+	dnsCache.Store(host, dnsEntry{ip: ips[0], expiry: time.Now().Add(5 * time.Minute)})
+	return ips[0], nil
+}
 
 // ANSI colors for terminal output
 const (
@@ -34,9 +73,8 @@ var customResolver = &net.Resolver{
 		servers := []string{"8.8.8.8:53", "1.1.1.1:53", "8.8.4.4:53", "1.0.0.1:53"}
 		var lastErr error
 		for _, server := range servers {
-			conn, err := net.DialTimeout("udp", server, 3*time.Second)
+			conn, err := net.DialTimeout("udp", server, 2*time.Second)
 			if err == nil {
-				log.Printf("%s[DNS]%s Using DNS server: %s", colorCyan, colorReset, server)
 				return conn, nil
 			}
 			lastErr = err
@@ -46,25 +84,44 @@ var customResolver = &net.Resolver{
 	},
 }
 
-// Custom dialer that uses our DNS resolver
+// Custom dialer — fast timeouts for snappy connections
 var customDialer = &net.Dialer{
-	Timeout:   10 * time.Second,
+	Timeout:   5 * time.Second,
 	KeepAlive: 30 * time.Second,
 	Resolver:  customResolver,
 }
 
-// Custom transport with connection pooling for HTTP forwarding
+// Custom transport — aggressive connection pooling
 var proxyTransport = &http.Transport{
 	DialContext:           customDialer.DialContext,
-	MaxIdleConns:          200,
-	MaxIdleConnsPerHost:   20,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   5 * time.Second,
-	ExpectContinueTimeout: 1 * time.Second,
+	MaxIdleConns:          500,
+	MaxIdleConnsPerHost:   50,
+	IdleConnTimeout:       120 * time.Second,
+	TLSHandshakeTimeout:   3 * time.Second,
+	ExpectContinueTimeout: 500 * time.Millisecond,
+	ResponseHeaderTimeout: 15 * time.Second,
 	DisableCompression:    false,
+	ForceAttemptHTTP2:     true,
+	WriteBufferSize:       64 * 1024,
+	ReadBufferSize:        64 * 1024,
+}
+
+func enableWindowsANSI() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	setMode := kernel32.NewProc("SetConsoleMode")
+	getMode := kernel32.NewProc("GetConsoleMode")
+	handle, _ := syscall.GetStdHandle(syscall.STD_OUTPUT_HANDLE)
+	var mode uint32
+	getMode.Call(uintptr(handle), uintptr(unsafe.Pointer(&mode)))
+	setMode.Call(uintptr(handle), uintptr(mode|0x0004)) // ENABLE_VIRTUAL_TERMINAL_PROCESSING
 }
 
 func main() {
+	enableWindowsANSI()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -126,89 +183,64 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		pacURL := fmt.Sprintf("%s://%s/proxy.pac", scheme, r.Host)
 
-		var bypassHTML string
+		var bypassList string
 		for _, d := range directDomains {
-			bypassHTML += fmt.Sprintf(`<span class="tag">%s</span>`, d)
+			bypassList += fmt.Sprintf(`<li>%s</li>`, d)
 		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NetNinja Proxy</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>netninja proxy</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0a0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
-.container{max-width:520px;width:100%%;padding:20px}
-.card{background:linear-gradient(145deg,#12121a,#1a1a2e);border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:32px;margin-bottom:16px;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
-.header{text-align:center;margin-bottom:24px}
-.logo{font-size:42px;margin-bottom:8px}
-h1{font-size:22px;font-weight:600;background:linear-gradient(135deg,#00d4aa,#7c4dff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.status-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(0,212,170,0.1);border:1px solid rgba(0,212,170,0.3);color:#00d4aa;padding:6px 14px;border-radius:20px;font-size:13px;font-weight:500;margin-top:12px}
-.pulse{width:8px;height:8px;background:#00d4aa;border-radius:50%%;animation:pulse 2s infinite}
-@keyframes pulse{0%%,100%%{opacity:1}50%%{opacity:0.3}}
-.stats{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:20px 0}
-.stat{background:rgba(255,255,255,0.03);border-radius:12px;padding:16px;text-align:center}
-.stat-value{font-size:28px;font-weight:700;color:#fff}
-.stat-label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
-.section{margin-top:20px}
-.section-title{font-size:12px;color:#666;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:10px;font-weight:600}
-.pac-url{background:rgba(124,77,255,0.08);border:1px solid rgba(124,77,255,0.2);border-radius:10px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:10px}
-.pac-url code{font-size:12px;color:#b388ff;word-break:break-all;flex:1}
-.copy-btn{background:rgba(124,77,255,0.2);border:1px solid rgba(124,77,255,0.3);color:#b388ff;padding:6px 12px;border-radius:8px;cursor:pointer;font-size:12px;white-space:nowrap;transition:all 0.2s}
-.copy-btn:hover{background:rgba(124,77,255,0.4)}
-.copy-btn:active{transform:scale(0.95)}
-.tags{display:flex;flex-wrap:wrap;gap:6px}
-.tag{background:rgba(255,152,0,0.1);border:1px solid rgba(255,152,0,0.2);color:#ffb74d;padding:4px 10px;border-radius:6px;font-size:11px;font-family:monospace}
-.info{background:rgba(255,255,255,0.02);border-radius:10px;padding:14px 16px;margin-top:12px}
-.info-row{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}
-.info-label{color:#666}
-.info-value{color:#aaa;font-family:monospace;font-size:12px}
-.setup{margin-top:16px;padding:16px;background:rgba(0,212,170,0.04);border:1px solid rgba(0,212,170,0.1);border-radius:10px}
-.setup p{font-size:12px;color:#888;line-height:1.6}
-.setup b{color:#00d4aa}
-footer{text-align:center;margin-top:16px;font-size:11px;color:#333}
+body{background:#111;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;padding:40px 20px}
+.w{max-width:480px;margin:0 auto}
+h1{color:#fff;font-size:18px;margin:0 0 4px;font-weight:normal}
+h1 span{color:#0a0}
+.sub{color:#555;font-size:12px;margin-bottom:30px}
+hr{border:0;border-top:1px solid #222;margin:20px 0}
+.row{display:flex;justify-content:space-between;padding:3px 0}
+.row .k{color:#777}
+.row .v{color:#eee}
+.num{color:#0f0;font-size:20px;font-weight:bold}
+.pac{background:#1a1a1a;border:1px solid #333;padding:10px 14px;margin:10px 0;word-break:break-all;font-size:12px;color:#7af;cursor:pointer;border-radius:3px}
+.pac:hover{border-color:#7af}
+.pac:active{background:#222}
+ul{margin:6px 0;padding-left:20px;color:#886}
+ul li{font-size:12px}
+.help{color:#555;font-size:11px;margin-top:30px;line-height:1.5}
+.help b{color:#888}
+.tag{display:inline-block;background:#1a1a1a;border:1px solid #333;color:#aaa;padding:2px 8px;font-size:11px;margin:2px}
 </style>
 </head>
 <body>
-<div class="container">
-<div class="card">
- <div class="header">
-  <div class="logo">🥷</div>
-  <h1>NetNinja Proxy</h1>
-  <div class="status-badge"><span class="pulse"></span> Online</div>
- </div>
- <div class="stats">
-  <div class="stat"><div class="stat-value">%d</div><div class="stat-label">Active</div></div>
-  <div class="stat"><div class="stat-value">%d</div><div class="stat-label">Total</div></div>
- </div>
- <div class="section">
-  <div class="section-title">PAC Auto-Proxy URL</div>
-  <div class="pac-url">
-   <code id="pac">%s</code>
-   <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('pac').textContent);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)">Copy</button>
-  </div>
- </div>
- <div class="section">
-  <div class="section-title">Bypass Domains (DIRECT)</div>
-  <div class="tags">%s</div>
- </div>
- <div class="info">
-  <div class="info-row"><span class="info-label">Proxy Address</span><span class="info-value">%s</span></div>
-  <div class="info-row"><span class="info-label">DNS</span><span class="info-value">8.8.8.8 / 1.1.1.1</span></div>
-  <div class="info-row"><span class="info-label">Engine</span><span class="info-value">Go (Goroutine)</span></div>
- </div>
- <div class="setup">
-  <div class="section-title">📱 iPad Setup</div>
-  <p>Settings → Wi-Fi → <b>(i)</b> → Configure Proxy → <b>Automatic</b><br>URL: paste the PAC URL above</p>
- </div>
+<div class="w">
+<h1><span>></span> netninja proxy</h1>
+<div class="sub">dns bypass proxy // go</div>
+
+<div class="row"><span class="k">status</span><span class="v" style="color:#0a0">running</span></div>
+<div class="row"><span class="k">active connections</span><span class="v num">%d</span></div>
+<div class="row"><span class="k">total requests</span><span class="v num">%d</span></div>
+<div class="row"><span class="k">proxy</span><span class="v">%s</span></div>
+<div class="row"><span class="k">dns</span><span class="v">8.8.8.8, 1.1.1.1</span></div>
+
+<hr>
+<div class="row"><span class="k">pac url</span></div>
+<div class="pac" onclick="navigator.clipboard.writeText(this.textContent)">%s</div>
+
+<div class="row"><span class="k">bypass (direct)</span></div>
+<ul>%s</ul>
+
+<div class="help">
+<b>ipad:</b> settings > wifi > (i) > proxy > automatic<br>
+paste the pac url above
 </div>
-<footer>NetNinja Proxy — High Performance DNS Bypass</footer>
 </div>
 </body>
-</html>`, active, total, pacURL, bypassHTML, proxyAddr)))
+</html>`, active, total, proxyAddr, pacURL, bypassList)))
 	}
 }
 
@@ -315,7 +347,24 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	atomic.AddInt64(&activeConns, 1)
 
-	destConn, err := customDialer.DialContext(r.Context(), "tcp", host)
+	// extract hostname and port for cached DNS
+	hostname := host
+	port := "443"
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		hostname = host[:idx]
+		port = host[idx+1:]
+	}
+
+	// resolve via cache
+	ip, err := cachedResolve(r.Context(), hostname)
+	if err != nil {
+		atomic.AddInt64(&activeConns, -1)
+		log.Printf("%s[ERR]%s DNS %s failed: %s", colorRed, colorReset, hostname, err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	destConn, err := net.DialTimeout("tcp", ip+":"+port, 5*time.Second)
 	if err != nil {
 		atomic.AddInt64(&activeConns, -1)
 		log.Printf("%s[ERR]%s CONNECT %s failed: %s", colorRed, colorReset, host, err)
@@ -364,11 +413,13 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	go transfer(clientConn, destConn)
 }
 
-// transfer pipes data between two connections
+// transfer pipes data between two connections using pooled buffers
 func transfer(dst, src net.Conn) {
 	defer dst.Close()
 	defer src.Close()
-	io.Copy(dst, src)
+	bufp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufp)
+	io.CopyBuffer(dst, src, *bufp)
 }
 
 // copyHeaders copies HTTP headers
