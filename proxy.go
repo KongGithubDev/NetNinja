@@ -97,6 +97,13 @@ func getClientIP(r *http.Request) string {
 	return ip
 }
 
+// Domains that go DIRECT (not through proxy) — for GFN streaming etc.
+var directDomains = []string{
+	"*.geforcenow.nvidiagrid.net",
+	"*.nvidia.com",
+	"*.nvidiagrid.net",
+}
+
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&totalRequests, 1)
 
@@ -104,13 +111,63 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		handleConnect(w, r)
 	} else if r.URL.Host != "" {
 		handleHTTP(w, r)
+	} else if r.URL.Path == "/proxy.pac" {
+		servePAC(w, r)
+	} else if r.URL.Path == "/status" {
+		// Status page — open from iPad Safari to verify connectivity
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><body style="font-family:sans-serif;text-align:center;padding:50px;background:#121212;color:#e0e0e0">
+			<h1 style="color:#4caf50">✅ NetNinja Proxy Active</h1>
+			<p>PAC URL: <code>http://` + r.Host + `/proxy.pac</code></p>
+			<p>Set this in iPad Wi-Fi > Auto Proxy</p>
+		</body></html>`))
 	} else {
-		// Direct access = health check
 		active := atomic.LoadInt64(&activeConns)
 		total := atomic.LoadInt64(&totalRequests)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(fmt.Sprintf("NetNinja Proxy: Active (Open Mode)\nActive Connections: %d\nTotal Requests: %d", active, total)))
+		w.Write([]byte(fmt.Sprintf("NetNinja Proxy: Active\nConnections: %d\nRequests: %d", active, total)))
 	}
+}
+
+// servePAC — default PROXY, GFN domains go DIRECT
+func servePAC(w http.ResponseWriter, r *http.Request) {
+	proxyHost := r.Host
+	if proxyHost == "" {
+		proxyHost = "localhost"
+	}
+
+	var conditions []string
+	for _, domain := range directDomains {
+		if strings.HasPrefix(domain, "*.") {
+			bare := domain[2:]
+			conditions = append(conditions,
+				fmt.Sprintf(`    if (dnsDomainIs(host, "%s")) return "DIRECT";`, bare))
+		} else {
+			conditions = append(conditions,
+				fmt.Sprintf(`    if (host == "%s") return "DIRECT";`, domain))
+		}
+	}
+
+	pac := fmt.Sprintf(`function FindProxyForURL(url, host) {
+    if (isPlainHostName(host) ||
+        shExpMatch(host, "10.*") ||
+        shExpMatch(host, "172.16.*") ||
+        shExpMatch(host, "192.168.*") ||
+        host == "127.0.0.1" ||
+        host == "localhost") {
+        return "DIRECT";
+    }
+%s
+    return "PROXY %s; DIRECT";
+}
+`, strings.Join(conditions, "\n"), proxyHost)
+
+	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write([]byte(pac))
+
+	log.Printf("%s[PAC]%s Served to %s",
+		colorCyan, colorReset, getClientIP(r))
 }
 
 // handleHTTP forwards standard HTTP requests
