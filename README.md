@@ -1,7 +1,7 @@
 # NetNinja
-A fast, simple proxy to bypass DNS filters and Cisco SSE intersections.
-
 NetNinja is a lightweight forward proxy written in Go. I built it to solve a specific problem: bypassing annoying network-level blocks (like Cisco Secure Client or DNS filters) without the overhead of a full VPN.
+
+![Preview](preview.png)
 
 It works on a **Direct-by-Default** principle. Normal traffic goes straight through at line speed. The proxy logic only kicks in when it detects a blocked domain or an intercepted Cisco link.
 
