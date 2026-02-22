@@ -28,6 +28,7 @@ var upgrader = websocket.Upgrader{
 }
 
 var db *sql.DB
+var openedForIPs sync.Map // map[string]bool
 
 // Buffer pool — reuse 64KB buffers to reduce GC pressure
 var bufPool = sync.Pool{
@@ -425,28 +426,74 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodConnect {
 		handleConnect(w, r)
-	} else if r.URL.Host != "" {
-		handleHTTP(w, r)
-	} else if r.URL.Path == "/proxy.pac" {
-		servePAC(w, r)
-	} else if r.URL.Path == "/ws" {
-		serveWS(w, r)
-	} else if r.URL.Path == "/logs" {
-		serveLogs(w, r)
-	} else if r.URL.Path == "/status" || r.URL.Path == "/" {
-		proxyAddr := os.Getenv("PROXY_ADDR")
-		if proxyAddr == "" {
-			proxyAddr = r.Host
-		}
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		pacURL := fmt.Sprintf("%s://%s/proxy.pac", scheme, r.Host)
+		return
+	}
 
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
+	path := r.URL.Path
+	host := r.URL.Host
+
+	// If the request is for this proxy itself (even if it's an absolute URL)
+	isForSelf := (host == "" || isSelf(host, r.Host))
+
+	if isForSelf {
+		if path == "/proxy.pac" {
+			servePAC(w, r)
+			return
+		} else if path == "/ws" {
+			serveWS(w, r)
+			return
+		} else if path == "/welcome" {
+			clientIP := getClientIP(r)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ยินดีต้อนรับสู่ NetNinja</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:13px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
+.w{max-width:400px;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,0.5)}
+h1{color:#fff;font-size:24px;margin:0 0 10px;font-weight:normal}
+h1 span{color:#0a0;margin-right:10px}
+p{color:#888;margin-bottom:25px}
+.ip{color:#7af;font-weight:bold;margin:10px 0;font-size:16px}
+.btn{display:inline-block;padding:12px 24px;background:#060;color:#fff;text-decoration:none;border-radius:4px;font-weight:bold;transition:0.3s;border:1px solid #0a0}
+.btn:hover{background:#080;transform:translateY(-2px);box-shadow:0 5px 15px rgba(0,170,0,0.3)}
+.footer{margin-top:40px;font-size:10px;color:#333;text-transform:uppercase;letter-spacing:1px}
+</style>
+</head>
+<body>
+<div class="w">
+    <h1><span>●</span> ยินดีต้อนรับ</h1>
+    <p>ระบบ NetNinja Proxy พร้อมใช้งานแล้วสำหรับการเชื่อมต่อของคุณ</p>
+    <div style="color:#444;font-size:10px;text-transform:uppercase;letter-spacing:2px;margin-bottom:5px">client_address_detected</div>
+    <div class="ip">%s</div>
+    <div style="margin-top:35px">
+        <a href="/" class="btn">เข้าสู่ Dashboard</a>
+    </div>
+    <div class="footer">powered_by // netninja_engine</div>
+</div>
+</body>
+</html>`, clientIP)))
+			return
+		} else if path == "/logs" {
+			serveLogs(w, r)
+			return
+		} else if path == "/status" || path == "/" {
+			proxyAddr := os.Getenv("PROXY_ADDR")
+			if proxyAddr == "" {
+				proxyAddr = r.Host
+			}
+			scheme := "http"
+			if r.TLS != nil {
+				scheme = "https"
+			}
+			pacURL := fmt.Sprintf("%s://%s/proxy.pac", scheme, r.Host)
+
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
@@ -570,7 +617,12 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 </script>
 </body>
 </html>`, buildTime, buildTime, pacURL)))
+			return
+		}
 	}
+
+	// Forward other HTTP requests to proxy logic
+	handleHTTP(w, r)
 }
 
 // servePAC — default PROXY, GFN domains go DIRECT
@@ -610,12 +662,11 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
 }
 `, strings.Join(conditions, "\n"), proxyHost)
 
-	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
-	w.Header().Set("Cache-Control", "no-cache")
 	w.Write([]byte(pac))
 
+	clientIP := getClientIP(r)
 	log.Printf("%s[PAC]%s Served to %s",
-		colorCyan, colorReset, getClientIP(r))
+		colorCyan, colorReset, clientIP)
 }
 
 func serveLogs(w http.ResponseWriter, r *http.Request) {
@@ -688,6 +739,20 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s%s%s %s %s ← %s", colorGreen, tag, colorReset, r.Method, unwrappedHost, clientIP)
 	}
 
+	// Welcome Redirect: If new IP and GET request, redirect to dashboard
+	if !isLocalIP(clientIP) && clientIP != "127.0.0.1" && clientIP != "::1" && r.Method == "GET" {
+		if _, loaded := openedForIPs.LoadOrStore(clientIP, true); !loaded {
+			proxyAddr := os.Getenv("PROXY_ADDR")
+			if proxyAddr == "" {
+				proxyAddr = r.Host
+			}
+			dashURL := fmt.Sprintf("http://%s/welcome", proxyAddr)
+			log.Printf("%s[SYSTEM]%s First-time HTTP connection from %s. Redirecting to %s", colorGreen, colorReset, clientIP, dashURL)
+			http.Redirect(w, r, dashURL, http.StatusFound)
+			return
+		}
+	}
+
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
 	if err != nil {
 		log.Printf("%s[ERR]%s Bad request from %s: %s", colorRed, colorReset, clientIP, err)
@@ -711,6 +776,12 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := proxyTransport.RoundTrip(outReq)
 	if err != nil {
+		// Detect WebSocket upgrade request for manual handling
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			handleWSUpgrade(w, r, unwrappedHost, clientIP)
+			return
+		}
+
 		log.Printf("%s[ERR]%s %s → %s: %s", colorRed, colorReset, clientIP, r.URL.Host, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
@@ -872,13 +943,99 @@ func copyHeaders(dst, src http.Header) {
 // removeHopHeaders removes hop-by-hop headers (not forwarded by proxies)
 func removeHopHeaders(h http.Header) {
 	hopHeaders := []string{
-		"Connection", "Keep-Alive", "Proxy-Authenticate",
+		"Keep-Alive", "Proxy-Authenticate",
 		"Proxy-Authorization", "Te", "Trailer",
-		"Transfer-Encoding", "Upgrade",
+		"Transfer-Encoding",
 	}
+
+	// For WebSockets, we MUST keep Upgrade and Connection: upgrade
+	isWS := strings.EqualFold(h.Get("Upgrade"), "websocket")
+	if !isWS {
+		hopHeaders = append(hopHeaders, "Connection", "Upgrade")
+	}
+
 	for _, hdr := range hopHeaders {
 		h.Del(hdr)
 	}
+}
+
+// isSelf checks if the hostname refers to this proxy server
+func isSelf(reqHost, headerHost string) bool {
+	if reqHost == "" {
+		return true
+	}
+	// Case 1: Matches the host header we are listening on
+	if reqHost == headerHost {
+		return true
+	}
+	// Case 2: Matches a local IP
+	hostOnly := reqHost
+	if h, _, err := net.SplitHostPort(reqHost); err == nil {
+		hostOnly = h
+	}
+	if isLocalIP(hostOnly) {
+		return true
+	}
+	return false
+}
+
+// handleWSUpgrade handles the WebSocket upgrade manually since RoundTrip doesn't support it
+func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP string) {
+	// 1. Dial the remote server
+	port := "80"
+	hostname := host
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		hostname = h
+		port = p
+	}
+	destConn, err := net.DialTimeout("tcp", hostname+":"+port, 5*time.Second)
+	if err != nil {
+		log.Printf("%s[ERR]%s WS Dial %s failed: %v", colorRed, colorReset, host, err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer destConn.Close()
+
+	// 2. Hijack the client connection
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, "Hijack failed", http.StatusServiceUnavailable)
+		return
+	}
+	defer clientConn.Close()
+
+	// 3. Forward the original GET request with upgrade headers
+	// Ensure Host header is correct for the destination
+	r.Header.Set("Host", hostname)
+
+	var req strings.Builder
+	req.WriteString(fmt.Sprintf("GET %s HTTP/1.1\r\n", r.URL.RequestURI()))
+	for k, vv := range r.Header {
+		for _, v := range vv {
+			req.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+		}
+	}
+	req.WriteString("\r\n")
+	destConn.Write([]byte(req.String()))
+
+	// 4. Pipe binary data
+	errChan := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(destConn, clientConn)
+		errChan <- err
+	}()
+	go func() {
+		_, err := io.Copy(clientConn, destConn)
+		errChan <- err
+	}()
+
+	<-errChan
+	log.Printf("%s[WS-PROXY]%s Tunnel closed for %s:%s ← %s", colorGray, colorReset, hostname, port, clientIP)
 }
 
 func serveWS(w http.ResponseWriter, r *http.Request) {
