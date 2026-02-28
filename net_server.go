@@ -261,24 +261,22 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	http.HandleFunc(*pathFlag, handleVLESS)
-
-	// Health check endpoint for Render.com free tier keep-alive
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	// Default handler to mask the server to scanners
+	// Single handler to avoid route collision panics (e.g., when NET_PATH=/ and default is /)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != *pathFlag {
-			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte("Not Found"))
-		} else {
-			// If accessed normally via HTTP but is the correct path, tell them upgrading is required
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("Bad Request"))
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
+			return
 		}
+
+		if r.URL.Path == *pathFlag {
+			handleVLESS(w, r)
+			return
+		}
+
+		// Mask the server to scanners
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("Not Found"))
 	})
 
 	log.Printf("========================================")
