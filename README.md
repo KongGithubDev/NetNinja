@@ -1,63 +1,73 @@
-# NetNinja
-NetNinja is a lightweight forward proxy written in Go. I built it to solve a specific problem: bypassing annoying network-level blocks (like Cisco Secure Client or DNS filters) without the overhead of a full VPN.
+# NetNinja Go
 
-![Preview](preview.png)
+A lightweight, high-performance networking tool written in Go. This repository contains components for setting up secure forward proxies and WebSocket-based tunnels (VLESS).
 
-It works on a **Direct-by-Default** principle. Normal traffic goes straight through at line speed. The proxy logic only kicks in when it detects a blocked domain or an intercepted Cisco link.
+## Architecture
 
-### What it does:
-- **Live Terminal Dashboard**: A WebSocket-powered UI that updates every second with system health.
-- **Nitro-Tier Performance**: All routing rules are cached in memory (O(1)) and persistence is handled asynchronously to ensure zero-latency in the main data path.
-- **Active IP Tracking**: Shows you who's connected. Click an IP to check its details on ipinfo.io.
-- **Header Injection**: Automatically adds `X-Forwarded-For` and `X-Real-IP` to HTTP traffic.
-- **Cisco Unwrapper**: Detects and fixes those wrapped Cisco SSE domains and hex-encoded hostnames automatically.
-- **DNS-over-HTTPS (DoH)**: If your local DNS is lying to you, it falls back to Cloudflare/Google DoH over port 443.
-- **Persistent Cache**: Uses a local SQLite DB (non-blocking) to remember intercepted domains for future access.
-
-### How it works:
-```mermaid
-graph TD
-    Client[Browser/Device] -->|PAC Config| Proxy{NetNinja Go}
-    Proxy -->|Regular Traffic| Direct[DIRECT]
-    Proxy -->|Blocked/Cisco| Bypass[Bypass Engine]
-    Bypass -->|Inject| IP[X-Forwarded-For]
-    IP -->|Resolve| DoH[DoH / SQLite]
-    DoH -->|Tunnel| Dest[Target Server]
-    
-    Proxy -.->|Metrics| Dashboard[Dashboard UI]
-```
-
-### Technical Specs:
-| Feature | Implementation |
-|---------|----------------|
-| **Engine** | Go (GOMAXPROCS tuned, 128KB buffers) |
-| **I/O Strategy** | **Nitro Mode**: Async Database Writes & Background Logging |
-| **Cache** | In-Memory Rule-Fast-Path + Pure Go SQLite |
-| **Tracking** | Concurrent-safe sync.Map with IP normalization |
-| **Updates** | 1Hz Low-overhead WebSocket streaming |
-
-### Getting Started:
-1. **Build** the binary:
-   ```powershell
-   ./build.ps1
-   ```
-2. **Run** it:
-   ```bash
-   ./proxy.exe
-   ```
-3. **Setup**: Point your system/browser's PAC (Proxy Auto-Config) URL to:
-   ```
-   http://YOUR_SERVER_IP:8080/proxy.pac
-   ```
-
-### API:
-- `/` : Live dashboard
-- `/proxy.pac` : Auto-generated config
-- `/logs` : Raw log view from SQLite
-- `/ws` : Metrics stream
-
-### License:
-MIT License - see the [LICENSE](LICENSE) file for details.
+* **`proxy.go` (NetNinja Proxy)**: A standard HTTP/HTTPS forward proxy implementation. It features basic traffic auditing, request caching, and domain filtering capabilities (e.g., matching known malicious domains).
+* **`net_server.go` (NetServer Tunnel)**: A minimalist WebSocket server. It implements a subset of the VLESS protocol to provide a secure tunnel point for authorized clients. 
 
 ---
-Developed by **Watcharapong Namsaeng** — [@KongGithubDev](https://github.com/KongGithubDev)
+
+## Deployment Data
+
+### 1. Building the WebSocket Tunnel (`net_server.go`)
+This service acts as the endpoint for your tunneled traffic.
+
+```bash
+go build -o net_server.exe net_server.go
+```
+
+**Running the Tunnel:**
+Use the provided batch script or run it manually.
+
+```bash
+run-netserver.bat
+```
+*Note: The default port is `8080`. Adjust `NET_PORT`, `NET_UUID`, and `NET_PATH` in the `.bat` file according to your network requirements.*
+
+**Client Connection Details:**
+Compatible clients (e.g., v2ray-core, v2box, etc.) can connect using standard VLESS JSON structures or URI links. Format:
+
+```text
+vless://[UUID]@[SERVER_IP]:[PORT]?encryption=none&security=none&type=ws&host=[HOST_HEADER]&path=%2F#NetTunnel
+```
+
+### 3. Deploying to Render.com (Free Tier)
+`net_server.go` is fully compatible with platform-as-a-service providers like Render.com. 
+
+**Features added for Cloud Deployment:**
+- **Dynamic Port Binding**: Automatically detects the `$PORT` environment variable required by Render.
+- **Keep-Alive Endpoint**: Includes a `/healthz` HTTP endpoint that always returns HTTP 200 OK. You can use a free cron-job service (like cron-job.org) to ping `https://[your-render-url].onrender.com/healthz` every 10 minutes to prevent the free tier from spinning down (sleeping).
+
+**Deployment Steps:**
+1. Upload this codebase to a GitHub repository.
+2. In Render.com, create a new **Web Service**.
+3. Connect your GitHub repository.
+4. Render Configuration:
+   - **Environment:** `Go`
+   - **Build Command:** `go build -o net_server net_server.go`
+   - **Start Command:** `./net_server`
+5. Click **Deploy**. Render will allocate a URL (e.g., `https://netninja-tunnel.onrender.com`), and automatically handle the SSL/TLS/Port 443 termination for you!
+
+*(Alternatively, you can just use the provided `render-netserver.yaml` Blueprint file)*
+
+---
+
+### 4. Building the Forward Proxy (`proxy.go`)
+This service is intended for localized network routing and filtering.
+
+```bash
+go build -o proxy.exe proxy.go
+```
+
+**Running the Proxy:**
+```bash
+proxy.exe
+```
+Access the local monitoring dashboard via standard HTTP at `http://127.0.0.1:8080/`.
+
+---
+
+## Disclaimer
+This project is intended strictly for educational purposes, network routing studies, and personal privacy enhancement on authorized networks. The maintainers are not responsible for any misuse, policy violations, or damages caused by deploying this software in unauthorized environments.
