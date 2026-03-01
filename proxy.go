@@ -439,10 +439,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		if path == "/proxy.pac" {
 			servePAC(w, r)
 			return
-		} else if path == "/healthz" {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("OK"))
-			return
 		} else if path == "/ws" {
 			serveWS(w, r)
 			return
