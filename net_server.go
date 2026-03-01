@@ -27,6 +27,22 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// bufferPool for 64KB buffers to reduce GC during UDP proxying
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 65535)
+		return &b
+	},
+}
+
+// copyBufferPool for 32KB buffers for io.CopyBuffer
+var copyBufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 var (
 	portFlag    = flag.String("port", "443", "Listen port")
 	uuidFlag    = flag.String("uuid", "b831381d-6324-4d53-ad4f-8cda48b30811", "VLESS UUID")
@@ -254,14 +270,18 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 
 		errc := make(chan error, 2)
 		go func() {
-			_, err := io.Copy(dest, wsAdapter)
+			bufPtr := copyBufferPool.Get().(*[]byte)
+			defer copyBufferPool.Put(bufPtr)
+			_, err := io.CopyBuffer(dest, wsAdapter, *bufPtr)
 			if tcpConn, ok := dest.(*net.TCPConn); ok {
 				tcpConn.CloseWrite()
 			}
 			errc <- err
 		}()
 		go func() {
-			_, err := io.Copy(wsAdapter, dest)
+			bufPtr := copyBufferPool.Get().(*[]byte)
+			defer copyBufferPool.Put(bufPtr)
+			_, err := io.CopyBuffer(wsAdapter, dest, *bufPtr)
 			// When the destination closes, force close the websocket to break the other io.Copy
 			conn.Close()
 			errc <- err
@@ -278,7 +298,11 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 
 		errc := make(chan error, 2)
 		go func() {
-			buf := make([]byte, 65535)
+			// Use buffer pool instead of allocating 64KB every UDP connection
+			bufPtr := bufferPool.Get().(*[]byte)
+			defer bufferPool.Put(bufPtr)
+			buf := *bufPtr
+
 			for {
 				n, err := dest.Read(buf)
 				if err != nil {
@@ -527,6 +551,9 @@ func broadcastStats() {
 }
 
 func main() {
+	// Nitro Performance Tuning
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	netStartTime = time.Now()
 	go broadcastStats()
 
