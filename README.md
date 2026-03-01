@@ -1,17 +1,19 @@
-# NetNinja 🥷🏽
+# NetNinja
 
-**NetNinja** is a lightweight, multipurpose networking toolkit written in Go. It's built specifically to deploy fast forward proxies and bypass firewalls using WebSocket (VLESS) tunnels. It's designed to be fast, minimal, and very light on system resources.
+**NetNinja** is a lightweight, multipurpose networking toolkit written in Go. It is built specifically to deploy fast forward proxies and bypass firewalls using WebSocket (VLESS) tunnels. It is designed to be fast, minimal, and resource-efficient.
+
+![NetNinja Dashboard Preview](./preview.png)
 
 ## Core Tools
 
-1. **`net_server.go` (VLESS VPN + SNI Multiplexer)** 🔥  
-   This is the real star of the show. It's a VLESS server upgraded with a built-in **SNI Multiplexer**. This allows your server to listen on port `443` while seamlessly sharing the same port with your existing web server (like Nginx or Caddy). It works by sniffing the incoming TLS ClientHello packets:
-   - If someone visits your normal website, it proxies the raw traffic straight to your real web server (so your SSL stays intact).
-   - If the incoming traffic is from a VPN client using an **SNI Bug** (like `line.me` etc.), it automatically generates a temporary in-memory Dummy Certificate, terminates the TLS, and smoothly transitions into providing a VLESS VPN connection!
-   - ⚠️ **Important Note:** Because `net_server` relies on intercepting SNI handshakes, it **ONLY works on port 443**.
+1. **`net_server.go` (VLESS VPN + SNI Multiplexer)**
+   This component serves as a VLESS server featuring a built-in **SNI Multiplexer**. This capability allows the server to listen on port `443` while seamlessly sharing the same port with an existing web server (such as Nginx or Caddy). It operates by interrogating incoming TLS ClientHello packets:
+   - For standard website traffic, it proxies the raw connection directly to the upstream web server, preserving the original SSL sequence.
+   - For incoming VPN traffic utilizing an **SNI Bug** (e.g., `line.me`), it dynamically generates a temporary in-memory certificate, terminates the TLS connection, and transitions into an active VLESS VPN session.
+   - **Important Note:** Because `net_server` relies on intercepting SNI handshakes, it **requires port 443**.
 
-2. **`proxy.go` (NetNinja HTTP/HTTPS Proxy)**  
-   A straightforward Forward Proxy that you can use to route local traffic or deploy basic domain filtering. It even comes with a low-overhead dashboard to monitor status at `http://127.0.0.1:8080/`.
+2. **`proxy.go` (NetNinja HTTP/HTTPS Proxy)**
+   A straightforward Forward Proxy suitable for routing local traffic or deploying domain-based filtering. It includes a low-overhead dashboard for monitoring status, accessible at `http://127.0.0.1:8080/`.
 
 ---
 
@@ -19,40 +21,40 @@
 
 ### 1. The VPN Edge Server (`net_server.go`)
 
-This is what you run on your VPS to act as your exit node. You can build it straight from source:
+This service is intended to act as the exit node on a VPS. It can be built directly from the source code:
 
 ```bash
 go build -o net_server.exe net_server.go
 ```
 
-To run it, you can use the provided batch script (`run-netserver.bat`) or run it manually. 
+To execute the service, use the provided batch script (`run-netserver.bat`) or run the executable directly.
 
-If you want to share port `443` with your existing website (putting `net_server` in the front), run it with these parameters:
+To share port `443` with an existing website (placing `net_server` in front), execute it with the following parameters:
 ```bash
 ./net_server.exe -port 443 -tls true -web-port 8443 -web-sni your-domain.com
 ```
-In short, you just need to reconfigure Nginx/Caddy to listen on an internal port like `8443` instead of 443. `net_server` will take over 443; if someone asks for `your-domain.com`, it kicks them over to 8443. Any other weird domains get handled as VPN traffic!
+Ensure that the upstream web server (Nginx/Caddy) is configured to listen on an internal port such as `8443` instead of `443`. `net_server` will govern port `443`; traffic matching `your-domain.com` will be forwarded to port `8443`. Unrecognized domains will be processed as VPN traffic.
 
-**Client App Setup:**
-Copy this URI and paste it directly into your favorite client (V2Ray, v2box, Shadowrocket). 
-*(Make sure to enable `allowInsecure: true` or "Skip Cert Verify" in your app, since we use dynamically generated Dummy Certs!)*
+**Client Application Setup:**
+Copy the following URI and import it into a compatible client (e.g., V2Ray, v2box, Shadowrocket). 
+*(Ensure that `allowInsecure: true` or "Skip Cert Verify" is enabled in the client application, as the connection utilizes dynamically generated certificates.)*
 ```text
 vless://[UUID]@[SERVER_IP]:443?encryption=none&security=none&type=ws&host=[YOUR_SNI_BUG]&path=%2F#NetNinjaTunnel
 ```
 
 ### 2. The Traffic Filter (`proxy.go`)
 
-Useful if you want to test filtering or set up a local network proxy.
+This tool is useful for testing traffic filtering or establishing a local network proxy.
 
 ```bash
 go build -o proxy.exe proxy.go
 ```
 
-Just run it:
+Execute the binary:
 ```bash
 proxy.exe
 ```
 
 ---
 
-*Disclaimer: This project was built strictly for educational purposes, learning how to manipulate network packets, and studying firewall evasion techniques. The developers are not responsible for any misuse or policy violations if deployed on unauthorized networks! 🙏🏼*
+*Disclaimer: This project was built strictly for educational purposes, learning how to manipulate network packets, and studying firewall evasion techniques. The developers are not responsible for any misuse or policy violations if deployed on unauthorized networks.*
