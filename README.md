@@ -1,73 +1,58 @@
-# NetNinja Go
+# NetNinja 🥷🏽
 
-A lightweight, high-performance networking tool written in Go. This repository contains components for setting up secure forward proxies and WebSocket-based tunnels (VLESS).
+**NetNinja** is a lightweight, multipurpose networking toolkit written in Go. It's built specifically to deploy fast forward proxies and bypass firewalls using WebSocket (VLESS) tunnels. It's designed to be fast, minimal, and very light on system resources.
 
-## Architecture
+## Core Tools
 
-* **`proxy.go` (NetNinja Proxy)**: A standard HTTP/HTTPS forward proxy implementation. It features basic traffic auditing, request caching, and domain filtering capabilities (e.g., matching known malicious domains).
-* **`net_server.go` (NetServer Tunnel)**: A minimalist WebSocket server. It implements a subset of the VLESS protocol to provide a secure tunnel point for authorized clients. 
+1. **`net_server.go` (VLESS VPN + SNI Multiplexer)** 🔥  
+   This is the real star of the show. It's a VLESS server upgraded with a built-in **SNI Multiplexer**. This allows your server to listen on port `443` while seamlessly sharing the same port with your existing web server (like Nginx or Caddy). It works by sniffing the incoming TLS ClientHello packets:
+   - If someone visits your normal website, it proxies the raw traffic straight to your real web server (so your SSL stays intact).
+   - If the incoming traffic is from a VPN client using an **SNI Bug** (like `line.me` etc.), it automatically generates a temporary in-memory Dummy Certificate, terminates the TLS, and smoothly transitions into providing a VLESS VPN connection!
+   - ⚠️ **Important Note:** Because `net_server` relies on intercepting SNI handshakes, it **ONLY works on port 443**.
+
+2. **`proxy.go` (NetNinja HTTP/HTTPS Proxy)**  
+   A straightforward Forward Proxy that you can use to route local traffic or deploy basic domain filtering. It even comes with a low-overhead dashboard to monitor status at `http://127.0.0.1:8080/`.
 
 ---
 
-## Deployment Data
+## Installation & Usage
 
-### 1. Building the WebSocket Tunnel (`net_server.go`)
-This service acts as the endpoint for your tunneled traffic.
+### 1. The VPN Edge Server (`net_server.go`)
+
+This is what you run on your VPS to act as your exit node. You can build it straight from source:
 
 ```bash
 go build -o net_server.exe net_server.go
 ```
 
-**Running the Tunnel:**
-Use the provided batch script or run it manually.
+To run it, you can use the provided batch script (`run-netserver.bat`) or run it manually. 
 
+If you want to share port `443` with your existing website (putting `net_server` in the front), run it with these parameters:
 ```bash
-run-netserver.bat
+./net_server.exe -port 443 -tls true -web-port 8443 -web-sni your-domain.com
 ```
-*Note: The default port is `8080`. Adjust `NET_PORT`, `NET_UUID`, and `NET_PATH` in the `.bat` file according to your network requirements.*
+In short, you just need to reconfigure Nginx/Caddy to listen on an internal port like `8443` instead of 443. `net_server` will take over 443; if someone asks for `your-domain.com`, it kicks them over to 8443. Any other weird domains get handled as VPN traffic!
 
-**Client Connection Details:**
-Compatible clients (e.g., v2ray-core, v2box, etc.) can connect using standard VLESS JSON structures or URI links. Format:
-
+**Client App Setup:**
+Copy this URI and paste it directly into your favorite client (V2Ray, v2box, Shadowrocket). 
+*(Make sure to enable `allowInsecure: true` or "Skip Cert Verify" in your app, since we use dynamically generated Dummy Certs!)*
 ```text
-vless://[UUID]@[SERVER_IP]:[PORT]?encryption=none&security=none&type=ws&host=[HOST_HEADER]&path=%2F#NetTunnel
+vless://[UUID]@[SERVER_IP]:443?encryption=none&security=none&type=ws&host=[YOUR_SNI_BUG]&path=%2F#NetNinjaTunnel
 ```
 
-### 3. Deploying to Render.com (Free Tier)
-`net_server.go` is fully compatible with platform-as-a-service providers like Render.com. 
+### 2. The Traffic Filter (`proxy.go`)
 
-**Features added for Cloud Deployment:**
-- **Dynamic Port Binding**: Automatically detects the `$PORT` environment variable required by Render.
-- **Keep-Alive Endpoint**: Includes a `/healthz` HTTP endpoint that always returns HTTP 200 OK. You can use a free cron-job service (like cron-job.org) to ping `https://[your-render-url].onrender.com/healthz` every 10 minutes to prevent the free tier from spinning down (sleeping).
-
-**Deployment Steps:**
-1. Upload this codebase to a GitHub repository.
-2. In Render.com, create a new **Web Service**.
-3. Connect your GitHub repository.
-4. Render Configuration:
-   - **Environment:** `Go`
-   - **Build Command:** `go build -o net_server net_server.go`
-   - **Start Command:** `./net_server`
-5. Click **Deploy**. Render will allocate a URL (e.g., `https://netninja-tunnel.onrender.com`), and automatically handle the SSL/TLS/Port 443 termination for you!
-
-*(Alternatively, you can just use the provided `render-netserver.yaml` Blueprint file)*
-
----
-
-### 4. Building the Forward Proxy (`proxy.go`)
-This service is intended for localized network routing and filtering.
+Useful if you want to test filtering or set up a local network proxy.
 
 ```bash
 go build -o proxy.exe proxy.go
 ```
 
-**Running the Proxy:**
+Just run it:
 ```bash
 proxy.exe
 ```
-Access the local monitoring dashboard via standard HTTP at `http://127.0.0.1:8080/`.
 
 ---
 
-## Disclaimer
-This project is intended strictly for educational purposes, network routing studies, and personal privacy enhancement on authorized networks. The maintainers are not responsible for any misuse, policy violations, or damages caused by deploying this software in unauthorized environments.
+*Disclaimer: This project was built strictly for educational purposes, learning how to manipulate network packets, and studying firewall evasion techniques. The developers are not responsible for any misuse or policy violations if deployed on unauthorized networks! 🙏🏼*
