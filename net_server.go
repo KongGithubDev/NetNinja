@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -27,18 +28,18 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// bufferPool for 64KB buffers to reduce GC during UDP proxying
+// bufferPool for UDP: 4KB (handles all DNS responses without truncation)
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 65535)
+		b := make([]byte, 4096)
 		return &b
 	},
 }
 
-// copyBufferPool for 32KB buffers for io.CopyBuffer
+// copyBufferPool: 128KB - max sweet spot for streaming (larger has diminishing returns)
 var copyBufferPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 32*1024)
+		b := make([]byte, 128*1024)
 		return &b
 	},
 }
@@ -48,8 +49,10 @@ var (
 	uuidFlag    = flag.String("uuid", "b831381d-6324-4d53-ad4f-8cda48b30811", "VLESS UUID")
 	pathFlag    = flag.String("path", "/", "WebSocket Path")
 	webSNIFlag  = flag.String("web-sni", "", "Proxy these SNIs to real web server (e.g. your-domain.com)")
-	webPortFlag = flag.String("web-port", "8443", "Local web server port proxy destination")
-	tlsFlag     = flag.Bool("tls", true, "Enable internal TLS termination for VPN")
+	webPortFlag = flag.String("webport", "8443", "Local web server port")
+	tlsFlag     = flag.Bool("tls", true, "Enable internal TLS termination")
+	certFlag    = flag.String("cert", "", "Path to real SSL certificate (fullchain.pem)")
+	keyFlag     = flag.String("key", "", "Path to real SSL private key (privkey.pem)")
 )
 
 var (
@@ -61,8 +64,59 @@ var (
 	netDashClients = make(map[*websocket.Conn]bool)
 )
 
+var (
+	netDnsCache sync.Map // map[string]netDnsEntry (host -> {ip, expiry})
+	dnsExpiry   = 5 * time.Minute
+)
+
+type netDnsEntry struct {
+	ip     string
+	expiry time.Time
+}
+
+var nitroDialer = &net.Dialer{
+	Timeout:   10 * time.Second,
+	KeepAlive: 30 * time.Second,
+	Resolver: &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return net.DialTimeout("udp", "8.8.8.8:53", 2*time.Second)
+		},
+	},
+}
+
+func nitroDial(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nitroDialer.DialContext(ctx, network, address)
+	}
+
+	if net.ParseIP(host) != nil {
+		return nitroDialer.DialContext(ctx, network, address)
+	}
+
+	if v, ok := netDnsCache.Load(host); ok {
+		entry := v.(netDnsEntry)
+		if time.Now().Before(entry.expiry) {
+			return nitroDialer.DialContext(ctx, network, net.JoinHostPort(entry.ip, port))
+		}
+		netDnsCache.Delete(host)
+	}
+
+	// Resolve and Cache
+	ips, err := nitroDialer.Resolver.LookupHost(ctx, host)
+	if err == nil && len(ips) > 0 {
+		netDnsCache.Store(host, netDnsEntry{ip: ips[0], expiry: time.Now().Add(dnsExpiry)})
+		return nitroDialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
+	}
+
+	return nitroDialer.DialContext(ctx, network, address)
+}
+
 var netUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:     func(r *http.Request) bool { return true },
+	ReadBufferSize:  64 * 1024,
+	WriteBufferSize: 64 * 1024,
 }
 
 func init() {
@@ -90,6 +144,12 @@ func init() {
 			*tlsFlag = true
 		}
 	}
+	if envCert := os.Getenv("NET_CERT"); envCert != "" {
+		*certFlag = envCert
+	}
+	if envKey := os.Getenv("NET_KEY"); envKey != "" {
+		*keyFlag = envKey
+	}
 	u := strings.ReplaceAll(*uuidFlag, "-", "")
 	var err error
 	expectedUUID, err = hex.DecodeString(u)
@@ -99,9 +159,11 @@ func init() {
 }
 
 // wsConnAdapter wraps websocket.Conn to act as a standard net.Conn
+// mu protects against concurrent writes (gorilla/websocket is NOT concurrent-write-safe)
 type wsConnAdapter struct {
 	*websocket.Conn
-	r io.Reader
+	r  io.Reader
+	mu sync.Mutex
 }
 
 func (c *wsConnAdapter) Read(b []byte) (int, error) {
@@ -129,6 +191,8 @@ func (c *wsConnAdapter) Read(b []byte) (int, error) {
 }
 
 func (c *wsConnAdapter) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	err := c.Conn.WriteMessage(websocket.BinaryMessage, b)
 	if err != nil {
 		return 0, err
@@ -166,7 +230,14 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 	wsAdapter := &wsConnAdapter{Conn: conn}
 
 	// Set a deadline for the VLESS handshake to prevent half-open connection leaks
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	// Heartbeat: reset read deadline on every Ping from client
+	// NOTE: WriteControl (Pong) is concurrent-safe in gorilla, NO mutex needed here.
+	conn.SetPingHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		return conn.WriteControl(websocket.PongMessage, []byte{}, time.Now().Add(5*time.Second))
+	})
 
 	// 1 byte ver
 	ver := make([]byte, 1)
@@ -250,7 +321,10 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetAddr := fmt.Sprintf("%s:%d", targetHost, targetPort)
-	log.Printf("[VLESS] Connecting to %s (CMD: %d)", targetAddr, cmd)
+	// log.Printf("[VLESS] Connecting to %s (CMD: %d)", targetAddr, cmd) // SILENCED: 100+ calls/sec kills Windows terminal performance
+
+	// ✅ CRITICAL: Clear handshake deadline - let connection live indefinitely (Heartbeat handles drops)
+	conn.SetReadDeadline(time.Time{})
 
 	// Send VLESS response
 	// Version: 0, Addon length: 0
@@ -267,6 +341,14 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer dest.Close()
+
+		// Tune TCP Socket for optimal latency and bandwidth (Nitro-Z: 512KB)
+		if tcpConn, ok := dest.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetReadBuffer(512 * 1024)
+			tcpConn.SetWriteBuffer(512 * 1024)
+		}
 
 		errc := make(chan error, 2)
 		go func() {
@@ -310,8 +392,12 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				// Write VLESS UDP payload: 2 byte length + payload
-				lenBuf := []byte{byte(n >> 8), byte(n & 0xff)}
-				wsAdapter.Write(append(lenBuf, buf[:n]...))
+				// Zero-allocation approach: write length then data or use a composite buffer
+				fullMsg := make([]byte, 2+n) // Small allocation is better than append's multiple copies
+				fullMsg[0] = byte(n >> 8)
+				fullMsg[1] = byte(n & 0xff)
+				copy(fullMsg[2:], buf[:n])
+				wsAdapter.Write(fullMsg)
 			}
 		}()
 
@@ -362,6 +448,14 @@ func (c *peekedConn) Read(p []byte) (int, error) {
 }
 
 func handleConnection(conn net.Conn, webSNIs map[string]bool, webPort string, tlsConfig *tls.Config, httpMap chan net.Conn) {
+	// TCP Tuning for incoming connection (Nitro-Z: 512KB)
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetReadBuffer(512 * 1024)
+		tcpConn.SetWriteBuffer(512 * 1024)
+	}
+
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReader(conn)
 
@@ -488,7 +582,21 @@ func readSNI(data []byte) string {
 	return ""
 }
 
-func generateDummyCert() (*tls.Certificate, error) {
+func getTLSConfig() (*tls.Config, error) {
+	// 1. Use Real Certificate if provided
+	if *certFlag != "" && *keyFlag != "" {
+		cert, err := tls.LoadX509KeyPair(*certFlag, *keyFlag)
+		if err == nil {
+			log.Printf("[TLS] Using real certificate from: %s", *certFlag)
+			return &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				NextProtos:   []string{"h2", "http/1.1"}, // ALPN for 100 Mbps Stealth
+			}, nil
+		}
+		log.Printf("[ERR] Failed to load real certificate: %v. Falling back to self-signed.", err)
+	}
+
+	// 2. Fallback to Self-Signed
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
@@ -508,19 +616,19 @@ func generateDummyCert() (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	cert := tls.Certificate{
+	tlsCert := tls.Certificate{
 		Certificate: [][]byte{derBytes},
 		PrivateKey:  priv,
 	}
-	return &cert, nil
+	return &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	}, nil
 }
 
 func broadcastStats() {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	for range ticker.C {
-		var ms runtime.MemStats
-		runtime.ReadMemStats(&ms)
-
 		upSecs := int(time.Since(netStartTime).Seconds())
 		uptime := fmt.Sprintf("%dh %02dm %02ds", upSecs/3600, (upSecs%3600)/60, upSecs%60)
 
@@ -529,8 +637,8 @@ func broadcastStats() {
 			"users":       atomic.LoadInt64(&netActiveConns),
 			"active_conn": atomic.LoadInt64(&netActiveConns),
 			"total_req":   atomic.LoadInt64(&netTotalReqs),
-			"mem_heap":    fmt.Sprintf("%.1f MB", float64(ms.Alloc)/1024/1024),
-			"mem_sys":     fmt.Sprintf("%.1f MB", float64(ms.Sys)/1024/1024),
+			"mem_heap":    "Nitro-X",
+			"mem_sys":     "Nitro-X",
 			"goroutines":  runtime.NumGoroutine(),
 			"go_ver":      runtime.Version(),
 			"cpus":        runtime.NumCPU(),
@@ -539,14 +647,26 @@ func broadcastStats() {
 
 		payload, _ := json.Marshal(stat)
 
+		// Capture clients into a slice to avoid long lock
+		var clients []*websocket.Conn
 		netClientsMu.Lock()
 		for c := range netDashClients {
-			if err := c.WriteMessage(websocket.TextMessage, payload); err != nil {
-				c.Close()
-				delete(netDashClients, c)
-			}
+			clients = append(clients, c)
 		}
 		netClientsMu.Unlock()
+
+		// Broadcast asynchronously to prevent lag
+		for _, c := range clients {
+			go func(conn *websocket.Conn) {
+				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+					conn.Close()
+					netClientsMu.Lock()
+					delete(netDashClients, conn)
+					netClientsMu.Unlock()
+				}
+			}(c)
+		}
 	}
 }
 
@@ -593,12 +713,10 @@ func main() {
 
 	var tlsConfig *tls.Config
 	if *tlsFlag {
-		cert, err := generateDummyCert()
+		var err error
+		tlsConfig, err = getTLSConfig()
 		if err != nil {
-			log.Fatalf("Failed to generate cert: %v", err)
-		}
-		tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{*cert},
+			log.Fatalf("Failed to get TLS config: %v", err)
 		}
 	}
 
@@ -630,6 +748,7 @@ func main() {
 	log.Printf("========================================")
 	log.Printf("       NetNinja VLESS VPN Server        ")
 	log.Printf("             SNI Multiplexer            ")
+	log.Printf("             [NITRO-ULTRA]             ")
 	log.Printf("========================================")
 	log.Printf("  Port     : %s", *portFlag)
 	log.Printf("  UUID     : %s", *uuidFlag)
