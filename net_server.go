@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -17,7 +18,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -32,9 +36,16 @@ var (
 	tlsFlag     = flag.Bool("tls", true, "Enable internal TLS termination for VPN")
 )
 
-var expectedUUID []byte
+var (
+	expectedUUID   []byte
+	netActiveConns int64
+	netTotalReqs   int64
+	netStartTime   time.Time
+	netClientsMu   sync.Mutex
+	netDashClients = make(map[*websocket.Conn]bool)
+)
 
-var upgrader = websocket.Upgrader{
+var netUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
@@ -120,13 +131,26 @@ func (c *wsConnAdapter) SetWriteDeadline(t time.Time) error { return c.Conn.SetW
 
 // handleVLESS handles the VLESS over WebSocket protocol
 func handleVLESS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		// Not a websocket connection, do not upgrade
+		return
+	}
+
+	atomic.AddInt64(&netTotalReqs, 1)
+	conn, err := netUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	defer conn.Close()
+	atomic.AddInt64(&netActiveConns, 1)
+	defer func() {
+		atomic.AddInt64(&netActiveConns, -1)
+		conn.Close()
+	}()
 
 	wsAdapter := &wsConnAdapter{Conn: conn}
+
+	// Set a deadline for the VLESS handshake to prevent half-open connection leaks
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	// 1 byte ver
 	ver := make([]byte, 1)
@@ -216,6 +240,9 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 	// Version: 0, Addon length: 0
 	wsAdapter.Write([]byte{0, 0})
 
+	// Handshake successful, clear the read deadline for normal tunnel operation
+	conn.SetReadDeadline(time.Time{})
+
 	if cmd == 1 {
 		// TCP Processing
 		dest, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
@@ -228,10 +255,15 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 		errc := make(chan error, 2)
 		go func() {
 			_, err := io.Copy(dest, wsAdapter)
+			if tcpConn, ok := dest.(*net.TCPConn); ok {
+				tcpConn.CloseWrite()
+			}
 			errc <- err
 		}()
 		go func() {
 			_, err := io.Copy(wsAdapter, dest)
+			// When the destination closes, force close the websocket to break the other io.Copy
+			conn.Close()
 			errc <- err
 		}()
 		<-errc
@@ -264,12 +296,14 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 			for {
 				// Read 2 byte length
 				if _, err := io.ReadFull(wsAdapter, lb); err != nil {
+					conn.Close()
 					errc <- err
 					return
 				}
 				n := int(lb[0])<<8 | int(lb[1])
 				pkt := make([]byte, n)
 				if _, err := io.ReadFull(wsAdapter, pkt); err != nil {
+					conn.Close()
 					errc <- err
 					return
 				}
@@ -338,6 +372,18 @@ func handleConnection(conn net.Conn, webSNIs map[string]bool, webPort string, tl
 		proxyToWeb = true
 	}
 
+	// Detect if it is a plain HTTP request hitting the HTTPS port
+	var isPlainHTTP bool
+	if len(hdr) >= 4 {
+		methodStr := string(hdr[:4])
+		// Matches GET, POST, PUT, HEAD, OPTIONS, DELETE, CONNECT, TRACE
+		if methodStr == "GET " || methodStr == "POST" || methodStr == "PUT " ||
+			methodStr == "HEAD" || methodStr == "OPTI" || methodStr == "DELE" ||
+			methodStr == "CONN" || methodStr == "TRAC" {
+			isPlainHTTP = true
+		}
+	}
+
 	peekConn := &peekedConn{Conn: conn, r: reader}
 
 	if proxyToWeb {
@@ -358,7 +404,12 @@ func handleConnection(conn net.Conn, webSNIs map[string]bool, webPort string, tl
 		return
 	}
 
-	if isTLS && tlsConfig != nil {
+	if isPlainHTTP {
+		// Pass directly to the internal Go HTTP server without TLS wrapper
+		// This ensures requests hitting the direct port via HTTP reach the dashboard cleanly
+		httpMap <- peekConn
+		return
+	} else if isTLS && tlsConfig != nil {
 		tlsConn := tls.Server(peekConn, tlsConfig)
 		httpMap <- tlsConn
 	} else {
@@ -440,20 +491,77 @@ func generateDummyCert() (*tls.Certificate, error) {
 	return &cert, nil
 }
 
-func main() {
-	if *pathFlag != "/" {
-		http.HandleFunc(*pathFlag, handleVLESS)
-	}
+func broadcastStats() {
+	ticker := time.NewTicker(1 * time.Second)
+	for range ticker.C {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
 
-	// Default handler to mask the server to scanners
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == *pathFlag {
-			handleVLESS(w, r)
-			return
+		upSecs := int(time.Since(netStartTime).Seconds())
+		uptime := fmt.Sprintf("%dh %02dm %02ds", upSecs/3600, (upSecs%3600)/60, upSecs%60)
+
+		stat := map[string]interface{}{
+			"uptime":      uptime,
+			"users":       atomic.LoadInt64(&netActiveConns),
+			"active_conn": atomic.LoadInt64(&netActiveConns),
+			"total_req":   atomic.LoadInt64(&netTotalReqs),
+			"mem_heap":    fmt.Sprintf("%.1f MB", float64(ms.Alloc)/1024/1024),
+			"mem_sys":     fmt.Sprintf("%.1f MB", float64(ms.Sys)/1024/1024),
+			"goroutines":  runtime.NumGoroutine(),
+			"go_ver":      runtime.Version(),
+			"cpus":        runtime.NumCPU(),
+			"rules":       len(strings.Split(*webSNIFlag, ",")),
 		}
 
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("Not Found"))
+		payload, _ := json.Marshal(stat)
+
+		netClientsMu.Lock()
+		for c := range netDashClients {
+			if err := c.WriteMessage(websocket.TextMessage, payload); err != nil {
+				c.Close()
+				delete(netDashClients, c)
+			}
+		}
+		netClientsMu.Unlock()
+	}
+}
+
+func main() {
+	netStartTime = time.Now()
+	go broadcastStats()
+
+	if *pathFlag != "/" {
+		http.HandleFunc(*pathFlag, func(w http.ResponseWriter, r *http.Request) {
+			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				handleVLESS(w, r)
+				return
+			}
+			// Fallback to Dashboard if accessing VLESS path directly in browser
+			serveDashboard(w, r)
+		})
+	}
+
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := netUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		netClientsMu.Lock()
+		netDashClients[conn] = true
+		netClientsMu.Unlock()
+	})
+
+	// Default handler serving the Dashboard or VLESS (if path is /)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// If VLESS is configured on the root path
+		if r.URL.Path == *pathFlag {
+			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				handleVLESS(w, r)
+				return
+			}
+		}
+
+		serveDashboard(w, r)
 	})
 
 	var tlsConfig *tls.Config
@@ -512,4 +620,100 @@ func main() {
 		}
 		go handleConnection(conn, webSNIs, *webPortFlag, tlsConfig, memListener.conns)
 	}
+}
+
+func serveDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	dashHTML := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>net_server dashboard [v1.1]</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:13px/1.6 'Courier New',monospace;margin:0;padding:40px 20px}
+.w{max-width:550px;margin:0 auto}
+h1{color:#fff;font-size:18px;margin:0 0 4px;font-weight:normal;display:flex;align-items:center}
+h1 span{color:#0a0;margin-right:10px}
+.sub{color:#444;font-size:11px;margin-bottom:30px;letter-spacing:1px}
+hr{border:0;border-top:1px solid #222;margin:25px 0}
+.row{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #111}
+.row .k{color:#666;text-transform:lowercase}
+.row .v{color:#eee;transition:all 0.3s}
+.num{color:#0f0;font-weight:bold}
+.pac-box{background:#111;border:1px solid #222;padding:12px 15px;margin:15px 0;border-radius:4px}
+.pac-box .k{color:#444;font-size:10px;margin-bottom:8px;text-transform:uppercase}
+.pac-url{color:#7af;word-break:break-all;font-size:11px;cursor:pointer}
+.flash{color:#fff !important;text-shadow:0 0 8px #0f0}
+.section-title{color:#444;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin:25px 0 10px}
+.footer{margin-top:40px;font-size:11px;color:#333}
+.footer a{color:#555;text-decoration:none}
+.footer a:hover{color:#7af}
+</style>
+</head>
+<body>
+<div class="w">
+	<h1><span>●</span> net_server edge</h1>
+	<div class="sub">sni_multiplexer_interface</div>
+
+	<div class="section-title">core_metrics</div>
+	<div class="row"><span class="k">uptime</span><span class="v" id="uptime">--</span></div>
+	<div class="row"><span class="k">vpn_active_conns</span><span class="v num" id="active">0</span></div>
+	<div class="row"><span class="k">total_requests</span><span class="v num" id="total">0</span></div>
+
+	<div class="section-title">memory_runtime</div>
+	<div class="row"><span class="k">heap_alloc</span><span class="v" id="mem_heap">--</span></div>
+	<div class="row"><span class="k">sys_total</span><span class="v" id="mem_sys">--</span></div>
+	<div class="row"><span class="k">goroutines</span><span class="v" id="goroutines">0</span></div>
+	<div class="row"><span class="k">runtime_env</span><span class="v" id="go_ver" style="font-size:10px;color:#555">--</span></div>
+
+	<div class="section-title">multiplexer_config</div>
+	<div class="row"><span class="k">protected_vless_port</span><span class="v">%s</span></div>
+	<div class="row"><span class="k">passthrough_web_port</span><span class="v">%s</span></div>
+	<div class="row"><span class="k">routed_sni_domains</span><span class="v" id="rules">0</span></div>
+
+	<div class="footer">
+		<span id="ws_status" style="color:#444">connecting_ws...</span>
+		<div style="margin-top:15px;color:#222;font-size:10px;text-transform:uppercase;letter-spacing:1px">
+			vless_core // sniper_engine
+		</div>
+	</div>
+</div>
+
+<script>
+	const updateVal = (id, val) => {
+		const el = document.getElementById(id);
+		if (el && el.textContent !== String(val)) {
+			el.textContent = val;
+			el.classList.add('flash');
+			setTimeout(() => el.classList.remove('flash'), 500);
+		}
+	};
+
+	const connect = () => {
+		const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+		const ws = new WebSocket(protocol + '//' + location.host + '/ws');
+		ws.onopen = () => document.getElementById('ws_status').textContent = 'ws_live';
+		ws.onclose = () => {
+			document.getElementById('ws_status').textContent = 'ws_reconnecting...';
+			setTimeout(connect, 2000);
+		};
+		ws.onmessage = (e) => {
+			const d = JSON.parse(e.data);
+			updateVal('uptime', d.uptime);
+			updateVal('active', d.active_conn);
+			updateVal('total', d.total_req);
+			updateVal('mem_heap', d.mem_heap);
+			updateVal('mem_sys', d.mem_sys);
+			updateVal('goroutines', d.goroutines);
+			updateVal('rules', d.rules);
+			updateVal('go_ver', d.go_ver + ' (' + d.cpus + ' CPUs)');
+		};
+	};
+	connect();
+</script>
+</body>
+</html>`, *portFlag, *webPortFlag)
+	w.Write([]byte(dashHTML))
 }
