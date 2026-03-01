@@ -55,6 +55,23 @@ Execute the binary:
 proxy.exe
 ```
 
+### 3. PC Client Setup (v2rayN / Windows)
+
+For Windows users who want to use the VPN tunnel directly on their PC (bypassing the need to tether from a mobile device or router), you can use **v2rayN**.
+
+1. Download **v2rayN-Core.zip** from the [v2rayN GitHub Releases](https://github.com/2dust/v2rayN/releases).
+2. Extract the ZIP file and run `v2rayN.exe`.
+3. Copy your `vless://...` URI.
+4. In v2rayN, press `Ctrl+V` or go to **Servers** > **Import from Clipboard**.
+5. Double-click the imported server to verify settings. Ensure that:
+   - **Network (Transport):** `ws`
+   - **Path:** `/`
+   - **TLS:** `tls`
+   - **SNI:** *[Your SNI Bug domain, e.g., line.me]*
+   - **AllowInsecure:** `true` (Crucial! because net_server uses self-signed certificates)
+6. Click **Confirm**. Right-click the server in the list and select **Set as active server**.
+7. Right-click the v2rayN icon in the system tray (bottom right of your screen), go to **System Proxy**, and select **Set system proxy**.
+
 ---
 
 *Disclaimer: This project was built strictly for educational purposes, learning how to manipulate network packets, and studying firewall evasion techniques. The developers are not responsible for any misuse or policy violations if deployed on unauthorized networks.*
