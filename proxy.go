@@ -30,14 +30,6 @@ var upgrader = websocket.Upgrader{
 var db *sql.DB
 var openedForIPs sync.Map // map[string]bool
 
-// Buffer pool — reuse 64KB buffers to reduce GC pressure
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		buf := make([]byte, 64*1024)
-		return &buf
-	},
-}
-
 // DNS cache — avoid repeated lookups for same host
 type dnsEntry struct {
 	ip     string
@@ -119,6 +111,60 @@ func cachedResolve(ctx context.Context, host string) (string, error) {
 	return ip, nil
 }
 
+// hyperResolve resolves via standard DNS and DoH simultaneously
+func hyperResolve(ctx context.Context, host string) (string, error) {
+	if net.ParseIP(host) != nil {
+		return host, nil
+	}
+
+	// 1. Check Cache
+	if v, ok := dnsCache.Load(host); ok {
+		entry := v.(dnsEntry)
+		if time.Now().Before(entry.expiry) {
+			return entry.ip, nil
+		}
+	}
+
+	type res struct {
+		ip  string
+		err error
+	}
+	ch := make(chan res, 2)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	go func() {
+		ips, err := customResolver.LookupHost(ctx, host)
+		if err == nil && len(ips) > 0 {
+			ch <- res{ip: ips[0], err: nil}
+		} else {
+			ch <- res{ip: "", err: err}
+		}
+	}()
+
+	go func() {
+		ip, err := resolveDoH(host)
+		ch <- res{ip: ip, err: err}
+	}()
+
+	var lastErr error
+	for i := 0; i < 2; i++ {
+		r := <-ch
+		if r.err == nil && r.ip != "" {
+			// Cache result for 5 min
+			exp := time.Now().Add(5 * time.Minute)
+			dnsCache.Store(host, dnsEntry{ip: r.ip, expiry: exp})
+			go func() {
+				_, _ = db.Exec("INSERT OR REPLACE INTO dns_records (host, ip, expiry) VALUES (?, ?, ?)", host, r.ip, exp)
+			}()
+			return r.ip, nil
+		}
+		lastErr = r.err
+	}
+
+	return "", lastErr
+}
+
 // DoH resolution using Cloudflare/Google
 func resolveDoH(host string) (string, error) {
 	urls := []string{
@@ -192,26 +238,30 @@ var customResolver = &net.Resolver{
 	},
 }
 
-// Custom dialer — fast timeouts for snappy connections
+// Custom dialer — Native performance with aggressive keep-alive
 var customDialer = &net.Dialer{
-	Timeout:   5 * time.Second,
+	Timeout:   10 * time.Second,
 	KeepAlive: 30 * time.Second,
 	Resolver:  customResolver,
+	Control: func(network, address string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			// Leave SO_RCVBUF/SO_SNDBUF alone to allow Windows Auto-Tuning (God-Mode)
+			// Windows is superior at calculating optimal window sizes for fiber.
+		})
+	},
 }
 
-// Custom transport — aggressive connection pooling
+// Custom transport — God-Mode concurrency for heavy video streaming
 var proxyTransport = &http.Transport{
 	DialContext:           customDialer.DialContext,
-	MaxIdleConns:          1000,
-	MaxIdleConnsPerHost:   100,
-	IdleConnTimeout:       120 * time.Second,
-	TLSHandshakeTimeout:   5 * time.Second,
-	ExpectContinueTimeout: 500 * time.Millisecond,
-	ResponseHeaderTimeout: 30 * time.Second,
+	MaxIdleConns:          5000,
+	MaxIdleConnsPerHost:   1000,
+	IdleConnTimeout:       60 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ResponseHeaderTimeout: 60 * time.Second,
 	DisableCompression:    false,
 	ForceAttemptHTTP2:     true,
-	WriteBufferSize:       128 * 1024,
-	ReadBufferSize:        128 * 1024,
 }
 
 func enableWindowsANSI() {
@@ -378,9 +428,9 @@ func main() {
 	proxy := &http.Server{
 		Addr:         "0.0.0.0:" + port,
 		Handler:      http.HandlerFunc(handleRequest),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  180 * time.Second,
 	}
 
 	fmt.Println()
@@ -792,6 +842,8 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	removeHopHeaders(w.Header())
 
 	w.WriteHeader(resp.StatusCode)
+
+	// Native Zero-Copy: Let Go optimize data transfer
 	io.Copy(w, resp.Body)
 
 	// Nitro: Background logging to avoid blocking the request cleanup
@@ -842,38 +894,25 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Resolution logic with SQLite Cache
 	cachedRule, previouslyCisco := getDomainRule(hostname)
 
-	// If it's a new domain, determine rule
-	if cachedRule == "" {
-		if isCisco || isManualProxy(hostname) {
-			cachedRule = "PROXY"
-		} else {
-			cachedRule = "DIRECT"
-		}
-		setDomainRule(hostname, cachedRule, isCisco)
+	// Overkill DNS: Resolve EVERY domain via optimized resolver
+	// This bypasses slow ISP DNS and finds better GGC nodes for YouTube
+	tag := "[DIRECT]"
+	if cachedRule == "PROXY" || isCisco || previouslyCisco {
+		tag = "[PROXY]"
+	} else if strings.Contains(hostname, "googlevideo.com") || strings.Contains(hostname, "youtube.com") {
+		tag = "[YOUTUBE-BOOST]"
 	}
 
-	var ip string
-	if cachedRule == "DIRECT" {
-		// Silent: don't log normal direct connections
+	log.Printf("%s%s%s %s ← %s", colorGreen, tag, colorReset, hostname, clientIP)
+
+	var dnsErr error
+	ip, dnsErr := hyperResolve(r.Context(), hostname)
+	if dnsErr != nil {
+		log.Printf("%s[WARN]%s DNS failed for %s: %v. Falling back to hostname.", colorYellow, colorReset, hostname, dnsErr)
 		ip = hostname
-	} else {
-		// High Visibility: Show PROXY or CISCO log
-		tag := "[PROXY]"
-		if isCisco || previouslyCisco {
-			tag = "[CISCO-DETECTOR]"
-		}
-		log.Printf("%s%s%s %s ← %s", colorGreen, tag, colorReset, hostname, clientIP)
-
-		// PROXY logic: Try resolving via Cache -> Std DNS -> DoH
-		var dnsErr error
-		ip, dnsErr = cachedResolve(r.Context(), hostname)
-		if dnsErr != nil {
-			log.Printf("%s[WARN]%s Proxy DNS %s failed: %v. Falling back to DIRECT.", colorYellow, colorReset, hostname, dnsErr)
-			ip = hostname
-		}
 	}
 
-	destConn, err := net.DialTimeout("tcp", ip+":"+port, 5*time.Second)
+	destConn, err := customDialer.DialContext(r.Context(), "tcp", ip+":"+port)
 	if err != nil {
 		atomic.AddInt64(&activeConns, -1)
 		log.Printf("%s[ERR]%s CONNECT %s failed: %s", colorRed, colorReset, host, err)
@@ -899,11 +938,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
+	// God-Mode: Pure native performance (No overrides, allow OS Auto-Tuning)
 	if tc, ok := clientConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
+		tc.SetKeepAlive(true)
 	}
 	if tc, ok := destConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
+		tc.SetKeepAlive(true)
 	}
 
 	log.Printf("%s[TLS]%s %s ↔ %s %s(tunnel established)%s",
@@ -912,23 +954,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		colorGray, colorReset)
 
 	go func() {
-		transfer(destConn, clientConn)
+		// Native optimization (ReadFrom logic)
+		io.Copy(destConn, clientConn)
 		atomic.AddInt64(&activeConns, -1)
-		log.Printf("%s[TLS]%s %s ✕ %s %s(closed)%s",
-			colorGray, colorReset,
-			clientIP, host,
-			colorGray, colorReset)
 	}()
-	go transfer(clientConn, destConn)
-}
-
-// transfer pipes data between two connections using pooled buffers
-func transfer(dst, src net.Conn) {
-	defer dst.Close()
-	defer src.Close()
-	bufp := bufPool.Get().(*[]byte)
-	defer bufPool.Put(bufp)
-	io.CopyBuffer(dst, src, *bufp)
+	io.Copy(clientConn, destConn)
 }
 
 // copyHeaders copies HTTP headers
@@ -988,13 +1018,20 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 		hostname = h
 		port = p
 	}
-	destConn, err := net.DialTimeout("tcp", hostname+":"+port, 5*time.Second)
+	destConn, err := customDialer.DialContext(r.Context(), "tcp", hostname+":"+port)
 	if err != nil {
 		log.Printf("%s[ERR]%s WS Dial %s failed: %v", colorRed, colorReset, host, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
 	defer destConn.Close()
+
+	// Overkill: Tuning destination socket for WS
+	if tc, ok := destConn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		tc.SetReadBuffer(16 * 1024 * 1024)
+		tc.SetWriteBuffer(16 * 1024 * 1024)
+	}
 
 	// 2. Hijack the client connection
 	hijacker, ok := w.(http.Hijacker)
@@ -1008,6 +1045,13 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 		return
 	}
 	defer clientConn.Close()
+
+	// Overkill: Tuning client socket for WS
+	if tc, ok := clientConn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		tc.SetReadBuffer(16 * 1024 * 1024)
+		tc.SetWriteBuffer(16 * 1024 * 1024)
+	}
 
 	// 3. Forward the original GET request with upgrade headers
 	// Ensure Host header is correct for the destination
@@ -1023,7 +1067,7 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 	req.WriteString("\r\n")
 	destConn.Write([]byte(req.String()))
 
-	// 4. Pipe binary data
+	// 4. Pipe binary data (Native Zero-Copy)
 	errChan := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(destConn, clientConn)
