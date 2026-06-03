@@ -1,131 +1,210 @@
 # NetNinja
 
-**NetNinja** is a lightweight, multipurpose networking toolkit written in Go. It is built specifically to deploy fast forward proxies and bypass firewalls using WebSocket (VLESS) tunnels. It is designed to be fast, minimal, and resource-efficient.
+NetNinja is a lightweight, high-performance networking toolkit written in Go. It provides a VLESS VPN server with SNI multiplexing and an HTTP/HTTPS forward proxy, designed for low-latency streaming and firewall evasion.
 
-![NetNinja Dashboard Preview](./preview.png)
+## Components
 
-## Core Tools
+### 1. net_server (VLESS VPN + SNI Multiplexer)
 
-1. **`net_server.go` (VLESS VPN + SNI Multiplexer)**
-   This component serves as a VLESS server featuring a built-in **SNI Multiplexer**. This capability allows the server to listen on port `443` while seamlessly sharing the same port with an existing web server (such as Nginx or Caddy). It operates by interrogating incoming TLS ClientHello packets:
-   - For standard website traffic, it proxies the raw connection directly to the upstream web server, preserving the original SSL sequence.
-   - For incoming VPN traffic utilizing an **SNI Bug** (e.g., `line.me`), it dynamically generates a temporary in-memory certificate, terminates the TLS connection, and transitions into an active VLESS VPN session.
-   - **Important Note:** Because `net_server` relies on intercepting SNI handshakes, it **requires port 443**.
+A VLESS server with built-in SNI multiplexer that listens on a single port (default 443) and transparently shares it with an existing web server. It inspects incoming TLS ClientHello packets:
 
-2. **`proxy.go` (NetNinja HTTP/HTTPS Proxy)**
-   A straightforward Forward Proxy suitable for routing local traffic or deploying domain-based filtering. It includes a low-overhead dashboard for monitoring status, accessible at `http://127.0.0.1:8080/`.
+- Recognized SNI domains are proxied to the upstream web server (e.g. Nginx on port 8443) preserving the original TLS handshake.
+- Unrecognized traffic (e.g. VPN clients using an SNI bug) triggers a dynamically generated in-memory certificate, TLS termination, and VLESS VPN session.
+
+**Key Features:**
+
+- Real SSL support via `-cert` / `-key` flags or auto-generated self-signed certificates
+- ALPN stealth advertising h2 and http/1.1
+- Concurrent-safe WebSocket with mutex-protected writes
+- WebSocket Ping/Pong heartbeat for unstable mobile networks
+- Dual-mode buffer pools: 512KB for TCP streaming, 4KB for UDP
+- TCP socket tuning: SetNoDelay, KeepAlive, 512KB socket buffers
+- sync.Pool buffer reuse for minimal GC pressure
+
+### 2. proxy (HTTP/HTTPS Forward Proxy)
+
+A forward proxy with domain-based filtering and Cisco Umbrella SSE unwrapping. Includes a low-overhead status dashboard.
+
+**Key Features:**
+
+- Cisco Umbrella SSE detection and transparent unwrapping
+- Dual DNS resolution (standard + DoH) for bypassing filtered resolvers
+- SQLite-backed persistent DNS cache and domain rule store
+- Real-time dashboard with active user tracking and connection metrics
 
 ---
 
-## Performance Features (NITRO-ULTRA)
+## Performance Optimizations
 
-NetNinja's `net_server` includes several advanced optimizations for maximum throughput and stability:
+### DNS Resolver Chain
 
-- **Real SSL Support** — Use your own certificate (`-cert` / `-key` flags) or Cloudflare Origin Certificate for stealth TLS
-- **ALPN Stealth** — Advertises `h2` and `http/1.1` to mimic standard browsers
-- **Concurrent-Safe WebSocket** — Mutex-protected writes prevent frame corruption under load
-- **WebSocket Heartbeat** — Automatic Ping/Pong keeps connections alive on unstable mobile networks
-- **Dual-Mode Buffers** — 128KB TCP buffers for smooth video streaming, 4KB UDP buffers for low-latency gaming
-- **Zero-Log Mode** — Per-connection logging silenced to eliminate Windows terminal I/O bottleneck
-- **TCP Tuning** — `SetNoDelay`, `KeepAlive`, 512KB socket buffers for maximum throughput
-- **Buffer Pooling** — `sync.Pool` for both TCP and UDP to minimize GC pressure
-- **Full CPU Utilization** — `GOMAXPROCS` set to use all available cores
+1. In-memory cache (with video CDN-aware TTL)
+2. Standard DNS via Google/Cloudflare resolvers (8.8.8.8, 1.1.1.1)
+3. DNS over HTTPS (Cloudflare + Google) as fallback
+4. IPv6 (AAAA record) support with automatic fallback
+
+Video streaming CDN domains (googlevideo.com, youtube.com, fbcdn.net, etc.) use a reduced TTL of 30 seconds to ensure optimal edge node selection.
+
+### QUIC/HTTP3 UDP NAT Relay
+
+net_server includes a UDP NAT relay on the same port as the TCP listener, enabling QUIC/HTTP3 traffic to pass through the tunnel. This reduces latency for YouTube live streams and other services that prefer QUIC over TCP.
+
+- NAT mapping keyed by client IP:port
+- Automatic stale entry cleanup after 5 minutes
+- Race-condition-safe entry creation with isWinner pattern
+- 64KB buffer pool for large UDP datagrams
+
+### Garbage Collection Tuning
+
+Both components support GC tuning via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| NET_GOGC | 200 | Go GC percentage target (higher = less frequent GC) |
+| NET_MEMLIMIT | 536870912 (512MB) | Soft memory limit to prevent OOM |
 
 ---
 
-## Installation & Usage
+## Installation
 
-### 1. The VPN Edge Server (`net_server.go`)
+### Prerequisites
 
-This service is intended to act as the exit node on a VPS. It can be built directly from the source code:
+- Go 1.21 or later
+- Git
+
+### Build
 
 ```bash
+# Build both components
 go build -o net_server.exe net_server.go
+go build -o proxy.exe proxy.go
+
+# Build with version injection (proxy.go only)
+powershell -File build.ps1
 ```
 
-To execute the service, use the provided batch script (`run-netserver.bat`) or run the executable directly.
+---
 
-#### Basic Usage (Self-Signed Certificate)
+## Usage
+
+### 1. VPN Edge Server (net_server)
+
+This component runs on a VPS as the tunnel exit node.
+
+#### Basic (Self-Signed Certificate)
+
 ```bash
-./net_server.exe -port 443 -tls true -web-port 8443 -web-sni your-domain.com
+./net_server.exe -port 443 -tls true -web-port 8443 -web-sni example.com
 ```
 
-#### With Real SSL Certificate (Recommended for Speed)
+#### With Real SSL Certificate
+
 ```bash
-./net_server.exe -port 443 -tls true -cert fullchain.pem -key privkey.pem -web-port 8443 -web-sni your-domain.com
+./net_server.exe -port 443 -cert fullchain.pem -key privkey.pem -web-port 8443 -web-sni example.com
 ```
-
-Ensure that the upstream web server (Nginx/Caddy) is configured to listen on an internal port such as `8443` instead of `443`. `net_server` will govern port `443`; traffic matching `your-domain.com` will be forwarded to port `8443`. Unrecognized domains will be processed as VPN traffic.
 
 #### Command-Line Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-port` | `443` | Listen port |
-| `-uuid` | *(built-in)* | VLESS UUID for authentication |
-| `-path` | `/` | WebSocket path |
-| `-tls` | `true` | Enable TLS termination |
-| `-cert` | *(empty)* | Path to SSL certificate (PEM) |
-| `-key` | *(empty)* | Path to SSL private key (PEM) |
-| `-web-sni` | *(empty)* | SNI domains to proxy to web server |
-| `-webport` | `8443` | Local web server port |
+| -port | 443 | Listen port |
+| -uuid | b831381d-6324-4d53-ad4f-8cda48b30811 | VLESS UUID |
+| -path | / | WebSocket path for VLESS |
+| -tls | true | Enable internal TLS termination |
+| -cert | | Path to SSL certificate (PEM) |
+| -key | | Path to SSL private key (PEM) |
+| -web-sni | | Comma-separated SNI domains to forward to web server |
+| -webport | 8443 | Local web server port |
+| -pac | /proxy.pac | PAC file path |
+| -proxy-addr | | Override proxy address in PAC |
+| -udp-port | *auto | UDP port for QUIC/HTTP3 relay (*auto = same as -port) |
 
 #### Environment Variables
 
-All flags can also be set via environment variables: `NET_PORT`, `NET_UUID`, `NET_PATH`, `NET_TLS`, `NET_CERT`, `NET_KEY`, `NET_WEB_SNI`, `NET_WEB_PORT`.
+The following flags support environment variables: `NET_PORT`, `NET_UUID`, `NET_PATH`, `NET_TLS`, `NET_CERT`, `NET_KEY`, `NET_WEB_SNI`, `NET_WEB_PORT`, `NET_PROXY_ADDR`, `NET_GOGC`, `NET_MEMLIMIT`. Flags `-pac` and `-udp-port` are flag-only.
 
-**Client Application Setup:**
-Copy the following URI and import it into a compatible client (e.g., V2Ray, v2box, Shadowrocket). 
-*(Ensure that `allowInsecure: true` or "Skip Cert Verify" is enabled in the client application, as the connection utilizes dynamically generated certificates.)*
-```text
-vless://[UUID]@[SERVER_IP]:443?encryption=none&security=none&type=ws&host=[YOUR_SNI_BUG]&path=%2F#NetNinjaTunnel
+#### Dashboard
+
+The control dashboard is accessible at `https://[SERVER_IP]:443/` and features:
+
+- Real-time bandwidth chart (5-minute history)
+- Active VPN connection count and total requests
+- Throughput upload/download display
+- Video CDN node detection and access counts
+- Active destination tracking
+- UDP relay count for QUIC/HTTP3 tunneling
+- PAC auto-config URL (one-click copy)
+
+#### Client Configuration
+
+Import the following URI into a compatible client (v2rayN, v2box, Shadowrocket, etc.):
+
+```
+vless://[UUID]@[SERVER_IP]:443?encryption=none&security=none&type=ws&host=[SNI_BUG_DOMAIN]&path=%2F#NetNinja
 ```
 
-### 2. The Traffic Filter (`proxy.go`)
+Note: Allow insecure certificates in the client, as the server uses dynamically generated certificates for non-matched SNI traffic.
 
-This tool is useful for testing traffic filtering or establishing a local network proxy.
+### 2. Traffic Filter (proxy)
+
+A forward proxy for routing local traffic with Cisco Umbrella detection.
 
 ```bash
-go build -o proxy.exe proxy.go
-```
-
-Execute the binary:
-```bash
+# Default port 8080
 proxy.exe
+
+# Custom port
+set PORT=5988 && proxy.exe
 ```
 
-### 3. PC Client Setup (v2rayN / Windows)
+#### Dashboard
 
-For Windows users who want to use the VPN tunnel directly on their PC (bypassing the need to tether from a mobile device or router), you can use **v2rayN**.
+Accessible at `http://127.0.0.1:[PORT]/` or `http://127.0.0.1:8080/` by default.
 
-1. Download **v2rayN-Core.zip** from the [v2rayN GitHub Releases](https://github.com/2dust/v2rayN/releases).
-2. Extract the ZIP file and run `v2rayN.exe`.
-3. Copy your `vless://...` URI.
-4. In v2rayN, press `Ctrl+V` or go to **Servers** > **Import from Clipboard**.
-5. Double-click the imported server to verify settings. Ensure that:
-   - **Network (Transport):** `ws`
-   - **Path:** `/`
-   - **TLS:** `tls`
-   - **SNI:** *[Your SNI Bug domain, e.g., line.me]*
-   - **AllowInsecure:** `true` (Crucial! because net_server uses self-signed certificates)
-6. Click **Confirm**. Right-click the server in the list and select **Set as active server**.
-7. Right-click the v2rayN icon in the system tray (bottom right of your screen), go to **System Proxy**, and select **Set system proxy**.
+#### PAC Auto-Config
+
+The proxy automatically serves a PAC file at `/proxy.pac`. Configure your browser to use this PAC URL for automatic proxy routing.
 
 ---
 
-## VPS Optimization (Windows)
+## VPS Tuning (Windows)
 
-For best performance on Windows VPS, run these in PowerShell (Admin):
+For optimal performance on Windows VPS, run the following in PowerShell (Administrator):
 
 ```powershell
-netsh int tcp set global autotuninglevel=experimental
+netsh int tcp set global autotuninglevel=normal
 netsh int tcp set global fastopen=enabled
 netsh int tcp set global timestamps=disabled
 netsh int tcp set global ecncapability=enabled
 ```
 
-> **Note:** For maximum speed, a **Linux VPS with BBR** enabled is strongly recommended over Windows Server.
+For maximum throughput, a Linux VPS with BBR congestion control is recommended over Windows Server.
 
 ---
 
-*Disclaimer: This project was built strictly for educational purposes, learning how to manipulate network packets, and studying firewall evasion techniques. The developers are not responsible for any misuse or policy violations if deployed on unauthorized networks.*
+## Architecture
+
+### Port Sharing
+
+net_server uses an in-memory listener pattern. The main TCP listener accepts all connections on port 443, then:
+
+1. Reads the first 5 bytes to detect TLS ClientHello or plain HTTP.
+2. Extracts the SNI from TLS handshakes.
+3. Routes recognized SNIs to the upstream web server via a new TCP connection.
+4. Upgrades unrecognized TLS connections to HTTP for VLESS WebSocket handling.
+5. Plain HTTP requests are handled directly by the built-in HTTP server.
+
+### DNS Resolution
+
+Both components implement a multi-layered DNS resolution strategy:
+
+- **Standard DNS**: Go's native resolver configured to use Google/Cloudflare.
+- **DNS over HTTPS**: Fallback to Cloudflare DNS over HTTPS and Google DNS over HTTPS when standard DNS is blocked or fails.
+- **Caching**: In-memory cache with configurable TTL. proxy.go additionally persists to SQLite for cross-session caching.
+- **Cisco Umbrella Bypass**: Detects and unwraps Cisco SSE-wrapped domain names before resolution.
+
+---
+
+## Disclaimer
+
+This project is built for educational purposes, including network packet analysis and firewall evasion research. The developers are not responsible for any misuse or policy violations if deployed on unauthorized networks.
