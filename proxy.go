@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -169,7 +171,9 @@ func hyperResolve(ctx context.Context, host string) (string, error) {
 func resolveDoH(host string) (string, error) {
 	urls := []string{
 		"https://cloudflare-dns.com/dns-query?name=" + host + "&type=A",
+		"https://cloudflare-dns.com/dns-query?name=" + host + "&type=AAAA",
 		"https://dns.google/resolve?name=" + host + "&type=A",
+		"https://dns.google/resolve?name=" + host + "&type=AAAA",
 	}
 
 	client := &http.Client{Timeout: 3 * time.Second}
@@ -181,7 +185,6 @@ func resolveDoH(host string) (string, error) {
 		if err != nil {
 			continue
 		}
-		defer resp.Body.Close()
 
 		var res struct {
 			Answer []struct {
@@ -191,13 +194,20 @@ func resolveDoH(host string) (string, error) {
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && len(res.Answer) > 0 {
-			// Find first A record
+			resp.Body.Close()
+			// Prefer A records (IPv4) for stability, fallback to AAAA (IPv6)
 			for _, ans := range res.Answer {
 				if ans.Type == 1 { // A record
 					return ans.Data, nil
 				}
 			}
+			for _, ans := range res.Answer {
+				if ans.Type == 28 { // AAAA record (IPv6)
+					return ans.Data, nil
+				}
+			}
 		}
+		resp.Body.Close()
 	}
 	return "", fmt.Errorf("doh: failed for %s", host)
 }
@@ -255,7 +265,7 @@ var customDialer = &net.Dialer{
 var proxyTransport = &http.Transport{
 	DialContext:           customDialer.DialContext,
 	MaxIdleConns:          5000,
-	MaxIdleConnsPerHost:   1000,
+	MaxIdleConnsPerHost:   100,
 	IdleConnTimeout:       60 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
@@ -393,6 +403,21 @@ func isManualProxy(host string) bool {
 func main() {
 	// Nitro Performance Tuning
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	// GC tuning via env vars: NET_GOGC (default 200), NET_MEMLIMIT (default 512MB)
+	if g := os.Getenv("NET_GOGC"); g != "" {
+		if v, err := strconv.Atoi(g); err == nil {
+			debug.SetGCPercent(v)
+		}
+	} else {
+		debug.SetGCPercent(200)
+	}
+	if m := os.Getenv("NET_MEMLIMIT"); m != "" {
+		if v, err := strconv.ParseInt(m, 10, 64); err == nil {
+			debug.SetMemoryLimit(v)
+		}
+	} else {
+		debug.SetMemoryLimit(512 * 1024 * 1024) // 512MB
+	}
 	startTime = time.Now()
 
 	enableWindowsANSI()
@@ -464,6 +489,22 @@ func getClientIP(r *http.Request) string {
 // Domains that go DIRECT (not through proxy) — for GFN streaming etc.
 var directDomains = []string{}
 
+// isVideoDomain returns true for video streaming CDN domains that benefit from shorter DNS TTL
+func isVideoDomain(host string) bool {
+	h := strings.ToLower(host)
+	return strings.Contains(h, "googlevideo.com") ||
+		strings.Contains(h, "youtube.com") ||
+		strings.Contains(h, "ytimg.com") ||
+		strings.Contains(h, "ggpht.com") ||
+		strings.Contains(h, "fbcdn.net") ||
+		strings.Contains(h, "tiktokcdn") ||
+		strings.Contains(h, "cloudfront.net") ||
+		strings.Contains(h, "akamai") ||
+		strings.Contains(h, "fastly") ||
+		strings.Contains(h, "cloudflare") ||
+		strings.Contains(h, ".cdn.")
+}
+
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&totalRequests, 1)
 
@@ -473,6 +514,11 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		trackingIP = "LOCAL-HOST"
 	}
 	userTracker.Store(trackingIP, time.Now())
+
+	// Shorter DNS TTL for video streaming domains — force refresh for optimal CDN node
+	if isVideoDomain(r.URL.Hostname()) {
+		dnsCache.Delete(strings.ToLower(r.URL.Hostname()))
+	}
 
 	if r.Method == http.MethodConnect {
 		handleConnect(w, r)
@@ -864,15 +910,12 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		host += ":443"
 	}
 
-	if !strings.Contains(host, ":") {
-		host += ":443"
-	}
-
 	log.Printf("%s[TLS]%s CONNECT %s ← %s",
 		colorCyan, colorReset,
 		host, clientIP)
 
 	atomic.AddInt64(&activeConns, 1)
+	defer atomic.AddInt64(&activeConns, -1)
 
 	// extract hostname and port for cached DNS
 	hostname := host
@@ -938,14 +981,16 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	// God-Mode: Pure native performance (No overrides, allow OS Auto-Tuning)
+	// God-Mode: Pure native performance + KeepAlive
 	if tc, ok := clientConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 	if tc, ok := destConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	log.Printf("%s[TLS]%s %s ↔ %s %s(tunnel established)%s",
@@ -953,12 +998,18 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		clientIP, host,
 		colorGray, colorReset)
 
+	errc := make(chan error, 2)
 	go func() {
-		// Native optimization (ReadFrom logic)
-		io.Copy(destConn, clientConn)
-		atomic.AddInt64(&activeConns, -1)
+		_, err := io.Copy(destConn, clientConn)
+		destConn.Close()
+		errc <- err
 	}()
-	io.Copy(clientConn, destConn)
+	go func() {
+		_, err := io.Copy(clientConn, destConn)
+		clientConn.Close()
+		errc <- err
+	}()
+	<-errc
 }
 
 // copyHeaders copies HTTP headers
@@ -1089,7 +1140,7 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -1156,6 +1207,7 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 				"recent":      recent,
 			}
 
+				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			if err := conn.WriteJSON(data); err != nil {
 				return
 			}

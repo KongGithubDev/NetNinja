@@ -7,6 +7,7 @@ set NET_PATH=/
 
 set NET_WEB_PORT=8443
 set NET_WEB_SNI=kpstore.online,www.kpstore.online,api.kpstore.online,gta-career.com,www.gta-career.com,api.gta-career.com,cdn.gta-career.com,careercity.gta-career.com,n8n.kongwatcharapong.in.th
+set NET_PROXY_ADDR=speedtest.net
 
 echo ========================================
 echo        NetNinja VLESS Launcher
