@@ -1,0 +1,30 @@
+═══ V2BOX (Android) Setup Guide ═══
+
+วิธีที่ 1: Import JSON
+  1. เปิด V2Box → กด + → Import Config from File
+  2. เลือกไฟล์ v2box-mobile-config.json
+  3. แก้ไข YOUR_SERVER_IP และ YOUR_PUBLIC_KEY_HERE
+  4. กด Connect
+
+วิธีที่ 2: Import via Clipboard (Share Link)
+  คัดลอก link ด้านล่างแล้วไปที่ V2Box → Import from Clipboard:
+
+vless://b831381d-6324-4d53-ad4f-8cda48b30811@YOUR_SERVER_IP:443?type=tcp&security=reality&pbk=YOUR_PUBLIC_KEY_HERE&fp=chrome&sni=www.microsoft.com&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision&encryption=none#NetNinja-REALITY
+
+วิธีที่ 3: Manual
+  Protocol : VLESS
+  Address  : YOUR_SERVER_IP
+  Port     : 443
+  UUID     : b831381d-6324-4d53-ad4f-8cda48b30811
+  Flow     : xtls-rprx-vision
+  Encryption: none
+  Network  : tcp
+  Security : reality
+    Fingerprint : chrome
+    ServerName  : www.microsoft.com
+    PublicKey   : YOUR_PUBLIC_KEY_HERE
+    ShortId     : 6ba85179e30d4fc2
+
+═══ NOTE ═══
+รัน .\setup-reality.ps1 ก่อนเพื่อ generate key pair
+แล้วเอา Public Key + Server IP มาใส่แทน YOUR_PUBLIC_KEY_HERE และ YOUR_SERVER_IP
