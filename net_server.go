@@ -59,6 +59,10 @@ var (
 	pacFlag     = flag.String("pac", "/proxy.pac", "PAC file path")
 	proxyAddr   = flag.String("proxy-addr", "", "Override proxy address in PAC (e.g. your-domain.com)")
 	udpPortFlag = flag.String("udp-port", "*auto", "UDP port for QUIC/HTTP3 NAT relay (*auto = same as -port)")
+	realityFlag     = flag.Bool("reality", false, "REALITY stealth mode (probe resistance + no TLS cert needed)")
+	realityFallback = flag.String("reality-fallback", "www.google.com:443", "REALITY fallback target for unauthorized connections")
+	realitySniFlag  = flag.String("reality-sni", "dl.google.com", "REALITY SNI for client identification")
+	realityPortFlag = flag.String("reality-port", "8443", "REALITY admin dashboard port (when reality mode)")
 )
 
 var (
@@ -273,6 +277,20 @@ func init() {
 	}
 	if envProxyAddr := os.Getenv("NET_PROXY_ADDR"); envProxyAddr != "" {
 		*proxyAddr = envProxyAddr
+	}
+	if envReality := os.Getenv("NET_REALITY"); envReality != "" {
+		if envReality == "true" || envReality == "1" {
+			*realityFlag = true
+		}
+	}
+	if envRealityFallback := os.Getenv("NET_REALITY_FALLBACK"); envRealityFallback != "" {
+		*realityFallback = envRealityFallback
+	}
+	if envRealitySNI := os.Getenv("NET_REALITY_SNI"); envRealitySNI != "" {
+		*realitySniFlag = envRealitySNI
+	}
+	if envRealityPort := os.Getenv("NET_REALITY_PORT"); envRealityPort != "" {
+		*realityPortFlag = envRealityPort
 	}
 	u := strings.ReplaceAll(*uuidFlag, "-", "")
 	var err error
@@ -509,6 +527,290 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 				pkt := make([]byte, n)
 				if _, err := io.ReadFull(wsAdapter, pkt); err != nil {
 					conn.Close()
+					errc <- err
+					return
+				}
+				dest.Write(pkt)
+				atomic.AddInt64(&netBytesUp, int64(n))
+			}
+		}()
+		<-errc
+	}
+}
+
+// ── REALITY Mode ────────────────────────────────────────────────────
+// handleRealityConnection handles TCP connections in REALITY stealth mode.
+// If the TLS ClientHello SNI matches our secret SNI (e.g. dl.google.com),
+// it terminates TLS and handles VLESS over raw TCP.
+// Otherwise, it proxies the raw connection to the fallback target
+// (active probe resistance — makes server look like a real website).
+func handleRealityConnection(conn net.Conn, fallbackAddr, realitySni string) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetReadBuffer(512 * 1024)
+		tcpConn.SetWriteBuffer(512 * 1024)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReader(conn)
+	hdr, err := reader.Peek(5)
+	if err != nil {
+		conn.SetReadDeadline(time.Time{})
+		if hdr != nil && len(hdr) > 0 {
+			fallbackProxyRaw(conn, fallbackAddr, reader)
+		} else {
+			conn.Close()
+		}
+		return
+	}
+	var sni string
+	isTLS := hdr[0] == 0x16
+	if isTLS {
+		length := int(hdr[3])<<8 | int(hdr[4])
+		if length <= 8192 {
+			record, err := reader.Peek(5 + length)
+			if err == nil {
+				sni = readSNI(record)
+			}
+		}
+	}
+	conn.SetReadDeadline(time.Time{})
+	peekConn := &peekedConn{Conn: conn, r: reader}
+
+	if isTLS && sni == realitySni {
+		log.Printf("[REALITY] ✅ Client via SNI: %s from %s", sni, conn.RemoteAddr())
+		tlsConfig, err := getTLSConfig()
+		if err != nil {
+			log.Printf("[ERR] REALITY TLS config: %v", err)
+			conn.Close()
+			return
+		}
+		tlsConn := tls.Server(peekConn, tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			log.Printf("[ERR] REALITY TLS handshake from %s: %v", conn.RemoteAddr(), err)
+			conn.Close()
+			return
+		}
+		atomic.AddInt64(&netTotalReqs, 1)
+		atomic.AddInt64(&netActiveConns, 1)
+		defer atomic.AddInt64(&netActiveConns, -1)
+		handleRealityVLESS(tlsConn)
+	} else {
+		probeType := "TLS"
+		if !isTLS {
+			probeType = "plain"
+		}
+		log.Printf("[REALITY] 🔄 Fallback: %s %s → %s (SNI: %s)", probeType, conn.RemoteAddr(), fallbackAddr, sni)
+		fallbackProxyRaw(peekConn, fallbackAddr, nil)
+	}
+}
+
+func fallbackProxyRaw(conn net.Conn, fallbackAddr string, reader io.Reader) {
+	dest, err := nitroDial(context.Background(), "tcp", fallbackAddr)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	defer dest.Close()
+	if tcpConn, ok := dest.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetReadBuffer(512 * 1024)
+		tcpConn.SetWriteBuffer(512 * 1024)
+	}
+	var src io.Reader = conn
+	if reader != nil {
+		src = reader
+	}
+	errc := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(dest, src)
+		dest.Close()
+		errc <- err
+	}()
+	go func() {
+		_, err := io.Copy(conn, dest)
+		conn.Close()
+		errc <- err
+	}()
+	<-errc
+}
+
+// handleRealityVLESS handles a VLESS session over raw TCP (no WebSocket).
+// This is the REALITY equivalent of handleVLESS but without WS framing —
+// VLESS header is read directly from the TLS connection.
+func handleRealityVLESS(tlsConn *tls.Conn) {
+	defer tlsConn.Close()
+
+	var writeMu sync.Mutex
+	writeLocked := func(b []byte) (int, error) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return tlsConn.Write(b)
+	}
+
+	tlsConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	ver := make([]byte, 1)
+	if _, err := io.ReadFull(tlsConn, ver); err != nil {
+		return
+	}
+	if ver[0] != 0 {
+		return
+	}
+	clientUUID := make([]byte, 16)
+	if _, err := io.ReadFull(tlsConn, clientUUID); err != nil {
+		return
+	}
+	if !bytes.Equal(clientUUID, expectedUUID) {
+		log.Printf("[REALITY] Unauthorized UUID: %x", clientUUID)
+		return
+	}
+	addonLenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(tlsConn, addonLenBuf); err != nil {
+		return
+	}
+	if addonLenBuf[0] > 0 {
+		addon := make([]byte, addonLenBuf[0])
+		if _, err := io.ReadFull(tlsConn, addon); err != nil {
+			return
+		}
+	}
+	cmdBuf := make([]byte, 1)
+	if _, err := io.ReadFull(tlsConn, cmdBuf); err != nil {
+		return
+	}
+	cmd := int(cmdBuf[0])
+	portBuf := make([]byte, 2)
+	if _, err := io.ReadFull(tlsConn, portBuf); err != nil {
+		return
+	}
+	targetPort := int(portBuf[0])<<8 | int(portBuf[1])
+	atypBuf := make([]byte, 1)
+	if _, err := io.ReadFull(tlsConn, atypBuf); err != nil {
+		return
+	}
+	atyp := int(atypBuf[0])
+	var targetHost string
+	switch atyp {
+	case 1:
+		ip := make([]byte, 4)
+		if _, err := io.ReadFull(tlsConn, ip); err != nil {
+			return
+		}
+		targetHost = fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])
+	case 2:
+		domainLenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(tlsConn, domainLenBuf); err != nil {
+			return
+		}
+		domain := make([]byte, int(domainLenBuf[0]))
+		if _, err := io.ReadFull(tlsConn, domain); err != nil {
+			return
+		}
+		targetHost = string(domain)
+	case 3:
+		ip := make([]byte, 16)
+		if _, err := io.ReadFull(tlsConn, ip); err != nil {
+			return
+		}
+		targetHost = net.IP(ip).String()
+	default:
+		return
+	}
+	targetAddr := fmt.Sprintf("%s:%d", targetHost, targetPort)
+
+	if cmd == 1 && targetHost != "" {
+		if isVideoDomain(targetHost) {
+			v, _ := cdnAccess.LoadOrStore(targetHost, new(int64))
+			atomic.AddInt64(v.(*int64), 1)
+		}
+		v, _ := activeDests.LoadOrStore(targetAddr, new(int64))
+		atomic.AddInt64(v.(*int64), 1)
+		defer func() {
+			if v, ok := activeDests.Load(targetAddr); ok {
+				atomic.AddInt64(v.(*int64), -1)
+			}
+		}()
+	}
+	tlsConn.SetReadDeadline(time.Time{})
+	writeLocked([]byte{0, 0})
+
+	if cmd == 1 {
+		dest, err := nitroDial(context.Background(), "tcp", targetAddr)
+		if err != nil {
+			log.Printf("[REALITY] TCP dial %s: %v", targetAddr, err)
+			return
+		}
+		defer dest.Close()
+		if tcpConn, ok := dest.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetReadBuffer(512 * 1024)
+			tcpConn.SetWriteBuffer(512 * 1024)
+		}
+
+		// Counting writers — write to dest and tlsConn
+		writeMu.Lock()
+		destDown := &countingWriter{w: tlsConn, count: &netBytesDown}
+		writeMu.Unlock()
+
+		destUp := &countingWriter{w: dest, count: &netBytesUp}
+		errc := make(chan error, 2)
+		go func() {
+			bufPtr := copyBufferPool.Get().(*[]byte)
+			defer copyBufferPool.Put(bufPtr)
+			_, err := io.CopyBuffer(destUp, tlsConn, *bufPtr)
+			if tcpConn, ok := dest.(*net.TCPConn); ok {
+				tcpConn.CloseWrite()
+			}
+			errc <- err
+		}()
+		go func() {
+			bufPtr := copyBufferPool.Get().(*[]byte)
+			defer copyBufferPool.Put(bufPtr)
+			_, err := io.CopyBuffer(destDown, dest, *bufPtr)
+			tlsConn.Close()
+			errc <- err
+		}()
+		<-errc
+	} else if cmd == 2 {
+		dest, err := net.DialTimeout("udp", targetAddr, 10*time.Second)
+		if err != nil {
+			log.Printf("[REALITY] UDP dial %s: %v", targetAddr, err)
+			return
+		}
+		defer dest.Close()
+		errc := make(chan error, 2)
+		go func() {
+			bufPtr := bufferPool.Get().(*[]byte)
+			defer bufferPool.Put(bufPtr)
+			buf := *bufPtr
+			for {
+				n, err := dest.Read(buf)
+				if err != nil {
+					errc <- err
+					return
+				}
+				atomic.AddInt64(&netBytesDown, int64(n))
+				fullMsg := make([]byte, 2+n)
+				fullMsg[0] = byte(n >> 8)
+				fullMsg[1] = byte(n & 0xff)
+				copy(fullMsg[2:], buf[:n])
+				writeLocked(fullMsg)
+			}
+		}()
+		go func() {
+			lb := make([]byte, 2)
+			for {
+				if _, err := io.ReadFull(tlsConn, lb); err != nil {
+					tlsConn.Close()
+					errc <- err
+					return
+				}
+				n := int(lb[0])<<8 | int(lb[1])
+				pkt := make([]byte, n)
+				if _, err := io.ReadFull(tlsConn, pkt); err != nil {
+					tlsConn.Close()
 					errc <- err
 					return
 				}
@@ -921,17 +1223,59 @@ func main() {
 		log.Fatalf("Server failed to start: %v", err)
 	}
 
-	memListener := &MemListener{
-		conns: make(chan net.Conn, 1024),
-		addr:  listener.Addr(),
+	var memListener *MemListener
+	// In REALITY mode, don't start in-memory HTTP server (port 443 is for REALITY only)
+	if !*realityFlag {
+		memListener = &MemListener{
+			conns: make(chan net.Conn, 1024),
+			addr:  listener.Addr(),
+		}
+		go func() {
+			err := http.Serve(memListener, nil)
+			if err != nil {
+				log.Fatalf("HTTP Serve error: %v", err)
+			}
+		}()
 	}
 
-	go func() {
-		err := http.Serve(memListener, nil)
-		if err != nil {
-			log.Fatalf("HTTP Serve error: %v", err)
+	// In REALITY mode, start admin dashboard on separate port
+	if *realityFlag {
+		adminPort := *realityPortFlag
+		if adminPort == *portFlag {
+			adminPort = "8443"
 		}
-	}()
+		go func() {
+			adminMux := http.NewServeMux()
+			adminMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == *pacFlag {
+					servePAC(w, r)
+					return
+				}
+				if r.URL.Path == *pathFlag && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+					handleVLESS(w, r)
+					return
+				}
+				serveDashboard(w, r)
+			})
+			adminMux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+				conn, err := netUpgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				netClientsMu.Lock()
+				netDashClients[conn] = true
+				netClientsMu.Unlock()
+			})
+			adminMux.HandleFunc("/proxy", handleProxy)
+			if *pacFlag != "/" {
+				adminMux.HandleFunc(*pacFlag, servePAC)
+			}
+			log.Printf("[ADMIN] Dashboard on 0.0.0.0:%s (REALITY mode)", adminPort)
+			if err := http.ListenAndServe("0.0.0.0:"+adminPort, adminMux); err != nil {
+				log.Printf("[WARN] Admin server on :%s: %v", adminPort, err)
+			}
+		}()
+	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+getUDPPort())
 	if err == nil {
@@ -944,16 +1288,27 @@ func main() {
 	}
 
 	log.Printf("========================================")
-	log.Printf("       NetNinja VLESS VPN Server        ")
-	log.Printf("             SNI Multiplexer            ")
+	if *realityFlag {
+		log.Printf("     NetNinja VLESS × REALITY Server     ")
+		log.Printf("         Probe Resistance Mode          ")
+	} else {
+		log.Printf("       NetNinja VLESS VPN Server        ")
+		log.Printf("             SNI Multiplexer            ")
+	}
 	log.Printf("             [NITRO-ULTRA]             ")
 	log.Printf("========================================")
 	log.Printf("  Port     : %s", *portFlag)
 	log.Printf("  UUID     : %s", *uuidFlag)
-	log.Printf("  Path     : %s", *pathFlag)
-	log.Printf("  Web SNI  : %s", *webSNIFlag)
-	log.Printf("  Web Port : %s", *webPortFlag)
-	log.Printf("  TLS      : %v", *tlsFlag)
+	if *realityFlag {
+		log.Printf("  Mode     : REALITY")
+		log.Printf("  Fallback : %s", *realityFallback)
+		log.Printf("  Client   : %s", *realitySniFlag)
+	} else {
+		log.Printf("  Path     : %s", *pathFlag)
+		log.Printf("  Web SNI  : %s", *webSNIFlag)
+		log.Printf("  Web Port : %s", *webPortFlag)
+		log.Printf("  TLS      : %v", *tlsFlag)
+	}
 	log.Printf("  UDP Relay: %s (QUIC/HTTP3)", getUDPPort())
 	log.Printf("========================================")
 	log.Printf("Server listening on 0.0.0.0:%s ...", *portFlag)
@@ -963,7 +1318,11 @@ func main() {
 		if err != nil {
 			continue
 		}
-		go handleConnection(conn, webSNIs, *webPortFlag, tlsConfig, memListener.conns)
+		if *realityFlag {
+			go handleRealityConnection(conn, *realityFallback, *realitySniFlag)
+		} else {
+			go handleConnection(conn, webSNIs, *webPortFlag, tlsConfig, memListener.conns)
+		}
 	}
 }
 
