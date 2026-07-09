@@ -140,7 +140,7 @@ $serverConfig = @"
 "@
 
 $ServerConfigPath = Join-Path $PSScriptRoot "xray-reality-server.json"
-$serverConfig | Set-Content -Path $ServerConfigPath -Encoding UTF8
+$serverConfig | Set-Content -Path $ServerConfigPath -Encoding ASCII
 Write-Host "      Saved: $ServerConfigPath" -ForegroundColor Green
 
 # ── 4. Generate client config ───────────────────────────────────────
@@ -208,7 +208,7 @@ $clientConfig = @"
 "@
 
 $ClientConfigPath = Join-Path $PSScriptRoot "xray-reality-client.json"
-$clientConfig | Set-Content -Path $ClientConfigPath -Encoding UTF8
+$clientConfig | Set-Content -Path $ClientConfigPath -Encoding ASCII
 Write-Host "      Saved: $ClientConfigPath" -ForegroundColor Green
 
 # ── 5. Summary ──────────────────────────────────────────────────────
