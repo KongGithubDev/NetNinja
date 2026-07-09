@@ -125,16 +125,10 @@ net_server.exe -port 8444 -tls false
 | -pac | /proxy.pac | PAC file path |
 | -proxy-addr | | Override proxy address in PAC |
 | -udp-port | *auto | UDP port for QUIC/HTTP3 relay (*auto = same as -port) |
-| -reality | false | REALITY stealth mode (probe resistance + no real cert needed) |
-| -reality-fallback | www.google.com:443 | Fallback target for unauthorized connections (probe resistance) |
-| -reality-sni | dl.google.com | SNI for client identification (client must connect with this SNI) |
-| -reality-port | 8443 | Admin dashboard port in REALITY mode |
 
 #### Environment Variables
 
 NET_PORT, NET_UUID, NET_PATH, NET_TLS, NET_CERT, NET_KEY, NET_WEB_SNI, NET_WEB_PORT, NET_PROXY_ADDR, NET_GOGC, NET_MEMLIMIT
-
-NET_REALITY, NET_REALITY_FALLBACK, NET_REALITY_SNI, NET_REALITY_PORT
 
 #### Dashboard
 
@@ -149,51 +143,11 @@ Access the real-time control center at `https://[SERVER_IP]:443/`:
 
 #### Client Configuration
 
-**Mode 1 — VLESS + WebSocket (original):**
 ```text
 vless://[UUID]@[SERVER_IP]:443?encryption=none&security=none&type=ws&host=[SNI_BUG_DOMAIN]&path=%2F#NetNinja
 ```
 
-Note: This mode is increasingly detected by carrier DPI. Use **Mode 2 (REALITY)** below for better stealth.
-
-**Mode 2 — VLESS + TLS + REALITY (stealth mode):**
-```powershell
-net_server.exe -reality -port 443 -reality-sni dl.google.com -reality-fallback www.google.com:443 -reality-port 8443
-```
-
-Client config for v2rayNG:
-```text
-vless://[UUID]@[SERVER_IP]:443?encryption=none&flow=xtls-rprx-vision&security=tls&sni=dl.google.com&fp=chrome&type=tcp&headerType=none#NetNinja-REALITY
-```
-
-Client setup (v2rayNG):
-| Field | Value |
-|-------|-------|
-| Address | YOUR_VPS_IP |
-| Port | 443 |
-| UUID | Same as server `-uuid` |
-| Flow | `xtls-rprx-vision` |
-| Encryption | `none` |
-| Transport | `tcp` |
-| Security | `tls` |
-| SNI | Same as server `-reality-sni` (default: `dl.google.com`) |
-| Fingerprint | `chrome` |
-| AllowInsecure | `true` (self-signed cert) |
-
-**How REALITY mode works:**
-1. Client connects with TLS SNI = `dl.google.com` (or your custom `-reality-sni`)
-2. Server sees matching SNI → terminates TLS → handles VLESS over raw TCP
-3. Unauthorized connections (probes, bots) with different SNI → server proxies raw bytes to `-reality-fallback` (e.g. real google.com)
-4. DPI sees real Google TLS handshake → thinks the server IS Google
-5. Admin dashboard available on `-reality-port` (default 8443)
-
-**Environment variables for REALITY mode:**
-| Variable | Description |
-|----------|-------------|
-| NET_REALITY | `true` or `1` to enable REALITY mode |
-| NET_REALITY_FALLBACK | Fallback target (default: www.google.com:443) |
-| NET_REALITY_SNI | Client SNI (default: dl.google.com) |
-| NET_REALITY_PORT | Admin dashboard port (default: 8443) |
+Note: Allow insecure certificates (AllowInsecure: true) in the client for self-signed certificate scenarios.
 
 ### 2. Traffic Filter (proxy)
 
