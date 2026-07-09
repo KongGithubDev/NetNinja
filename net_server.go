@@ -579,7 +579,7 @@ func handleRealityConnection(conn net.Conn, fallbackAddr, realitySni string) {
 
 	if isTLS && sni == realitySni {
 		log.Printf("[REALITY] ✅ Client via SNI: %s from %s", sni, conn.RemoteAddr())
-		tlsConfig, err := getTLSConfig()
+		tlsConfig, err := getTLSConfig(realitySni)
 		if err != nil {
 			log.Printf("[ERR] REALITY TLS config: %v", err)
 			conn.Close()
@@ -974,7 +974,7 @@ func readSNI(data []byte) string {
 	return ""
 }
 
-func getTLSConfig() (*tls.Config, error) {
+func getTLSConfig(dnsNames ...string) (*tls.Config, error) {
 	if *certFlag != "" && *keyFlag != "" {
 		cert, err := tls.LoadX509KeyPair(*certFlag, *keyFlag)
 		if err == nil {
@@ -1000,6 +1000,7 @@ func getTLSConfig() (*tls.Config, error) {
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+		DNSNames:              dnsNames,
 	}
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
