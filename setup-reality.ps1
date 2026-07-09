@@ -35,13 +35,36 @@ if (!(Test-Path $XrayExe)) {
 
 # ── 2. Generate REALITY key pair ────────────────────────────────────
 Write-Host "[2/4] Generating REALITY key pair..." -ForegroundColor Yellow
-$output = & $XrayExe x25519
-$privateKey = ($output | Select-String "Private key:").ToString() -replace ".*Private key:\s*", ""
-$publicKey  = ($output | Select-String "Public key:").ToString()  -replace ".*Public key:\s*", ""
-
-if ([string]::IsNullOrEmpty($privateKey)) {
-    Write-Host "      Failed to generate keys. Is xray.exe accessible?" -ForegroundColor Red
+if (!(Test-Path $XrayExe)) {
+    Write-Host "      xray.exe not found at: $XrayExe" -ForegroundColor Red
+    Write-Host "      Download manually from: https://github.com/XTLS/Xray-core/releases" -ForegroundColor Yellow
+    Write-Host "      Extract to: $XrayDir" -ForegroundColor Yellow
     exit 1
+}
+$output = & $XrayExe x25519 2>&1
+$outputStr = $output | Out-String
+$privateKey = ""
+$publicKey = ""
+if ($outputStr -match "Private key:\s*(\S+)") {
+    $privateKey = $Matches[1]
+}
+if ($outputStr -match "Public key:\s*(\S+)") {
+    $publicKey = $Matches[1]
+}
+if ([string]::IsNullOrEmpty($privateKey) -or [string]::IsNullOrEmpty($publicKey)) {
+    Write-Host "      xray x25519 output was:" -ForegroundColor Yellow
+    Write-Host "      $outputStr" -ForegroundColor Gray
+    Write-Host "      Failed to extract keys. Possible version mismatch." -ForegroundColor Red
+    Write-Host "      Generating fallback keys with PowerShell..." -ForegroundColor Yellow
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $privBytes = new-object byte[] 32
+    $rng.GetBytes($privBytes)
+    $privateKey = [System.Convert]::ToBase64String($privBytes)
+    $pubBytes = new-object byte[] 32
+    $rng.GetBytes($pubBytes)
+    $publicKey = [System.Convert]::ToBase64String($pubBytes)
+    Write-Host "      ⚠  Fallback keys generated (not REALITY-valid, just placeholder)" -ForegroundColor Red
+    Write-Host "      You MUST run 'xray x25519' manually on VPS and update configs" -ForegroundColor Red
 }
 
 Write-Host "      Private Key: $privateKey" -ForegroundColor Green
