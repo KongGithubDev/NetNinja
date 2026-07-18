@@ -29,6 +29,7 @@ var (
 	wsUser    = flag.String("user", "vpn", "SSH username (embedded mode)")
 	wsPass    = flag.String("pass", "vpn", "SSH password (embedded mode)")
 	wsHostKey = flag.String("host-key", "", "SSH host key file (PEM, embedded mode)")
+	wsFwdAddr = flag.String("fwd-addr", "", "Forward WS data to this TCP addr (overrides embed SSH)")
 
 	certFile = flag.String("cert", "fullchain.pem", "TLS certificate file")
 	keyFile  = flag.String("key", "privkey.pem", "TLS private key file")
@@ -64,6 +65,9 @@ func init() {
 	}
 	if v := os.Getenv("NET_WEB_PORT"); v != "" {
 		*webPort = v
+	}
+	if v := os.Getenv("WS_FWD_ADDR"); v != "" {
+		*wsFwdAddr = v
 	}
 }
 
@@ -143,6 +147,32 @@ func indexBytes(data, sub []byte) int {
 		}
 	}
 	return -1
+}
+
+func forwardWSToTCP(ws *websocket.Conn, addr string) {
+	defer ws.Close()
+	dest, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		log.Printf("[FWD] Connect to %s failed: %v", addr, err)
+		return
+	}
+	defer dest.Close()
+	log.Printf("[FWD] Connected to %s", addr)
+
+	adapter := &wsSSHAdapter{Conn: ws}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(dest, adapter)
+		dest.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(adapter, dest)
+	}()
+	wg.Wait()
+	log.Printf("[FWD] Done")
 }
 
 func embedSSHSession(ws *websocket.Conn, config *ssh.ServerConfig) {
@@ -348,7 +378,9 @@ func handleWSTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[WS] New connection from %s", conn.RemoteAddr())
-	if *wsEmbed {
+	if *wsFwdAddr != "" {
+		forwardWSToTCP(conn, *wsFwdAddr)
+	} else if *wsEmbed {
 		embedSSHSession(conn, getEmbedSSHConfig())
 	} else {
 		proxyToExternalSSH(conn)
