@@ -29,7 +29,8 @@ var (
 	wsUser    = flag.String("user", "vpn", "SSH username (embedded mode)")
 	wsPass    = flag.String("pass", "vpn", "SSH password (embedded mode)")
 	wsHostKey = flag.String("host-key", "", "SSH host key file (PEM, embedded mode)")
-	wsFwdAddr = flag.String("fwd-addr", "", "Forward WS data to this TCP addr (overrides embed SSH)")
+	wsFwdAddr = flag.String("fwd-addr", "", "Forward decoded WS data to TCP addr")
+	wsTCPProxy = flag.String("tcp-proxy", "", "Transparent TCP proxy mode: forward ALL traffic to this backend")
 
 	certFile = flag.String("cert", "fullchain.pem", "TLS certificate file")
 	keyFile  = flag.String("key", "privkey.pem", "TLS private key file")
@@ -68,6 +69,9 @@ func init() {
 	}
 	if v := os.Getenv("WS_FWD_ADDR"); v != "" {
 		*wsFwdAddr = v
+	}
+	if v := os.Getenv("WS_TCP_PROXY"); v != "" {
+		*wsTCPProxy = v
 	}
 }
 
@@ -474,7 +478,51 @@ func readSNI(data []byte) string {
 
 // ── Connection Handler ───────────────────────────────────────────────────────
 
+func tcpProxyLoop(src, dst net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(dst, src)
+		dst.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(src, dst)
+		src.Close()
+	}()
+	wg.Wait()
+}
+
 func handleConnection(conn net.Conn, webSNIs map[string]bool, tlsCfg *tls.Config, httpConns chan net.Conn) {
+	if *wsTCPProxy != "" {
+		proxyConn := conn
+		if tlsCfg != nil {
+			reader := bufio.NewReader(conn)
+			hdr, err := reader.Peek(5)
+			if err == nil && len(hdr) > 0 && hdr[0] == 0x16 {
+				tlsConn := tls.Server(&peekedConn{Conn: conn, r: reader}, tlsCfg)
+				if err := tlsConn.Handshake(); err == nil {
+					proxyConn = tlsConn
+					log.Printf("[TCPPROXY] TLS terminated from %s", conn.RemoteAddr())
+				} else {
+					log.Printf("[TCPPROXY] TLS handshake failed: %v (forwarding raw)", err)
+					proxyConn = &peekedConn{Conn: conn, r: reader}
+				}
+			} else {
+				proxyConn = &peekedConn{Conn: conn, r: reader}
+			}
+		}
+		dest, err := net.DialTimeout("tcp", *wsTCPProxy, 10*time.Second)
+		if err != nil {
+			log.Printf("[TCPPROXY] Connect to %s failed: %v", *wsTCPProxy, err)
+			conn.Close()
+			return
+		}
+		log.Printf("[TCPPROXY] %s -> %s", conn.RemoteAddr(), *wsTCPProxy)
+		tcpProxyLoop(proxyConn, dest)
+		return
+	}
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
@@ -539,18 +587,7 @@ func handleConnection(conn net.Conn, webSNIs map[string]bool, tlsCfg *tls.Config
 			conn.Close()
 			return
 		}
-		errc := make(chan error, 2)
-		go func() {
-			_, err := io.Copy(dest, peekConn)
-			dest.Close()
-			errc <- err
-		}()
-		go func() {
-			_, err := io.Copy(peekConn, dest)
-			peekConn.Close()
-			errc <- err
-		}()
-		<-errc
+		tcpProxyLoop(dest, peekConn)
 		return
 	}
 
