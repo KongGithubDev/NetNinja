@@ -85,9 +85,16 @@ func handleSSHChannel(conn *ssh.ServerConn, newChan ssh.NewChannel) {
 		if err != nil {
 			return
 		}
-		go ssh.DiscardRequests(reqs)
+		go func() {
+			for req := range reqs {
+				if req.Type == "shell" || req.Type == "exec" || req.Type == "subsystem" {
+					req.Reply(true, nil)
+				} else {
+					req.Reply(false, nil)
+				}
+			}
+		}()
 		go io.Copy(io.Discard, ch)
-		ch.Close()
 
 	case "direct-tcpip":
 		type directTCPIP struct {
@@ -106,6 +113,7 @@ func handleSSHChannel(conn *ssh.ServerConn, newChan ssh.NewChannel) {
 
 		remote, err := net.DialTimeout("tcp", dest, 15*time.Second)
 		if err != nil {
+			log.Printf("[TCP] Dial %s failed: %v", dest, err)
 			newChan.Reject(ssh.Prohibited, fmt.Sprintf("dial failed: %v", err))
 			return
 		}
