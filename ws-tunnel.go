@@ -168,12 +168,14 @@ func forwardWSToTCP(ws *websocket.Conn, addr string) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(dest, adapter)
+		n, _ := io.Copy(dest, &debugReader{Reader: adapter, name: "ws->tcp"})
+		log.Printf("[FWD] ws->tcp copied %d bytes", n)
 		dest.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(adapter, dest)
+		n, _ := io.Copy(adapter, &debugReader{Reader: dest, name: "tcp->ws"})
+		log.Printf("[FWD] tcp->ws copied %d bytes", n)
 	}()
 	wg.Wait()
 	log.Printf("[FWD] Done")
