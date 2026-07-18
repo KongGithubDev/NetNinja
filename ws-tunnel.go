@@ -193,7 +193,8 @@ func getEmbedSSHConfig() *ssh.ServerConfig {
 
 func handleWSTunnel(w http.ResponseWriter, r *http.Request) {
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		http.Error(w, "WebSocket upgrade required", http.StatusBadRequest)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
 		return
 	}
 	hj, ok := w.(http.Hijacker)
