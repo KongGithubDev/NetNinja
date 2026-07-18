@@ -136,6 +136,15 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 
 // ── SSH Server ───────────────────────────────────────────────────────────────
 
+func indexBytes(data, sub []byte) int {
+	for i := 0; i <= len(data)-len(sub); i++ {
+		if string(data[i:i+len(sub)]) == string(sub) {
+			return i
+		}
+	}
+	return -1
+}
+
 func embedSSHSession(ws *websocket.Conn, config *ssh.ServerConfig) {
 	defer ws.Close()
 	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -150,6 +159,16 @@ func embedSSHSession(ws *websocket.Conn, config *ssh.ServerConfig) {
 		showLen = 128
 	}
 	log.Printf("[SSH] First WS message: type=%d len=%d data=%x", msgType, len(payload), payload[:showLen])
+	sshSig := []byte("SSH-")
+	if pos := indexBytes(payload, sshSig); pos >= 0 {
+		end := pos + 50
+		if end > len(payload) {
+			end = len(payload)
+		}
+		log.Printf("[SSH] Found 'SSH-' at offset %d: %s", pos, string(payload[pos:end]))
+	} else {
+		log.Printf("[SSH] No 'SSH-' signature found in %d bytes", len(payload))
+	}
 	adapter := &wsSSHAdapter{Conn: ws, preload: payload, preloaded: true}
 	conn, chans, reqs, err := ssh.NewServerConn(adapter, config)
 	if err != nil {
