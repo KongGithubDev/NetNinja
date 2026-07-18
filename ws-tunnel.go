@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
 	"flag"
@@ -17,7 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -29,8 +30,6 @@ var (
 	wsUser    = flag.String("user", "vpn", "SSH username (embedded mode)")
 	wsPass    = flag.String("pass", "vpn", "SSH password (embedded mode)")
 	wsHostKey = flag.String("host-key", "", "SSH host key file (PEM, embedded mode)")
-	wsFwdAddr = flag.String("fwd-addr", "", "Forward decoded WS data to TCP addr")
-	wsTCPProxy = flag.String("tcp-proxy", "", "Transparent TCP proxy mode: forward ALL traffic to this backend")
 
 	certFile = flag.String("cert", "fullchain.pem", "TLS certificate file")
 	keyFile  = flag.String("key", "privkey.pem", "TLS private key file")
@@ -67,68 +66,6 @@ func init() {
 	if v := os.Getenv("NET_WEB_PORT"); v != "" {
 		*webPort = v
 	}
-	if v := os.Getenv("WS_FWD_ADDR"); v != "" {
-		*wsFwdAddr = v
-	}
-	if v := os.Getenv("WS_TCP_PROXY"); v != "" {
-		*wsTCPProxy = v
-	}
-}
-
-// ── WebSocket → SSH Adapter ──────────────────────────────────────────────────
-
-type wsSSHAdapter struct {
-	*websocket.Conn
-	r        io.Reader
-	mu       sync.Mutex
-	preload  []byte // first message pre-read for debugging
-	preloaded bool
-}
-
-func (c *wsSSHAdapter) Read(b []byte) (int, error) {
-	if c.preloaded {
-		n := copy(b, c.preload)
-		c.preload = nil
-		c.preloaded = false
-		return n, nil
-	}
-	for {
-		msgType, reader, err := c.Conn.NextReader()
-		if err != nil {
-			return 0, err
-		}
-		if msgType == websocket.BinaryMessage || msgType == websocket.TextMessage {
-			n, err := reader.Read(b)
-			if err == io.EOF {
-				if n > 0 {
-					return n, nil
-				}
-				continue
-			}
-			return n, err
-		}
-	}
-}
-
-func (c *wsSSHAdapter) Write(b []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.Conn.WriteMessage(websocket.BinaryMessage, b); err != nil {
-		return 0, err
-	}
-	return len(b), nil
-}
-
-func (c *wsSSHAdapter) SetDeadline(t time.Time) error {
-	return c.Conn.SetReadDeadline(t)
-}
-
-func (c *wsSSHAdapter) SetReadDeadline(t time.Time) error {
-	return c.Conn.SetReadDeadline(t)
-}
-
-func (c *wsSSHAdapter) SetWriteDeadline(t time.Time) error {
-	return nil
 }
 
 // ── Peeked Connection ────────────────────────────────────────────────────────
@@ -143,81 +80,6 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 }
 
 // ── SSH Server ───────────────────────────────────────────────────────────────
-
-func indexBytes(data, sub []byte) int {
-	for i := 0; i <= len(data)-len(sub); i++ {
-		if string(data[i:i+len(sub)]) == string(sub) {
-			return i
-		}
-	}
-	return -1
-}
-
-func forwardWSToTCP(ws *websocket.Conn, addr string) {
-	defer ws.Close()
-	dest, err := net.DialTimeout("tcp", addr, 10*time.Second)
-	if err != nil {
-		log.Printf("[FWD] Connect to %s failed: %v", addr, err)
-		return
-	}
-	defer dest.Close()
-	log.Printf("[FWD] Connected to %s", addr)
-
-	adapter := &wsSSHAdapter{Conn: ws}
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(dest, &debugReader{Reader: adapter, name: "ws->tcp"})
-		log.Printf("[FWD] ws->tcp copied %d bytes", n)
-		dest.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		n, _ := io.Copy(adapter, &debugReader{Reader: dest, name: "tcp->ws"})
-		log.Printf("[FWD] tcp->ws copied %d bytes", n)
-	}()
-	wg.Wait()
-	log.Printf("[FWD] Done")
-}
-
-func embedSSHSession(ws *websocket.Conn, config *ssh.ServerConfig) {
-	defer ws.Close()
-	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
-	msgType, payload, err := ws.ReadMessage()
-	if err != nil {
-		log.Printf("[SSH] First WS message error: %v", err)
-		return
-	}
-	ws.SetReadDeadline(time.Time{})
-	showLen := len(payload)
-	if showLen > 128 {
-		showLen = 128
-	}
-	log.Printf("[SSH] First WS message: type=%d len=%d data=%x", msgType, len(payload), payload[:showLen])
-	sshSig := []byte("SSH-")
-	if pos := indexBytes(payload, sshSig); pos >= 0 {
-		end := pos + 50
-		if end > len(payload) {
-			end = len(payload)
-		}
-		log.Printf("[SSH] Found 'SSH-' at offset %d: %s", pos, string(payload[pos:end]))
-	} else {
-		log.Printf("[SSH] No 'SSH-' signature found in %d bytes", len(payload))
-	}
-	adapter := &wsSSHAdapter{Conn: ws, preload: payload, preloaded: true}
-	conn, chans, reqs, err := ssh.NewServerConn(adapter, config)
-	if err != nil {
-		log.Printf("[SSH] Handshake failed: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	go ssh.DiscardRequests(reqs)
-	for newChan := range chans {
-		go handleSSHChannel(conn, newChan)
-	}
-}
 
 func handleSSHChannel(conn *ssh.ServerConn, newChan ssh.NewChannel) {
 	switch newChan.ChannelType() {
@@ -282,30 +144,6 @@ func handleSSHChannel(conn *ssh.ServerConn, newChan ssh.NewChannel) {
 	}
 }
 
-func proxyToExternalSSH(ws *websocket.Conn) {
-	defer ws.Close()
-	adapter := &wsSSHAdapter{Conn: ws}
-	dest, err := net.DialTimeout("tcp", *wsSSHAddr, 10*time.Second)
-	if err != nil {
-		log.Printf("[PROXY] Failed to connect to SSH %s: %v", *wsSSHAddr, err)
-		return
-	}
-	defer dest.Close()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		io.Copy(dest, adapter)
-		dest.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(adapter, dest)
-	}()
-	wg.Wait()
-}
-
 // ── SSH Config ───────────────────────────────────────────────────────────────
 
 var (
@@ -352,14 +190,16 @@ func getEmbedSSHConfig() *ssh.ServerConfig {
 	return embedSSHConfig
 }
 
-// ── WebSocket Handler ────────────────────────────────────────────────────────
+// ── WebSocket Upgrade Helper ─────────────────────────────────────────────────
 
-var wsUpgrader = websocket.Upgrader{
-	CheckOrigin:     func(r *http.Request) bool { return true },
-	ReadBufferSize:  64 * 1024,
-	WriteBufferSize: 64 * 1024,
-	Subprotocols:    []string{"binary"},
+func computeAcceptKey(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key))
+	h.Write([]byte("258EAFA5-E914-47DA-95CA-5AB5B8F46B3B"))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
+
+// ── WebSocket Handler (manual, no gorilla/websocket) ─────────────────────────
 
 func handleWSTunnel(w http.ResponseWriter, r *http.Request) {
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
@@ -367,29 +207,61 @@ func handleWSTunnel(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
 		return
 	}
-	if r.Header.Get("Sec-WebSocket-Key") == "" {
+
+	wsKey := r.Header.Get("Sec-WebSocket-Key")
+	if wsKey == "" {
 		k := make([]byte, 16)
 		rand.Read(k)
-		r.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(k))
+		wsKey = base64.StdEncoding.EncodeToString(k)
 	}
-	if r.Header.Get("Sec-WebSocket-Version") == "" {
-		r.Header.Set("Sec-WebSocket-Version", "13")
-	}
-	origMethod := r.Method
-	r.Method = "GET"
-	conn, err := wsUpgrader.Upgrade(w, r, nil)
-	r.Method = origMethod
-	if err != nil {
-		log.Printf("[WS] Upgrade failed: %v", err)
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack not supported", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("[WS] New connection from %s", conn.RemoteAddr())
-	if *wsFwdAddr != "" {
-		forwardWSToTCP(conn, *wsFwdAddr)
-	} else if *wsEmbed {
-		embedSSHSession(conn, getEmbedSSHConfig())
+	raw, bufrw, err := hj.Hijack()
+	if err != nil {
+		log.Printf("[WS] Hijack: %v", err)
+		return
+	}
+
+	accept := computeAcceptKey(wsKey)
+	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	bufrw.WriteString("Upgrade: websocket\r\n")
+	bufrw.WriteString("Connection: Upgrade\r\n")
+	bufrw.WriteString("Sec-WebSocket-Accept: " + accept + "\r\n")
+	bufrw.WriteString("\r\n")
+	bufrw.Flush()
+
+	raw.SetReadDeadline(time.Time{})
+	log.Printf("[WS] New connection from %s", raw.RemoteAddr())
+
+	// Read first data from client (raw TCP after 101, no WS framing)
+	raw.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 8192)
+	n, err := raw.Read(buf)
+	if err != nil {
+		log.Printf("[WS] First read error: %v", err)
+		return
+	}
+	raw.SetReadDeadline(time.Time{})
+	show := n
+	if show > 128 {
+		show = 128
+	}
+	log.Printf("[WS] First data: %d bytes, hex=%x", n, buf[:show])
+
+	// Feed data back in for SSH
+	peekConn := &peekedConn{Conn: raw, r: bufio.NewReader(io.MultiReader(
+		bytes.NewReader(buf[:n]),
+		raw,
+	))}
+
+	if *wsEmbed {
+		handleRawSSH(peekConn)
 	} else {
-		proxyToExternalSSH(conn)
+		proxyRawToExternalSSH(peekConn)
 	}
 }
 
@@ -480,74 +352,7 @@ func readSNI(data []byte) string {
 
 // ── Connection Handler ───────────────────────────────────────────────────────
 
-type debugReader struct {
-	io.Reader
-	name string
-}
-
-func (d *debugReader) Read(p []byte) (int, error) {
-	n, err := d.Reader.Read(p)
-	if n > 0 {
-		show := n
-		if show > 64 {
-			show = 64
-		}
-		log.Printf("[DEBUG %s] %d bytes: %x", d.name, n, p[:show])
-	}
-	return n, err
-}
-
-func tcpProxyLoop(src, dst net.Conn) {
-	srcDebug := &debugReader{Reader: src, name: "src->dst"}
-	dstDebug := &debugReader{Reader: dst, name: "dst->src"}
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		io.Copy(dst, srcDebug)
-		dst.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(src, dstDebug)
-		src.Close()
-	}()
-	wg.Wait()
-}
-
 func handleConnection(conn net.Conn, webSNIs map[string]bool, tlsCfg *tls.Config, httpConns chan net.Conn) {
-	if *wsTCPProxy != "" {
-		proxyConn := conn
-		if tlsCfg != nil {
-			reader := bufio.NewReader(conn)
-			hdr, err := reader.Peek(5)
-			if err == nil && len(hdr) > 0 && hdr[0] == 0x16 {
-				tlsConn := tls.Server(&peekedConn{Conn: conn, r: reader}, tlsCfg)
-				if err := tlsConn.Handshake(); err == nil {
-					proxyConn = tlsConn
-					log.Printf("[TCPPROXY] TLS terminated from %s", conn.RemoteAddr())
-				} else {
-					log.Printf("[TCPPROXY] TLS handshake failed: %v (forwarding raw)", err)
-					proxyConn = &peekedConn{Conn: conn, r: reader}
-				}
-			} else {
-				proxyConn = &peekedConn{Conn: conn, r: reader}
-			}
-		}
-		dest, err := net.DialTimeout("tcp", *wsTCPProxy, 10*time.Second)
-		if err != nil {
-			log.Printf("[TCPPROXY] Connect to %s failed: %v", *wsTCPProxy, err)
-			conn.Close()
-			return
-		}
-		log.Printf("[TCPPROXY] %s -> %s", conn.RemoteAddr(), *wsTCPProxy)
-		go func() {
-			io.Copy(dest, &debugReader{Reader: proxyConn, name: "client->backend"})
-			dest.Close()
-		}()
-		io.Copy(proxyConn, &debugReader{Reader: dest, name: "backend->client"})
-		return
-	}
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
@@ -612,7 +417,18 @@ func handleConnection(conn net.Conn, webSNIs map[string]bool, tlsCfg *tls.Config
 			conn.Close()
 			return
 		}
-		tcpProxyLoop(dest, peekConn)
+		errc := make(chan error, 2)
+		go func() {
+			_, err := io.Copy(dest, peekConn)
+			dest.Close()
+			errc <- err
+		}()
+		go func() {
+			_, err := io.Copy(peekConn, dest)
+			peekConn.Close()
+			errc <- err
+		}()
+		<-errc
 		return
 	}
 
