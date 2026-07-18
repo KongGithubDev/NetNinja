@@ -1,30 +1,37 @@
 ═══ V2BOX (Android) Setup Guide ═══
+   (VLESS + WebSocket + TLS + SNI-bug → AIS free-data bypass)
 
 วิธีที่ 1: Import JSON
   1. เปิด V2Box → กด + → Import Config from File
   2. เลือกไฟล์ v2box-mobile-config.json
-  3. แก้ไข YOUR_SERVER_IP และ YOUR_PUBLIC_KEY_HERE
+  3. แก้ไข YOUR_SERVER_IP เป็น IP ของ server (เช่น 1.2.3.4)
   4. กด Connect
 
 วิธีที่ 2: Import via Clipboard (Share Link)
   คัดลอก link ด้านล่างแล้วไปที่ V2Box → Import from Clipboard:
 
-vless://b831381d-6324-4d53-ad4f-8cda48b30811@YOUR_SERVER_IP:443?type=tcp&security=reality&pbk=YOUR_PUBLIC_KEY_HERE&fp=chrome&sni=www.microsoft.com&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision&encryption=none#NetNinja-REALITY
+vless://b831381d-6324-4d53-ad4f-8cda48b30811@YOUR_SERVER_IP:443?encryption=none&security=tls&sni=search.ais.co.th&allowInsecure=1&type=ws&host=search.ais.co.th&path=%2F#NetNinja-AIS
 
 วิธีที่ 3: Manual
-  Protocol : VLESS
-  Address  : YOUR_SERVER_IP
-  Port     : 443
-  UUID     : b831381d-6324-4d53-ad4f-8cda48b30811
-  Flow     : xtls-rprx-vision
-  Encryption: none
-  Network  : tcp
-  Security : reality
-    Fingerprint : chrome
-    ServerName  : www.microsoft.com
-    PublicKey   : YOUR_PUBLIC_KEY_HERE
-    ShortId     : 6ba85179e30d4fc2
+  Protocol   : VLESS
+  Address    : YOUR_SERVER_IP
+  Port       : 443
+  UUID       : b831381d-6324-4d53-ad4f-8cda48b30811
+  Encryption : none
+  Network    : ws
+    Path     : /
+    Host     : search.ais.co.th
+  Security   : tls
+    ServerName : search.ais.co.th
+    AllowInsecure : true (เปิด)
 
 ═══ NOTE ═══
-รัน .\setup-reality.ps1 ก่อนเพื่อ generate key pair
-แล้วเอา Public Key + Server IP มาใส่แทน YOUR_PUBLIC_KEY_HERE และ YOUR_SERVER_IP
+- ไฟล์ .npvt (01-AIS_NOPRO_SSH_WS) เป็นหลักฐานว่า Host "search.ais.co.th" เป็น
+  AIS zero-rated/free-data domain ที่ยัง bypass DPI ได้
+  (อันเก่าใช้ speedtest.net แต่ถูก AIS ปรับสถานะไปแล้ว)
+- Host นี้จะถูกใช้ทั้ง TLS SNI และ HTTP Host header — ต้องไม่อยู่ใน
+  NET_WEB_SNI ของ server (เดิมใช้ kpstore.online, gta-career.com,
+  n8n.kongwatcharapong.in.th — search.ais.co.th ไม่อยู่ในลิสต์ ถูกต้อง)
+- ถ้าใช้ -cert/-key (real cert) แทน self-signed ก็ยังต้อง AllowInsecure
+  อยู่ดี เพราะ cert เป็นของโดเมนอื่น (เช่น *.kongwatcharapong.in.th)
+  ไม่ตรงกับ search.ais.co.th

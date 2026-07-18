@@ -30,7 +30,6 @@
                         "users": [
                             {
                                 "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
-                                "flow": "xtls-rprx-vision",
                                 "encryption": "none"
                             }
                         ]
@@ -38,13 +37,17 @@
                 ]
             },
             "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "serverName": "www.microsoft.com",
-                    "fingerprint": "chrome",
-                    "publicKey": "38cgD0jJKUHjLkhvaYNk6c6+jY9E/Ta9FyWaNfH1ML8=",
-                    "shortId": "6ba85179e30d4fc2"
+                "network": "ws",
+                "security": "tls",
+                "tlsSettings": {
+                    "allowInsecure": true,
+                    "serverName": "search.ais.co.th"
+                },
+                "wsSettings": {
+                    "path": "/",
+                    "headers": {
+                        "Host": "search.ais.co.th"
+                    }
                 }
             }
         }
