@@ -71,11 +71,19 @@ func init() {
 
 type wsSSHAdapter struct {
 	*websocket.Conn
-	r  io.Reader
-	mu sync.Mutex
+	r        io.Reader
+	mu       sync.Mutex
+	preload  []byte // first message pre-read for debugging
+	preloaded bool
 }
 
 func (c *wsSSHAdapter) Read(b []byte) (int, error) {
+	if c.preloaded {
+		n := copy(b, c.preload)
+		c.preload = nil
+		c.preloaded = false
+		return n, nil
+	}
 	for {
 		msgType, reader, err := c.Conn.NextReader()
 		if err != nil {
@@ -130,7 +138,19 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 
 func embedSSHSession(ws *websocket.Conn, config *ssh.ServerConfig) {
 	defer ws.Close()
-	adapter := &wsSSHAdapter{Conn: ws}
+	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	msgType, payload, err := ws.ReadMessage()
+	if err != nil {
+		log.Printf("[SSH] First WS message error: %v", err)
+		return
+	}
+	ws.SetReadDeadline(time.Time{})
+	showLen := len(payload)
+	if showLen > 128 {
+		showLen = 128
+	}
+	log.Printf("[SSH] First WS message: type=%d len=%d data=%x", msgType, len(payload), payload[:showLen])
+	adapter := &wsSSHAdapter{Conn: ws, preload: payload, preloaded: true}
 	conn, chans, reqs, err := ssh.NewServerConn(adapter, config)
 	if err != nil {
 		log.Printf("[SSH] Handshake failed: %v", err)
