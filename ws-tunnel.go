@@ -213,11 +213,12 @@ func handleWSTunnel(w http.ResponseWriter, r *http.Request) {
 	bufrw.WriteString(resp)
 	bufrw.Flush()
 
+	peeked := &peekedConn{Conn: rawConn, r: bufrw.Reader}
 	log.Printf("[WS] New connection from %s", rawConn.RemoteAddr())
 	if *wsEmbed {
-		handleRawSSH(rawConn)
+		handleRawSSH(peeked)
 	} else {
-		proxyRawToExternalSSH(rawConn)
+		proxyRawToExternalSSH(peeked)
 	}
 }
 
