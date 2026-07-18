@@ -14,3 +14,9 @@ Thumbs.db
 # Certificates
 fullchain.pem
 privkey.pem
+
+# Backups
+backup/
+
+# NPVT configs (white-box AES is reversible, contain SSH creds)
+*.npvt

@@ -39,12 +39,12 @@
         "security": "tls",
         "tlsSettings": {
           "allowInsecure": true,
-          "serverName": "search.ais.co.th"
+          "serverName": "d1fbs8nqzc2s4w.cloudfront.net"
         },
         "wsSettings": {
           "path": "/",
           "headers": {
-            "Host": "search.ais.co.th"
+            "Host": "d1fbs8nqzc2s4w.cloudfront.net"
           }
         }
       }
