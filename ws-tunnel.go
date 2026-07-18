@@ -440,6 +440,11 @@ func handleConnection(conn net.Conn, webSNIs map[string]bool, tlsCfg *tls.Config
 		}
 	}
 
+	var isSSH bool
+	if len(hdr) >= 4 && string(hdr[:4]) == "SSH-" {
+		isSSH = true
+	}
+
 	peekConn := &peekedConn{Conn: conn, r: reader}
 
 	if proxyToWeb {
@@ -464,6 +469,16 @@ func handleConnection(conn net.Conn, webSNIs map[string]bool, tlsCfg *tls.Config
 		return
 	}
 
+	if isSSH {
+		log.Printf("[SSH] Direct SSH connection from %s", conn.RemoteAddr())
+		if *wsEmbed {
+			handleRawSSH(peekConn)
+		} else {
+			proxyRawToExternalSSH(peekConn)
+		}
+		return
+	}
+
 	if isPlainHTTP {
 		httpConns <- peekConn
 	} else if isTLS && tlsCfg != nil {
@@ -472,6 +487,46 @@ func handleConnection(conn net.Conn, webSNIs map[string]bool, tlsCfg *tls.Config
 	} else {
 		httpConns <- peekConn
 	}
+}
+
+func handleRawSSH(conn net.Conn) {
+	defer conn.Close()
+	config := getEmbedSSHConfig()
+	conn2, chans, reqs, err := ssh.NewServerConn(conn, config)
+	if err != nil {
+		log.Printf("[SSH] Direct handshake failed: %v", err)
+		return
+	}
+	defer conn2.Close()
+
+	go ssh.DiscardRequests(reqs)
+	for newChan := range chans {
+		go handleSSHChannel(conn2, newChan)
+	}
+}
+
+func proxyRawToExternalSSH(conn net.Conn) {
+	defer conn.Close()
+	dest, err := net.DialTimeout("tcp", *wsSSHAddr, 10*time.Second)
+	if err != nil {
+		log.Printf("[PROXY] SSH proxy failed: %v", err)
+		return
+	}
+	defer dest.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(dest, conn)
+		dest.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(conn, dest)
+		conn.Close()
+	}()
+	wg.Wait()
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
