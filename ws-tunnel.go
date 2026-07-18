@@ -343,6 +343,32 @@ func handleConnection(conn net.Conn, webSNIs map[string]bool, tlsCfg *tls.Config
 		if *wsEmbed { handleRawSSH(peekConn) } else { proxyRawToExternalSSH(peekConn) }
 		return
 	}
+	// ── fwd-addr mode: detect Upgrade & forward raw ──
+	if *wsFwdAddr != "" && tlsCfg != nil {
+		if isTLS {
+			// Terminate TLS, check decrypted data for Upgrade
+			tlsConn := tls.Server(peekConn, tlsCfg)
+			tlsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			br := bufio.NewReader(tlsConn)
+			peek, err := br.Peek(128)
+			tlsConn.SetReadDeadline(time.Time{})
+			if err == nil && strings.Contains(string(peek), "Upgrade:") {
+				dest, err := net.DialTimeout("tcp", *wsFwdAddr, 10*time.Second)
+				if err == nil {
+					log.Printf("[FWD] %s -> %s (raw TLS→%s)", conn.RemoteAddr(), *wsFwdAddr, *wsFwdAddr)
+					pc := &peekedConn{Conn: tlsConn, r: br}
+					var wg sync.WaitGroup; wg.Add(2)
+					go func() { defer wg.Done(); io.Copy(dest, pc); dest.Close() }()
+					go func() { defer wg.Done(); io.Copy(pc, dest); pc.Close() }()
+					wg.Wait()
+				}
+				return
+			}
+			// Non-Upgrade TLS (PING) → HTTP server
+			httpConns <- tlsConn
+			return
+		}
+	}
 	if isPlainHTTP { httpConns <- peekConn
 	} else if isTLS && tlsCfg != nil { httpConns <- tls.Server(peekConn, tlsCfg)
 	} else { httpConns <- peekConn }
