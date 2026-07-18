@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
@@ -290,7 +291,9 @@ func handleWSTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Header.Get("Sec-WebSocket-Key") == "" {
-		r.Header.Set("Sec-WebSocket-Key", "dGhpcyBpcyBhIGR1bW15IGtleQ==")
+		k := make([]byte, 16)
+		rand.Read(k)
+		r.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(k))
 	}
 	if r.Header.Get("Sec-WebSocket-Version") == "" {
 		r.Header.Set("Sec-WebSocket-Version", "13")
