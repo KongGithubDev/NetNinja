@@ -4,9 +4,7 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha1"
 	"crypto/tls"
-	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -67,6 +66,59 @@ func init() {
 	}
 }
 
+// ── WebSocket → SSH Adapter ──────────────────────────────────────────────────
+
+type wsSSHAdapter struct {
+	*websocket.Conn
+	r  io.Reader
+	mu sync.Mutex
+}
+
+func (c *wsSSHAdapter) Read(b []byte) (int, error) {
+	if c.r == nil {
+		for {
+			msgType, reader, err := c.Conn.NextReader()
+			if err != nil {
+				return 0, err
+			}
+			if msgType == websocket.BinaryMessage || msgType == websocket.TextMessage {
+				c.r = reader
+				break
+			}
+		}
+	}
+	n, err := c.r.Read(b)
+	if err == io.EOF {
+		c.r = nil
+		if n > 0 {
+			return n, nil
+		}
+		return c.Read(b)
+	}
+	return n, err
+}
+
+func (c *wsSSHAdapter) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.Conn.WriteMessage(websocket.BinaryMessage, b); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (c *wsSSHAdapter) SetDeadline(t time.Time) error {
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *wsSSHAdapter) SetReadDeadline(t time.Time) error {
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *wsSSHAdapter) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
 // ── Peeked Connection ────────────────────────────────────────────────────────
 
 type peekedConn struct {
@@ -79,6 +131,22 @@ func (c *peekedConn) Read(b []byte) (int, error) {
 }
 
 // ── SSH Server ───────────────────────────────────────────────────────────────
+
+func embedSSHSession(ws *websocket.Conn, config *ssh.ServerConfig) {
+	defer ws.Close()
+	adapter := &wsSSHAdapter{Conn: ws}
+	conn, chans, reqs, err := ssh.NewServerConn(adapter, config)
+	if err != nil {
+		log.Printf("[SSH] Handshake failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	go ssh.DiscardRequests(reqs)
+	for newChan := range chans {
+		go handleSSHChannel(conn, newChan)
+	}
+}
 
 func handleSSHChannel(conn *ssh.ServerConn, newChan ssh.NewChannel) {
 	switch newChan.ChannelType() {
@@ -137,6 +205,31 @@ func handleSSHChannel(conn *ssh.ServerConn, newChan ssh.NewChannel) {
 	}
 }
 
+func proxyToExternalSSH(ws *websocket.Conn) {
+	defer ws.Close()
+	adapter := &wsSSHAdapter{Conn: ws}
+	dest, err := net.DialTimeout("tcp", *wsSSHAddr, 10*time.Second)
+	if err != nil {
+		log.Printf("[PROXY] Failed to connect to SSH %s: %v", *wsSSHAddr, err)
+		return
+	}
+	defer dest.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(dest, adapter)
+		dest.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(adapter, dest)
+		ws.Close()
+	}()
+	wg.Wait()
+}
+
 // ── SSH Config ───────────────────────────────────────────────────────────────
 
 var (
@@ -185,48 +278,34 @@ func getEmbedSSHConfig() *ssh.ServerConfig {
 
 // ── WebSocket Handler ────────────────────────────────────────────────────────
 
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin:     func(r *http.Request) bool { return true },
+	ReadBufferSize:  64 * 1024,
+	WriteBufferSize: 64 * 1024,
+}
+
 func handleWSTunnel(w http.ResponseWriter, r *http.Request) {
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		http.Error(w, "WebSocket upgrade required", http.StatusBadRequest)
 		return
 	}
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		return
+	if r.Header.Get("Sec-WebSocket-Key") == "" {
+		r.Header.Set("Sec-WebSocket-Key", "dGhpcyBpcyBhIGR1bW15IGtleQ==")
 	}
-	rawConn, bufrw, err := hj.Hijack()
+	if r.Header.Get("Sec-WebSocket-Version") == "" {
+		r.Header.Set("Sec-WebSocket-Version", "13")
+	}
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[WS] Hijack failed: %v", err)
+		log.Printf("[WS] Upgrade failed: %v", err)
 		return
 	}
-	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		key = "dGhpcyBpcyBhIGR1bW15IGtleQ=="
-	}
-	accept := computeAcceptKey(key)
-	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n" +
-		"Sec-WebSocket-Version: 13\r\n\r\n"
-	bufrw.WriteString(resp)
-	bufrw.Flush()
-
-	peeked := &peekedConn{Conn: rawConn, r: bufrw.Reader}
-	log.Printf("[WS] New connection from %s", rawConn.RemoteAddr())
+	log.Printf("[WS] New connection from %s", conn.RemoteAddr())
 	if *wsEmbed {
-		handleRawSSH(peeked)
+		embedSSHSession(conn, getEmbedSSHConfig())
 	} else {
-		proxyRawToExternalSSH(peeked)
+		proxyToExternalSSH(conn)
 	}
-}
-
-func computeAcceptKey(key string) string {
-	h := sha1.New()
-	h.Write([]byte(key))
-	h.Write([]byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
 // ── HTTP Server Frontend ─────────────────────────────────────────────────────
