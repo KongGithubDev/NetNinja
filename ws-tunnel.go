@@ -478,17 +478,36 @@ func readSNI(data []byte) string {
 
 // ── Connection Handler ───────────────────────────────────────────────────────
 
+type debugReader struct {
+	io.Reader
+	name string
+}
+
+func (d *debugReader) Read(p []byte) (int, error) {
+	n, err := d.Reader.Read(p)
+	if n > 0 {
+		show := n
+		if show > 64 {
+			show = 64
+		}
+		log.Printf("[DEBUG %s] %d bytes: %x", d.name, n, p[:show])
+	}
+	return n, err
+}
+
 func tcpProxyLoop(src, dst net.Conn) {
+	srcDebug := &debugReader{Reader: src, name: "src->dst"}
+	dstDebug := &debugReader{Reader: dst, name: "dst->src"}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(dst, src)
+		io.Copy(dst, srcDebug)
 		dst.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(src, dst)
+		io.Copy(src, dstDebug)
 		src.Close()
 	}()
 	wg.Wait()
@@ -520,7 +539,11 @@ func handleConnection(conn net.Conn, webSNIs map[string]bool, tlsCfg *tls.Config
 			return
 		}
 		log.Printf("[TCPPROXY] %s -> %s", conn.RemoteAddr(), *wsTCPProxy)
-		tcpProxyLoop(proxyConn, dest)
+		go func() {
+			io.Copy(dest, &debugReader{Reader: proxyConn, name: "client->backend"})
+			dest.Close()
+		}()
+		io.Copy(proxyConn, &debugReader{Reader: dest, name: "backend->client"})
 		return
 	}
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
