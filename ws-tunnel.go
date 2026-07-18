@@ -201,12 +201,12 @@ func handleWSTunnel(w http.ResponseWriter, r *http.Request) {
 	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n\r\n")
 	bufrw.Flush()
 
-	conn := &peekedConn{Conn: raw, r: bufrw.Reader}
+	raw.SetReadDeadline(time.Time{})
 	log.Printf("[WS] New connection from %s", raw.RemoteAddr())
 	if *wsEmbed {
-		handleRawSSH(conn)
+		handleRawSSH(raw)
 	} else {
-		proxyRawToExternalSSH(conn)
+		proxyRawToExternalSSH(raw)
 	}
 }
 
