@@ -14,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,10 +113,12 @@ func cachedResolve(ctx context.Context, host string) (string, error) {
 	if v, ok := dnsCache.Load(host); ok {
 		entry := v.(dnsEntry)
 		if time.Now().Before(entry.expiry) {
+			atomic.AddInt64(&dnsHits, 1)
 			return entry.ip, nil
 		}
 		dnsCache.Delete(host)
 	}
+	atomic.AddInt64(&dnsMisses, 1)
 
 	// 2. check SQLite persistent cache
 	var ip string
@@ -158,9 +161,11 @@ func hyperResolve(ctx context.Context, host string) (string, error) {
 	if v, ok := dnsCache.Load(host); ok {
 		entry := v.(dnsEntry)
 		if time.Now().Before(entry.expiry) {
+			atomic.AddInt64(&dnsHits, 1)
 			return entry.ip, nil
 		}
 	}
+	atomic.AddInt64(&dnsMisses, 1)
 
 	type res struct {
 		ip  string
@@ -237,6 +242,7 @@ func resolveDoH(host string) (string, error) {
 
 		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && len(res.Answer) > 0 {
 			resp.Body.Close()
+			atomic.AddInt64(&dohCalls, 1)
 			// Prefer A records (IPv4) for stability, fallback to AAAA (IPv6)
 			for _, ans := range res.Answer {
 				if ans.Type == 1 { // A record
@@ -267,8 +273,38 @@ const (
 // Connection counter
 var activeConns int64
 var totalRequests int64
+var totalBytesUp int64   // bytes sent to targets (client → internet)
+var totalBytesDown int64 // bytes received from targets (internet → client)
+var dnsHits int64
+var dnsMisses int64
+var dohCalls int64
+var errCount int64
 var startTime time.Time
 var userTracker sync.Map // map[string]time.Time (IP -> last seen)
+
+// Host traffic stats (host -> last seen + counters)
+type hostStat struct {
+	mu    sync.Mutex
+	count int64
+	bytes int64
+	last  time.Time
+}
+var hostStats sync.Map // map[string]*hostStat
+
+func (h *hostStat) addConn(n int64) {
+	h.mu.Lock()
+	h.count++
+	h.bytes += n
+	h.last = time.Now()
+	h.mu.Unlock()
+}
+
+// Rolling traffic history for the sparkline (1 value / sec, 60 slots)
+var bwHistory []int64
+var bwHistoryMu sync.Mutex
+
+// Active tunnel list for the dashboard
+var activeTunnels sync.Map // map[string]time.Time (host -> start time)
 
 var buildTime = "manual_build" // Auto-injected via -ldflags during build
 
@@ -675,8 +711,33 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 	<div class="row"><span class="k">uptime</span><span class="v" id="uptime">--</span></div>
 	<div class="row"><span class="k">active_users</span><span class="v num" id="users" style="color:#7af">0</span></div>
 	<div id="ip_list" class="tag-list" style="margin-bottom:10px"></div>
-	<div class="row"><span class="k">active_conns</span><span class="v num" id="active">0</span></div>
+	<div class="row"><span class="k">active_tunnels</span><span class="v num" id="active">0</span></div>
 	<div class="row"><span class="k">total_reqs</span><span class="v num" id="total">0</span></div>
+
+	<div class="section-title">live_traffic</div>
+	<div class="row"><span class="k">bytes_up</span><span class="v" id="bytes_up">0</span></div>
+	<div class="row"><span class="k">bytes_down</span><span class="v" id="bytes_down">0</span></div>
+	<div class="row"><span class="k">dns_cache_hits</span><span class="v num" id="dns_hits" style="color:#0f0">0</span></div>
+	<div class="row"><span class="k">dns_cache_misses</span><span class="v" id="dns_misses">0</span></div>
+	<div class="row"><span class="k">doh_fallbacks</span><span class="v" id="doh_calls">0</span></div>
+	<div class="row"><span class="k">errors</span><span class="v" id="err_count" style="color:#f55">0</span></div>
+	<div class="spark-wrap">
+		<canvas id="bw_spark" width="510" height="52"></canvas>
+		<div class="spark-label">throughput_b/sec_history_60s</div>
+	</div>
+
+	<div class="section-title">active_tunnels_by_host</div>
+	<div class="tag-list" id="tunnels">--</div>
+
+	<div class="section-title">top_hosts_by_conns</div>
+	<div class="mini-table" id="top_hosts">
+		<div class="mini-row"><span>--</span></div>
+	</div>
+
+	<div class="section-title">top_traffic_hosts</div>
+	<div class="mini-table" id="recent_traffic">
+		<div class="mini-row"><span>--</span></div>
+	</div>
 
 	<div class="section-title">memory_runtime</div>
 	<div class="row"><span class="k">heap_alloc</span><span class="v" id="mem_heap">--</span></div>
@@ -699,12 +760,24 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 
 	<div class="footer">
 		<a href="/logs">view_full_logs</a> &nbsp;•&nbsp; 
+		<a href="/block-check">block_check</a> &nbsp;•&nbsp;
 		<span id="ws_status" style="color:#444">connecting_ws...</span>
 		<div style="margin-top:15px;color:#222;font-size:10px;text-transform:uppercase;letter-spacing:1px">
 			developed_by // Watcharapong Namsaeng
 		</div>
 	</div>
 </div>
+
+<style>
+.mini-table{display:flex;flex-direction:column;gap:2px;margin-bottom:10px}
+.mini-row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #0d0d0d;font-size:11px}
+.mini-row .h{color:#7af;word-break:break-all}
+.mini-row .c{color:#0f0}
+.mini-row .m{color:#888}
+.spark-wrap{margin-top:12px}
+.spark-label{color:#444;font-size:10px;letter-spacing:1px;margin-top:4px}
+#bw_spark{background:#0d0d0d;border:1px solid #1a1a1a;width:100%%;max-width:510px;border-radius:3px}
+</style>
 
 <script>
 	const updateVal = (id, val) => {
@@ -716,20 +789,72 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 		}
 	};
 
+	const fmtBytes = (b) => {
+		if (!b) return '0 b';
+		if (b < 1024) return b + ' b';
+		if (b < 1048576) return (b/1024).toFixed(1) + ' kb';
+		if (b < 1073741824) return (b/1048576).toFixed(2) + ' mb';
+		return (b/1073741824).toFixed(2) + ' gb';
+	};
+
+	const drawSpark = (canvas, data) => {
+		const ctx = canvas.getContext('2d');
+		const w = canvas.width, h = canvas.height;
+		ctx.clearRect(0, 0, w, h);
+		if (!data || data.length === 0) { ctx.fillStyle='#1a1a1a'; ctx.fillRect(0,0,w,h); return; }
+		ctx.lineWidth = 1.5;
+		ctx.strokeStyle = '#0f0';
+		ctx.beginPath();
+		const max = Math.max(...data, 1);
+		data.forEach((v, i) => {
+			const x = (i / 59) * w;
+			const y = h - (v / max) * (h - 4) - 2;
+			if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+		});
+		ctx.stroke();
+	};
+
+	const renderHosts = (el, list, isBytes) => {
+		if (!list || list.length === 0) {
+			el.innerHTML = '<div class="mini-row"><span class="h" style="color:#444">-- no traffic --</span></div>';
+			return;
+		}
+		el.innerHTML = list.map(h => {
+			const val = isBytes ? fmtBytes(h.bytes) : String(h.count);
+			const cls = isBytes ? 'm' : 'c';
+			return '<div class="mini-row"><span class="h">' + h.host + '</span><span class="' + cls + '">' + val + '</span></div>';
+		}).join('');
+	};
+
 	const connect = () => {
 		const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+		let backoff = 1000;
 		const ws = new WebSocket(protocol + '//' + location.host + '/ws');
-		ws.onopen = () => document.getElementById('ws_status').textContent = 'ws_live';
+		ws.onopen = () => {
+			backoff = 1000;
+			document.getElementById('ws_status').textContent = 'ws_live';
+			document.getElementById('ws_status').style.color = '#0f0';
+		};
 		ws.onclose = () => {
 			document.getElementById('ws_status').textContent = 'ws_reconnecting...';
-			setTimeout(connect, 2000);
+			document.getElementById('ws_status').style.color = '#f55';
+			setTimeout(connect, backoff);
+			backoff = Math.min(backoff * 2, 10000);
 		};
+		ws.onerror = () => ws.close();
 		ws.onmessage = (e) => {
-			const d = JSON.parse(e.data);
+			let d;
+			try { d = JSON.parse(e.data); } catch (_) { return; }
 			updateVal('uptime', d.uptime);
 			updateVal('users', d.users);
 			updateVal('active', d.active_conn);
 			updateVal('total', d.total_req);
+			updateVal('bytes_up', fmtBytes(d.bytes_up));
+			updateVal('bytes_down', fmtBytes(d.bytes_down));
+			updateVal('dns_hits', d.dns_hits);
+			updateVal('dns_misses', d.dns_misses);
+			updateVal('doh_calls', d.doh_calls);
+			updateVal('err_count', d.err_count);
 			updateVal('mem_heap', d.mem_heap);
 			updateVal('mem_sys', d.mem_sys);
 			updateVal('goroutines', d.goroutines);
@@ -738,6 +863,18 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 			updateVal('db_size', d.db_size);
 			updateVal('go_ver', d.go_ver + ' (' + d.cpus + ' CPUs)');
 			
+			drawSpark(document.getElementById('bw_spark'), d.bw_history);
+
+			const tunnelsEl = document.getElementById('tunnels');
+			if (d.tunnels && d.tunnels.length > 0) {
+				tunnelsEl.innerHTML = d.tunnels.map(t => '<span class="tag ip-link" style="cursor:default">' + t + '</span>').join('');
+			} else {
+				tunnelsEl.innerHTML = '<span class="tag" style="color:#444">--</span>';
+			}
+
+			renderHosts(document.getElementById('top_hosts'), d.top_hosts, false);
+			renderHosts(document.getElementById('recent_traffic'), d.recent_traffic, true);
+
 			const ipListEl = document.getElementById('ip_list');
 			if (d.user_ips && d.user_ips.length > 0) {
 				ipListEl.innerHTML = d.user_ips.map(ip => {
@@ -752,6 +889,8 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 			const recentEl = document.getElementById('recent');
 			if (d.recent && d.recent.length > 0) {
 				recentEl.innerHTML = d.recent.map(t => '<span class="tag">' + t + '</span>').join('');
+			} else {
+				recentEl.innerHTML = '<span class="tag" style="color:#444">--</span>';
 			}
 		};
 	};
@@ -861,7 +1000,7 @@ button{width:100%;padding:12px;background:#060;color:#fff;border:none;border-rad
 <title>Block Check Result</title>
 <style>
 body{background:#0a0a0a;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
-.c{max-width:480px;width:90%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
+.c{max-width:480px;width:90%%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
 h1{font-size:22px;margin:0 0 20px;font-weight:normal}
 .v{font-size:20px;font-weight:bold;padding:16px;border-radius:4px;margin-bottom:16px}
 .d{color:#888;font-size:12px;word-break:break-all;margin-bottom:20px}
@@ -889,7 +1028,7 @@ a{color:#7af}
 <title>Block Check Result</title>
 <style>
 body{background:#0a0a0a;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
-.c{max-width:480px;width:90%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
+.c{max-width:480px;width:90%%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
 h1{font-size:22px;margin:0 0 20px;font-weight:normal}
 .v{font-size:20px;font-weight:bold;padding:16px;border-radius:4px;margin-bottom:16px}
 .d{color:#888;font-size:12px;word-break:break-all;margin-bottom:20px}
@@ -908,7 +1047,7 @@ a{color:#7af}
 <title>Block Check Result</title>
 <style>
 body{background:#0a0a0a;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
-.c{max-width:480px;width:90%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
+.c{max-width:480px;width:90%%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
 h1{font-size:22px;margin:0 0 20px;font-weight:normal}
 .v{font-size:20px;font-weight:bold;padding:16px;border-radius:4px;margin-bottom:16px}
 .d{color:#888;font-size:12px;word-break:break-all;margin-bottom:20px}
@@ -930,7 +1069,7 @@ a{color:#7af}
 <title>Block Check Result</title>
 <style>
 body{background:#0a0a0a;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
-.c{max-width:480px;width:90%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
+.c{max-width:480px;width:90%%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
 h1{font-size:22px;margin:0 0 20px;font-weight:normal}
 .v{font-size:20px;font-weight:bold;padding:16px;border-radius:4px;margin-bottom:16px}
 .d{color:#888;font-size:12px;word-break:break-all;margin-bottom:20px}
@@ -1144,6 +1283,20 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		port = host[idx+1:]
 	}
 
+	// Track active tunnel (host-based)
+	activeTunnels.Store(hostname, time.Now())
+
+	// Track host stats
+	var hs *hostStat
+	if s, ok := hostStats.Load(hostname); ok {
+		hs = s.(*hostStat)
+		hs.addConn(0)
+	} else {
+		hs = &hostStat{}
+		hs.addConn(0)
+		hostStats.Store(hostname, hs)
+	}
+
 	// Cisco Unwrapping Logic
 	unwrapped := unwrapCiscoDomain(hostname)
 	isCisco := unwrapped != hostname
@@ -1177,6 +1330,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	destConn, err := customDialer.DialContext(r.Context(), "tcp", net.JoinHostPort(ip, port))
 	if err != nil {
 		atomic.AddInt64(&activeConns, -1)
+		atomic.AddInt64(&errCount, 1)
 		log.Printf("%s[ERR]%s CONNECT %s failed: %s", colorRed, colorReset, host, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
@@ -1193,12 +1347,16 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
 		atomic.AddInt64(&activeConns, -1)
+		atomic.AddInt64(&errCount, 1)
 		destConn.Close()
 		http.Error(w, "Hijack failed", http.StatusServiceUnavailable)
 		return
 	}
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// Track active tunnel start time
+	activeTunnels.Store(hostname, time.Now())
 
 	// God-Mode: Pure native performance + KeepAlive
 	if tc, ok := clientConn.(*net.TCPConn); ok {
@@ -1218,17 +1376,69 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		colorGray, colorReset)
 
 	errc := make(chan error, 2)
+
+	// Client → dest (upload)
 	go func() {
-		_, err := io.Copy(destConn, clientConn)
+		n, err := io.Copy(destConn, clientConn)
+		atomic.AddInt64(&totalBytesUp, n)
+		if hs != nil {
+			hs.mu.Lock()
+			hs.bytes += n
+			hs.last = time.Now()
+			hs.mu.Unlock()
+		}
 		destConn.Close()
 		errc <- err
 	}()
+	// dest → client (download)
 	go func() {
-		_, err := io.Copy(clientConn, destConn)
+		n, err := io.Copy(clientConn, destConn)
+		atomic.AddInt64(&totalBytesDown, n)
+		if hs != nil {
+			hs.mu.Lock()
+			hs.bytes += n
+			hs.last = time.Now()
+			hs.mu.Unlock()
+		}
 		clientConn.Close()
 		errc <- err
 	}()
+
+	// Record bandwidth history every second (decoupled)
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		var lastUp, lastDown int64
+		for {
+			select {
+			case <-t.C:
+				cu := atomic.LoadInt64(&totalBytesUp)
+				cd := atomic.LoadInt64(&totalBytesDown)
+				sample := cu + cd - lastUp - lastDown
+				lastUp = cu
+				lastDown = cd
+				bwHistoryMu.Lock()
+				bwHistory = append(bwHistory, sample)
+				if len(bwHistory) > 60 {
+					bwHistory = bwHistory[len(bwHistory)-60:]
+				}
+				bwHistoryMu.Unlock()
+			case <-errc:
+				return
+			}
+		}
+	}()
+
 	<-errc
+	activeTunnels.Delete(hostname)
+}
+
+func bwSnapshot() []int64 {
+	bwHistoryMu.Lock()
+	defer bwHistoryMu.Unlock()
+	out := make([]int64, len(bwHistory))
+	copy(out, bwHistory)
+	return out
 }
 
 // copyHeaders copies HTTP headers
@@ -1414,22 +1624,94 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 				rows.Close()
 			}
 
+			// Top hosts by connection count
+			type hostRow struct {
+				name  string
+				count int64
+				bytes int64
+			}
+			var hosts []hostRow
+			hostStats.Range(func(k, v interface{}) bool {
+				st := v.(*hostStat)
+				st.mu.Lock()
+				hosts = append(hosts, hostRow{k.(string), st.count, st.bytes})
+				st.mu.Unlock()
+				return true
+			})
+			sort.Slice(hosts, func(i, j int) bool { return hosts[i].count > hosts[j].count })
+			if len(hosts) > 12 {
+				hosts = hosts[:12]
+			}
+			topHosts := []map[string]interface{}{}
+			for _, h := range hosts {
+				topHosts = append(topHosts, map[string]interface{}{
+					"host":  h.name,
+					"count": h.count,
+					"bytes": h.bytes,
+				})
+			}
+
+			// Active tunnels (host that have open connections right now)
+			var tunnels []string
+			activeTunnels.Range(func(k, v interface{}) bool {
+				tunnels = append(tunnels, k.(string))
+				return true
+			})
+			sort.Strings(tunnels)
+
+			// Bandwidth history snapshot
+			bwHistoryMu.Lock()
+			bw := make([]int64, len(bwHistory))
+			copy(bw, bwHistory)
+			bwHistoryMu.Unlock()
+
+			// Recent traffic (last N hosts seen + their bytes)
+			var recentTraffic []map[string]interface{}
+			var trafficRows []hostRow
+			hostStats.Range(func(k, v interface{}) bool {
+				st := v.(*hostStat)
+				st.mu.Lock()
+				trafficRows = append(trafficRows, hostRow{k.(string), st.count, st.bytes})
+				st.mu.Unlock()
+				return true
+			})
+			sort.Slice(trafficRows, func(i, j int) bool { return trafficRows[i].bytes > trafficRows[j].bytes })
+			if len(trafficRows) > 8 {
+				trafficRows = trafficRows[:8]
+			}
+			for _, t := range trafficRows {
+				recentTraffic = append(recentTraffic, map[string]interface{}{
+					"host":  t.name,
+					"bytes": t.bytes,
+				})
+			}
+
 			data := map[string]interface{}{
-				"uptime":      time.Since(startTime).Round(time.Second).String(),
-				"users":       userCount,
-				"user_ips":    activeIPs,
-				"active_conn": atomic.LoadInt64(&activeConns),
-				"total_req":   atomic.LoadInt64(&totalRequests),
-				"mem_alloc":   fmt.Sprintf("%.2f MB", float64(m.Alloc)/1024/1024),
-				"mem_sys":     fmt.Sprintf("%.2f MB", float64(m.Sys)/1024/1024),
-				"mem_heap":    fmt.Sprintf("%.2f MB", float64(m.HeapAlloc)/1024/1024),
-				"goroutines":  runtime.NumGoroutine(),
-				"cpus":        runtime.NumCPU(),
-				"go_ver":      runtime.Version(),
-				"rules":       rules,
-				"cisco":       cisco,
-				"db_size":     dbSize,
-				"recent":      recent,
+				"uptime":        time.Since(startTime).Round(time.Second).String(),
+				"users":         userCount,
+				"user_ips":      activeIPs,
+				"active_conn":   atomic.LoadInt64(&activeConns),
+				"total_req":     atomic.LoadInt64(&totalRequests),
+				"bytes_up":      atomic.LoadInt64(&totalBytesUp),
+				"bytes_down":    atomic.LoadInt64(&totalBytesDown),
+				"dns_hits":      atomic.LoadInt64(&dnsHits),
+				"dns_misses":    atomic.LoadInt64(&dnsMisses),
+				"doh_calls":     atomic.LoadInt64(&dohCalls),
+				"err_count":     atomic.LoadInt64(&errCount),
+				"mem_alloc":     fmt.Sprintf("%.2f MB", float64(m.Alloc)/1024/1024),
+				"mem_sys":       fmt.Sprintf("%.2f MB", float64(m.Sys)/1024/1024),
+				"mem_heap":      fmt.Sprintf("%.2f MB", float64(m.HeapAlloc)/1024/1024),
+				"goroutines":    runtime.NumGoroutine(),
+				"cpus":          runtime.NumCPU(),
+				"go_ver":        runtime.Version(),
+				"rules":         rules,
+				"cisco":         cisco,
+				"db_size":       dbSize,
+				"recent":        recent,
+				"top_hosts":     topHosts,
+				"tunnels":       tunnels,
+				"bw_history":    bw,
+				"recent_traffic": recentTraffic,
 			}
 
 				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
