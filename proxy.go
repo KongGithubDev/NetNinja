@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,7 +18,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"database/sql"
 
@@ -31,6 +31,39 @@ var upgrader = websocket.Upgrader{
 
 var db *sql.DB
 var openedForIPs sync.Map // map[string]bool
+
+// Proxy Basic Auth — loaded from PROXY_USERS="user:pass,user2:pass2"
+var proxyUsers = map[string]string{}
+
+func authRequired(w http.ResponseWriter, r *http.Request) bool {
+	if len(proxyUsers) == 0 {
+		return true
+	}
+	auth := r.Header.Get("Proxy-Authorization")
+	if !strings.HasPrefix(auth, "Basic ") {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="NetNinja"`)
+		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+		return false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
+	if err != nil {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="NetNinja"`)
+		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+		return false
+	}
+	parts := strings.SplitN(string(raw), ":", 2)
+	if len(parts) != 2 {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="NetNinja"`)
+		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+		return false
+	}
+	if want, ok := proxyUsers[parts[0]]; ok && want == parts[1] {
+		return true
+	}
+	w.Header().Set("Proxy-Authenticate", `Basic realm="NetNinja"`)
+	http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+	return false
+}
 
 // DNS cache — avoid repeated lookups for same host
 type dnsEntry struct {
@@ -274,19 +307,6 @@ var proxyTransport = &http.Transport{
 	ForceAttemptHTTP2:     true,
 }
 
-func enableWindowsANSI() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	setMode := kernel32.NewProc("SetConsoleMode")
-	getMode := kernel32.NewProc("GetConsoleMode")
-	handle, _ := syscall.GetStdHandle(syscall.STD_OUTPUT_HANDLE)
-	var mode uint32
-	getMode.Call(uintptr(handle), uintptr(unsafe.Pointer(&mode)))
-	setMode.Call(uintptr(handle), uintptr(mode|0x0004)) // ENABLE_VIRTUAL_TERMINAL_PROCESSING
-}
-
 func initDB() {
 	var err error
 	db, err = sql.Open("sqlite", "proxy_cache.db")
@@ -450,8 +470,22 @@ func main() {
 		port = "8080"
 	}
 
+	if pu := os.Getenv("PROXY_USERS"); pu != "" {
+		for _, up := range strings.Split(pu, ",") {
+			if idx := strings.Index(up, ":"); idx > 0 {
+				proxyUsers[up[:idx]] = up[idx+1:]
+			}
+		}
+		fmt.Printf("Proxy auth enabled for %d user(s)\n", len(proxyUsers))
+	}
+
+	bindAddr := os.Getenv("BIND_ADDR")
+	if bindAddr == "" {
+		bindAddr = "0.0.0.0"
+	}
+
 	proxy := &http.Server{
-		Addr:         "0.0.0.0:" + port,
+		Addr:         bindAddr + ":" + port,
 		Handler:      http.HandlerFunc(handleRequest),
 		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 120 * time.Second,
@@ -521,6 +555,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodConnect {
+		if !authRequired(w, r) {
+			return
+		}
 		handleConnect(w, r)
 		return
 	}
@@ -718,6 +755,9 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 	}
 
 	// Forward other HTTP requests to proxy logic
+	if !authRequired(w, r) {
+		return
+	}
 	handleHTTP(w, r)
 }
 
@@ -1045,16 +1085,22 @@ func isSelf(reqHost, headerHost string) bool {
 	if reqHost == "" {
 		return true
 	}
-	// Case 1: Matches the host header we are listening on
-	if reqHost == headerHost {
-		return true
-	}
-	// Case 2: Matches a local IP
 	hostOnly := reqHost
 	if h, _, err := net.SplitHostPort(reqHost); err == nil {
 		hostOnly = h
 	}
+	// Case 1: Matches a local IP (loopback / interface addresses)
 	if isLocalIP(hostOnly) {
+		return true
+	}
+	// Case 2: Matches this proxy's own published address (PROXY_ADDR host, BIND_ADDR, localhost)
+	if h, _, err := net.SplitHostPort(os.Getenv("PROXY_ADDR")); err == nil && strings.EqualFold(hostOnly, h) {
+		return true
+	}
+	if strings.EqualFold(hostOnly, os.Getenv("BIND_ADDR")) {
+		return true
+	}
+	if strings.EqualFold(hostOnly, "localhost") {
 		return true
 	}
 	return false
