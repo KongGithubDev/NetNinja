@@ -279,7 +279,43 @@ var dnsHits int64
 var dnsMisses int64
 var dohCalls int64
 var errCount int64
+var adBlocked int64
 var startTime time.Time
+
+// Ad-block: banner/tracking domains are refused at the proxy so the
+// client falls back gracefully (no banner/ad network round-trips).
+// Suffix list matches the domain and every subdomain under it.
+var adBlockSuffixes = []string{
+	".doubleclick.net", ".doubleclick.com",
+	".googlesyndication.com", ".googleadservices.com",
+	".googletagmanager.com", ".google-analytics.com", ".googletagservices.com",
+	".doubleverify.com", ".adsafeprotected.com", ".moatads.com", ".scorecardresearch.com",
+	".criteo.com", ".criteo.net", ".taboola.com", ".outbrain.com",
+	".adnxs.com", ".adsrvr.org", ".casalemedia.com", ".rubiconproject.com",
+	".pubmatic.com", ".openx.net", ".smartadserver.com", ".spotxchange.com",
+	".contextweb.com", ".emxdgt.com", ".tidaltv.com", ".teads.tv",
+	".amazon-adsystem.com", ".quantserve.com", ".advertising.com",
+	".adcolony.com", ".vungle.com", ".imrworldwide.com", ".thebrighttag.com",
+}
+var adBlockExact = map[string]bool{ // exact hostname match
+	"adservice.google.com":     true,
+	"adservice.google.co.th":   true,
+	"pagead2.googlesyndication.com": true,
+	"googleads.g.doubleclick.net":   true,
+}
+
+func isAdBlockedHost(hostname string) bool {
+	h := strings.ToLower(strings.TrimSuffix(hostname, "."))
+	if adBlockExact[h] {
+		return true
+	}
+	for _, suf := range adBlockSuffixes {
+		if strings.HasSuffix(h, suf) {
+			return true
+		}
+	}
+	return false
+}
 var userTracker sync.Map // map[string]time.Time (IP -> last seen)
 
 // Host traffic stats (host -> last seen + counters)
@@ -1184,6 +1220,14 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		setDomainRule(unwrappedHost, rule, isCisco)
 	}
 
+	// Ad-block: refuse explicit ad/tracking hosts on plain HTTP too
+	if isAdBlockedHost(unwrappedHost) {
+		atomic.AddInt64(&adBlocked, 1)
+		log.Printf("%s[AD-BLOCK]%s refused HTTP %s ← %s", colorRed, colorReset, unwrappedHost, clientIP)
+		http.Error(w, "Forbidden (Ad-Blocked by NetNinja)", http.StatusForbidden)
+		return
+	}
+
 	// Console Logging: Show only if Proxy/Cisco
 	if isCisco || previouslyCisco || isManualProxy(unwrappedHost) {
 		tag := "[PROXY]"
@@ -1304,6 +1348,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		hostname = unwrapped
 		// Initial rule set if Cisco detected
 		setDomainRule(hostname, "PROXY", true)
+	}
+
+	// Ad-block: refuse tunnels to ad/tracking networks before dialing
+	if isAdBlockedHost(hostname) {
+		atomic.AddInt64(&adBlocked, 1)
+		log.Printf("%s[AD-BLOCK]%s refused CONNECT %s ← %s", colorRed, colorReset, hostname, clientIP)
+		http.Error(w, "Forbidden (Ad-Blocked by NetNinja)", http.StatusForbidden)
+		return
 	}
 
 	// Resolution logic with SQLite Cache
