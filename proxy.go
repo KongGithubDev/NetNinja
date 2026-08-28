@@ -395,6 +395,7 @@ func trackUserDevice(user, clientIP, ua string) {
 
 // Per-user, per-host traffic summary (persisted to SQLite, reloaded on boot)
 type userHostStat struct {
+	mu        sync.Mutex
 	bytesUp   int64
 	bytesDown int64
 	conns     int64
@@ -402,6 +403,52 @@ type userHostStat struct {
 	lastSeen  time.Time
 }
 var userHosts sync.Map // map[string]*userHostStat  (key = username + "\x00" + host)
+
+// Per-user account settings (persisted in user_settings table)
+type userSetting struct {
+	quotaBytes int64 // 0 = unlimited
+	suspended  bool
+	updatedAt  time.Time
+}
+var userSettings sync.Map // map[string]*userSetting (key = username)
+
+// Live bytes used per user, seeded from persisted user_hosts and incremented as
+// traffic flows. Used for quota enforcement BEFORE the SQLite flush catches up.
+var userQuotaUsed sync.Map // map[string]*int64
+
+func quotaUsedOf(user string) int64 {
+	if v, ok := userQuotaUsed.Load(user); ok {
+		return *v.(*int64)
+	}
+	return 0
+}
+
+func addQuotaUsed(user string, n int64) {
+	if n <= 0 {
+		return
+	}
+	v, _ := userQuotaUsed.LoadOrStore(user, new(int64))
+	p := v.(*int64)
+	atomic.AddInt64(p, n)
+}
+
+// Enforced at CONNECT/HTTP: suspended account or quota exceeded?
+// Returns false when the user may keep connecting.
+func checkUserBlocked(user string) (blocked bool, reason string) {
+	if user == "" {
+		return false, ""
+	}
+	if v, ok := userSettings.Load(user); ok {
+		st := v.(*userSetting)
+		if st.suspended {
+			return true, "suspended"
+		}
+		if st.quotaBytes > 0 && quotaUsedOf(user) > st.quotaBytes {
+			return true, "quota"
+		}
+	}
+	return false, ""
+}
 
 func touchUserHost(user, host string, up, down int64, conns int64) {
 	if user == "" || host == "" {
@@ -411,6 +458,7 @@ func touchUserHost(user, host string, up, down int64, conns int64) {
 	v, _ := userHosts.LoadOrStore(key, &userHostStat{})
 	st := v.(*userHostStat)
 	now := time.Now()
+	st.mu.Lock()
 	if st.firstSeen.IsZero() {
 		st.firstSeen = now
 	}
@@ -418,6 +466,8 @@ func touchUserHost(user, host string, up, down int64, conns int64) {
 	st.bytesDown += down
 	st.conns += conns
 	st.lastSeen = now
+	st.mu.Unlock()
+	addQuotaUsed(user, down)
 }
 
 // Connection audit log — batched writes via a background goroutine.
@@ -492,6 +542,51 @@ func pushConnLog(e connLogEntry) {
 	default:
 		atomic.AddInt64(&errCount, 1) // table full → count as dropped
 	}
+}
+
+// Persist the in-memory userHosts totals back to SQLite every 5s so per-user,
+// per-host usage (and thus quota accounting) survives restarts.
+func startUserHostsFlusher() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		stmts := make([]string, 0, 32)
+		args := make([]interface{}, 0, 128)
+		for range ticker.C {
+			stmts = stmts[:0]
+			args = args[:0]
+			userHosts.Range(func(k, v interface{}) bool {
+				parts := strings.SplitN(k.(string), "\x00", 2)
+				if len(parts) != 2 {
+					return true
+				}
+				st := v.(*userHostStat)
+				st.mu.Lock()
+				up, down, conns := st.bytesUp, st.bytesDown, st.conns
+				f, l := st.firstSeen, st.lastSeen
+				st.mu.Unlock()
+				fstr, lstr := "", ""
+				if !f.IsZero() {
+					fstr = f.Format("2006-01-02 15:04:05")
+				}
+				if !l.IsZero() {
+					lstr = l.Format("2006-01-02 15:04:05")
+				}
+				stmts = append(stmts, "(?, ?, ?, ?, ?, ?, ?)")
+				args = append(args, parts[0], parts[1], up, down, conns, fstr, lstr)
+				return true
+			})
+			if len(stmts) == 0 {
+				continue
+			}
+			query := "INSERT INTO user_hosts (username, host, bytes_up, bytes_down, conns, first_seen, last_seen) VALUES " +
+				strings.Join(stmts, ", ") +
+				" ON CONFLICT(username, host) DO UPDATE SET bytes_up=excluded.bytes_up, bytes_down=excluded.bytes_down, conns=excluded.conns, first_seen=excluded.first_seen, last_seen=excluded.last_seen"
+			if _, err := db.Exec(query, args...); err != nil {
+				log.Printf("%s[HOSTS]%s failed to flush user_hosts: %v", colorRed, colorReset, err)
+			}
+		}
+	}()
 }
 
 // Periodic retention pruning for conn_logs and admin_logs
@@ -694,6 +789,28 @@ func initDB() {
 	}
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_admin_logs_ts ON admin_logs(ts)")
 
+	// Per-user account settings (quota + suspension); applies to env and DB users alike
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS user_settings (
+		username TEXT PRIMARY KEY,
+		quota_bytes INTEGER DEFAULT 0,
+		suspended INTEGER DEFAULT 0,
+		updated_at TIMESTAMP
+	)`)
+	if err != nil {
+		log.Fatal("Failed to create user_settings table:", err)
+	}
+	rowsS, err := db.Query("SELECT username, quota_bytes, suspended FROM user_settings")
+	if err == nil {
+		for rowsS.Next() {
+			var u string
+			var qb, sus int64
+			if rowsS.Scan(&u, &qb, &sus) == nil && u != "" {
+				userSettings.Store(u, &userSetting{quotaBytes: qb, suspended: sus == 1})
+			}
+		}
+		rowsS.Close()
+	}
+
 	// Load persisted users into memory (env PROXY_USERS takes precedence overrides handled in main)
 	rowsU, err := db.Query("SELECT username, password FROM proxy_users")
 	if err == nil {
@@ -724,6 +841,7 @@ func initDB() {
 					st.lastSeen = t
 				}
 				userHosts.Store(u+"\x00"+h, st)
+				addQuotaUsed(u, dn)
 			}
 		}
 		rowsH.Close()
@@ -841,7 +959,8 @@ func main() {
 	defer db.Close()
 	loadAdminCreds()
 	startConnLogWriter()
-	startRetentionPruner()
+startRetentionPruner()
+	startUserHostsFlusher()
 
 	// Extreme Performance: Cache local IPs and preload rules
 	updateLocalIPs()
@@ -955,6 +1074,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if u := authedUser(r); u != "" {
+			if blocked, reason := checkUserBlocked(u); blocked {
+				log.Printf("%s[BLOCKED]%s %s (ip=%s) denied: %s", colorYellow, colorReset, u, clientIP, reason)
+				pushConnLog(connLogEntry{username: u, clientIP: clientIP, host: r.URL.Hostname(), status: reason, durMs: 0})
+				w.Header().Set("Content-Length", "0")
+				w.WriteHeader(403)
+				return
+			}
 			trackUserDevice(u, clientIP, r.Header.Get("User-Agent"))
 		}
 		handleConnect(w, r)
@@ -994,6 +1120,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if path == "/admin/audit" {
 			serveAdminAudit(w, r)
+			return
+		} else if path == "/admin/quota" {
+			handleAdminQuota(w, r)
+			return
+		} else if path == "/admin/suspend" {
+			handleAdminSuspend(w, r)
 			return
 		} else if path == "/welcome" {
 			clientIP := getClientIP(r)
@@ -1569,6 +1701,16 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Account policy: suspended/quota-exceeded users are refused on plain HTTP too
+	if u := authedUser(r); u != "" {
+		if blocked, reason := checkUserBlocked(u); blocked {
+			log.Printf("%s[BLOCKED]%s %s (ip=%s) denied on HTTP: %s", colorYellow, colorReset, u, clientIP, reason)
+			pushConnLog(connLogEntry{username: u, clientIP: clientIP, host: unwrappedHost, status: reason, durMs: 0})
+			http.Error(w, "Forbidden ("+reason+" by NetNinja)", http.StatusForbidden)
+			return
+		}
+	}
+
 	// Console Logging: Show only if Proxy/Cisco
 	if isCisco || previouslyCisco || isManualProxy(unwrappedHost) {
 		tag := "[PROXY]"
@@ -1736,7 +1878,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	destConn, err := customDialer.DialContext(r.Context(), "tcp", net.JoinHostPort(ip, port))
 	if err != nil {
-		atomic.AddInt64(&activeConns, -1)
 		atomic.AddInt64(&errCount, 1)
 		log.Printf("%s[ERR]%s CONNECT %s failed: %s", colorRed, colorReset, host, err)
 		pushConnLog(connLogEntry{username: tunnelUser, clientIP: clientIP, host: hostname, status: "dial_fail", durMs: time.Since(tunnelStart).Milliseconds()})
@@ -1746,7 +1887,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		atomic.AddInt64(&activeConns, -1)
 		destConn.Close()
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
@@ -1754,7 +1894,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		atomic.AddInt64(&activeConns, -1)
 		atomic.AddInt64(&errCount, 1)
 		destConn.Close()
 		http.Error(w, "Hijack failed", http.StatusServiceUnavailable)
@@ -2206,6 +2345,9 @@ type userSnap struct {
 	lastSeen    time.Time
 	deviceCount int
 	devices     []string
+	suspended   bool
+	quotaBytes  int64
+	quotaUsed   int64
 }
 
 // snapshotUsers aggregates persisted per-host totals WITH live device info.
@@ -2223,19 +2365,23 @@ func snapshotUsers() []userSnap {
 		if st == nil {
 			return true
 		}
+		st.mu.Lock()
+		up, down, conns := st.bytesUp, st.bytesDown, st.conns
+		firstSeen, lastSeen := st.firstSeen, st.lastSeen
+		st.mu.Unlock()
 		s, ok := agg[u]
 		if !ok {
 			s = &userSnap{name: u}
 			agg[u] = s
 		}
-		s.bytesUp += st.bytesUp
-		s.bytesDown += st.bytesDown
-		s.conns += st.conns
-		if !st.firstSeen.IsZero() && (s.firstSeen.IsZero() || st.firstSeen.Before(s.firstSeen)) {
-			s.firstSeen = st.firstSeen
+		s.bytesUp += up
+		s.bytesDown += down
+		s.conns += conns
+		if !firstSeen.IsZero() && (s.firstSeen.IsZero() || firstSeen.Before(s.firstSeen)) {
+			s.firstSeen = firstSeen
 		}
-		if st.lastSeen.After(s.lastSeen) {
-			s.lastSeen = st.lastSeen
+		if lastSeen.After(s.lastSeen) {
+			s.lastSeen = lastSeen
 		}
 		return true
 	})
@@ -2265,6 +2411,12 @@ func snapshotUsers() []userSnap {
 
 	var out []userSnap
 	for _, s := range agg {
+		if v, ok := userSettings.Load(s.name); ok {
+			st := v.(*userSetting)
+			s.suspended = st.suspended
+			s.quotaBytes = st.quotaBytes
+		}
+		s.quotaUsed = quotaUsedOf(s.name)
 		out = append(out, *s)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -2309,6 +2461,10 @@ a.u:hover{color:#fff;text-decoration:underline}
 .dev.dim{color:#555}
 .btn-del{background:#3a0f0f;color:#f77;border:1px solid #722;border-radius:3px;padding:3px 10px;font:inherit;cursor:pointer}
 .btn-del:hover{background:#5a1515}
+.btn-sus{background:#3a2a00;color:#ffc966;border:1px solid #6a4a00;border-radius:3px;padding:3px 10px;font:inherit;cursor:pointer;margin-right:4px}
+.btn-sus:hover{background:#5a3f00}
+.btn-ok{background:#0f2f0f;color:#8f8;border:1px solid #274;border-radius:3px;padding:3px 10px;font:inherit;cursor:pointer;margin-right:4px}
+.btn-ok:hover{background:#174017}
 .add-card{background:#111;border:1px solid #222;border-radius:6px;padding:16px;margin-top:10px}
 .add-card label{color:#666;font-size:10px;text-transform:uppercase;letter-spacing:1px;display:block;margin:8px 0 4px}
 .add-card input,.add-card select{background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:8px 10px;border-radius:3px;font:inherit;width:100%%;box-sizing:border-box}
@@ -2369,6 +2525,19 @@ func fmtMB(b int64) string {
 	return fmt.Sprintf("%.2f MB", float64(b)/1048576)
 }
 
+func fmtSize(b int64) string {
+	if b >= 1073741824 {
+		return fmt.Sprintf("%.2f GB", float64(b)/1073741824)
+	}
+	if b >= 1048576 {
+		return fmt.Sprintf("%.1f MB", float64(b)/1048576)
+	}
+	if b >= 1024 {
+		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	}
+	return fmt.Sprintf("%d B", b)
+}
+
 func fmtDur(ms int64) string {
 	if ms < 1000 {
 		return fmt.Sprintf("%dms", ms)
@@ -2390,7 +2559,14 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 	// Add auth users that exist but never connected
 	for name := range proxyUsers {
 		if !known[name] {
-			snaps = append(snaps, userSnap{name: name})
+			s := userSnap{name: name}
+			if v, ok := userSettings.Load(name); ok {
+				st := v.(*userSetting)
+				s.suspended = st.suspended
+				s.quotaBytes = st.quotaBytes
+				s.quotaUsed = quotaUsedOf(name)
+			}
+			snaps = append(snaps, s)
 		}
 	}
 	sort.Slice(snaps, func(i, j int) bool {
@@ -2432,10 +2608,40 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 			ac = "yes"
 			acCls = "ok"
 		}
+		if s.suspended {
+			ac = "suspended"
+			acCls = "err"
+		}
 		activeNow := ""
 		if time.Since(s.lastSeen) < 90*time.Second {
 			activeNow = `&nbsp;<span class="dev" style="color:#0f0;border-color:#040">● live</span>`
 		}
+		// Quota cell: usage bar + data column
+		quotaCell := `<td class="dim">∞</td>`
+		if s.quotaBytes > 0 {
+			used := s.quotaUsed
+			if used > s.quotaBytes {
+				used = s.quotaBytes
+			}
+			pct := int(used * 100 / s.quotaBytes)
+			color := "#0f0"
+			if pct >= 90 {
+				color = "#f77"
+			} else if pct >= 60 {
+				color = "#ffa500"
+			}
+			quotaCell = fmt.Sprintf(`<td class="num">%s / %s&nbsp;(%d%%)<div style="background:#151515;border:1px solid #222;border-radius:3px;height:6px;margin-top:4px;width:110px"><div style="background:%s;width:%d%%;height:6px;border-radius:3px"></div></div></td>`,
+				fmtSize(used), fmtSize(s.quotaBytes), pct, color, pct)
+		}
+		suspendBtn := ""
+		if s.name != adminUser {
+			if s.suspended {
+				suspendBtn = fmt.Sprintf(`<form method="post" action="/admin/suspend" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="action" value="unsuspend"><button type="submit" class="btn-ok">ปลดระงับ</button></form>`, html.EscapeString(s.name))
+			} else {
+				suspendBtn = fmt.Sprintf(`<form method="post" action="/admin/suspend" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="action" value="suspend"><button type="submit" class="btn-sus" onclick="return confirm('ระงับบัญชี &#39;%s&#39;?')">ระงับ</button></form>`, html.EscapeString(s.name), html.EscapeString(s.name))
+			}
+		}
+		quotaForm := fmt.Sprintf(`<form method="post" action="/admin/quota" style="display:inline"><input type="hidden" name="user" value="%s"><input type="number" step="0.001" min="0" name="gbytes" value="%s" style="width:70px;background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:4px;border-radius:3px;font:inherit"><button type="submit" class="btn">set (GB)</button></form>`, html.EscapeString(s.name), strconv.FormatFloat(float64(s.quotaBytes)/1073741824, 'f', 3, 64))
 		userRows += fmt.Sprintf(`<tr>
 			<td><a class="u" href="/admin/user?name=%s">%s</a>%s</td>
 			<td class="%s">%s</td>
@@ -2445,13 +2651,18 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 			<td class="dim">%s</td>
 			<td class="dim">%s</td>
 			<td><span class="devc">%d</span><div class="devlist">%s</div></td>
-			<td><form method="post" action="/admin/delete" onsubmit="return confirm('ลบ user &#39;%s&#39;?' )"><input type="hidden" name="user" value="%s"><button type="submit" class="btn-del">ลบ</button></form></td>
+			%s
+			<td>%s %s
+				<form method="post" action="/admin/delete" style="display:inline" onsubmit="return confirm('ลบ user &#39;%s&#39;?' )"><input type="hidden" name="user" value="%s"><button type="submit" class="btn-del">ลบ</button></form>
+			</td>
 		</tr>`,
 			url.QueryEscape(s.name), html.EscapeString(s.name), activeNow,
 			acCls, ac,
 			fmtMB(s.bytesUp), fmtMB(s.bytesDown), s.conns,
 			first, last,
 			s.deviceCount, devList,
+			quotaCell,
+			suspendBtn, quotaForm,
 			html.EscapeString(s.name), html.EscapeString(s.name))
 	}
 
@@ -2475,7 +2686,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 	%s
 
 	<table>
-	<tr><th>user</th><th>active</th><th>bytes_up</th><th>bytes_down</th><th>conns</th><th>first_seen</th><th>last_seen</th><th>devices</th><th></th></tr>
+	<tr><th>user</th><th>active</th><th>bytes_up</th><th>bytes_down</th><th>conns</th><th>first_seen</th><th>last_seen</th><th>devices</th><th>quota</th><th></th></tr>
 	%s
 	</table>
 
@@ -2486,6 +2697,8 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 			<input type="text" name="user" required autocomplete="off" placeholder="เช่น mama">
 			<label>password</label>
 			<input type="text" name="pass" required autocomplete="off" placeholder="รหัสผ่าน">
+			<label>quota (GB — 0 = ไม่จำกัด)</label>
+			<input type="number" step="0.001" min="0" name="gbytes" placeholder="เช่น 2 = 2GB">
 			<button type="submit" class="btn-add">เพิ่มผู้ใช้</button>
 		</form>
 	</div>
@@ -2520,6 +2733,7 @@ func serveAdminUser(w http.ResponseWriter, r *http.Request) {
 		if st == nil {
 			return true
 		}
+		st.mu.Lock()
 		f, l := "--", "--"
 		if !st.firstSeen.IsZero() {
 			f = st.firstSeen.Format("2006-01-02 15:04")
@@ -2527,7 +2741,9 @@ func serveAdminUser(w http.ResponseWriter, r *http.Request) {
 		if !st.lastSeen.IsZero() {
 			l = st.lastSeen.Format("2006-01-02 15:04")
 		}
-		hosts = append(hosts, hostRow{parts[1], st.bytesUp, st.bytesDown, st.conns, f, l})
+		up, down, conns := st.bytesUp, st.bytesDown, st.conns
+		st.mu.Unlock()
+		hosts = append(hosts, hostRow{parts[1], up, down, conns, f, l})
 		return true
 	})
 	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Down > hosts[j].Down })
@@ -2768,7 +2984,7 @@ func pgLink(show bool, href, label string) string {
 
 func statusOpts(cur string) string {
 	opts := ""
-	for _, s := range []string{"ok", "http", "dial_fail", "ad_block"} {
+	for _, s := range []string{"ok", "http", "dial_fail", "ad_block", "suspended", "quota"} {
 		sel := ""
 		if s == cur {
 			sel = "selected"
@@ -2813,8 +3029,11 @@ func serveAdminAudit(w http.ResponseWriter, r *http.Request) {
 	bodyRows := ""
 	for _, it := range list {
 		acCls := "ok"
-		if it.Action == "delete" {
+		switch it.Action {
+		case "delete", "suspend", "quota":
 			acCls = "err"
+		case "unsuspend":
+			acCls = "warn"
 		}
 		bodyRows += fmt.Sprintf(`<tr><td class="dim">%s</td><td class="num">%s</td><td class="%s">%s</td><td><b>%s</b></td><td class="dim">%s</td></tr>`,
 			html.EscapeString(it.Ts), html.EscapeString(it.Admin), acCls, html.EscapeString(it.Action),
@@ -2847,9 +3066,13 @@ func handleAdminAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	user := strings.TrimSpace(r.FormValue("user"))
 	pass := strings.TrimSpace(r.FormValue("pass"))
+	quotaGB, _ := strconv.ParseFloat(strings.TrimSpace(r.FormValue("gbytes")), 64)
 	msg := "กรอกข้อมูลไม่ครบ"
 	if user != "" && pass != "" && !strings.Contains(user, ":") && !strings.Contains(user, ",") && !strings.Contains(pass, ":") && !strings.Contains(pass, ",") {
 		proxyUsers[user] = pass
+		if quotaGB > 0 {
+			setUserQuota(user, int64(quotaGB*1073741824))
+		}
 		go func() {
 			_, err := db.Exec("INSERT OR REPLACE INTO proxy_users (username, password, created_at) VALUES (?, ?, DATETIME('now'))", user, pass)
 			if err != nil {
@@ -2882,10 +3105,100 @@ func handleAdminDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(proxyUsers, user)
 	userStats.Delete(user)
+	userSettings.Delete(user)
+	userQuotaUsed.Delete(user)
+	userHosts.Range(func(k, v interface{}) bool {
+		if parts := strings.SplitN(k.(string), "\x00", 2); len(parts) == 2 && parts[0] == user {
+			userHosts.Delete(k)
+		}
+		return true
+	})
 	go func() {
 		_, _ = db.Exec("DELETE FROM proxy_users WHERE username = ?", user)
+		_, _ = db.Exec("DELETE FROM user_settings WHERE username = ?", user)
+		_, _ = db.Exec("DELETE FROM user_hosts WHERE username = ?", user) // conn_logs kept for audit trail
 	}()
 	recordAdminLog(adminUser, "delete", user, "removed user account")
 	log.Printf("%s[ADMIN]%s deleted user %q", colorYellow, colorReset, user)
 	http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ลบ user '"+user+"' แล้ว"), http.StatusFound)
+}
+
+// setUserQuota updates the in-memory setting and persists to SQLite
+func setUserQuota(user string, qb int64) {
+	old := userSetting{}
+	if v, ok := userSettings.Load(user); ok {
+		old = *v.(*userSetting)
+	}
+	userSettings.Store(user, &userSetting{quotaBytes: qb, suspended: old.suspended, updatedAt: time.Now()})
+	_, _ = db.Exec("INSERT INTO user_settings (username, quota_bytes, suspended, updated_at) VALUES (?, ?, 0, DATETIME('now')) ON CONFLICT(username) DO UPDATE SET quota_bytes=excluded.quota_bytes, updated_at=excluded.updated_at", user, qb)
+}
+
+func handleAdminQuota(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	user := strings.TrimSpace(r.FormValue("user"))
+	gb, err := strconv.ParseFloat(strings.TrimSpace(r.FormValue("gbytes")), 64)
+	if user == "" || err != nil || gb < 0 {
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ค่า quota ไม่ถูกต้อง"), http.StatusFound)
+		return
+	}
+	if gb > 0 {
+		setUserQuota(user, int64(gb*1073741824))
+		// Lift any quota-induced block automatically once the quota changes
+		if v, ok := userSettings.Load(user); ok {
+			st := v.(*userSetting)
+			if !st.suspended && st.quotaBytes > 0 && quotaUsedOf(user) > st.quotaBytes {
+				recordAdminLog(adminUser, "quota", user, "set quota to "+fmtSize(st.quotaBytes)+" (unblocked by quota reset)")
+			}
+		}
+		recordAdminLog(adminUser, "quota", user, "set quota to "+fmtSize(int64(gb*1073741824)))
+		log.Printf("%s[ADMIN]%s quota for %q → %s", colorGreen, colorReset, user, fmtSize(int64(gb*1073741824)))
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ตั้ง quota ของ '"+user+"' เรียบร้อย ("+fmtSize(int64(gb*1073741824))+")"), http.StatusFound)
+	} else {
+		setUserQuota(user, 0)
+		recordAdminLog(adminUser, "quota", user, "cleared quota (unlimited)")
+		log.Printf("%s[ADMIN]%s cleared quota for %q", colorYellow, colorReset, user)
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ล้าง quota ของ '"+user+"' แล้ว (ไม่จำกัด)"), http.StatusFound)
+	}
+}
+
+func handleAdminSuspend(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	user := strings.TrimSpace(r.FormValue("user"))
+	if user == adminUser {
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ระงับ admin เองไม่ได้"), http.StatusFound)
+		return
+	}
+	action := r.FormValue("action")
+	suspend := action == "suspend"
+	old := userSetting{}
+	if v, ok := userSettings.Load(user); ok {
+		old = *v.(*userSetting)
+	}
+	userSettings.Store(user, &userSetting{quotaBytes: old.quotaBytes, suspended: suspend, updatedAt: time.Now()})
+	sus := 0
+	if suspend {
+		sus = 1
+	}
+	_, _ = db.Exec("INSERT INTO user_settings (username, quota_bytes, suspended, updated_at) VALUES (?, ?, ?, DATETIME('now')) ON CONFLICT(username) DO UPDATE SET suspended=excluded.suspended, updated_at=excluded.updated_at", user, old.quotaBytes, sus)
+	if suspend {
+		recordAdminLog(adminUser, "suspend", user, "account suspended")
+		log.Printf("%s[ADMIN]%s suspended user %q", colorYellow, colorReset, user)
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ระงับบัญชี '"+user+"' แล้ว"), http.StatusFound)
+	} else {
+		recordAdminLog(adminUser, "unsuspend", user, "account re-enabled")
+		log.Printf("%s[ADMIN]%s unsuspended user %q", colorGreen, colorReset, user)
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ปลดระงับ '"+user+"' แล้ว"), http.StatusFound)
+	}
 }
