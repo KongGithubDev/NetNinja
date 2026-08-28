@@ -29,11 +29,14 @@ A VLESS server with built-in SNI multiplexer that listens on a single TCP/UDP po
 A forward proxy that bypasses Cisco Umbrella content filters (DNS-level blocking). It resolves DNS and originates connections from the proxy's own IP, which sits outside the filtering policy. Includes an HTTP(S) CONNECT tunnel, a PAC auto-config server, and a block-check endpoint.
 
 **Features:**
-- HTTP Basic Auth via `PROXY_USERS="user:pass,user2:pass2"` (default `Kong:KongPassword`)
+- HTTP Basic Auth via `PROXY_USERS="user:pass,user2:pass2"` (default `Kong:KongPassword`); additional users managed live via the admin console
 - CONNECT tunneling over Go's high-performance goroutine engine
 - Dual DNS resolution (standard + DoH) for bypassing filtered resolvers
-- SQLite-backed persistent DNS cache and domain rule store
-- Real-time dashboard with active user tracking and connection metrics
+- SQLite-backed persistent DNS cache and domain rule store (WAL mode, busy-timeout hardened)
+- Per-user **bandwidth quota** (bytes-down) and **account suspension** — enforced at CONNECT/HTTP with a 403 and logged to the audit trail
+- **Ad-blocking**: CONNECT/HTTP tunnels to known ad/tracking networks are refused with 403 (suffix + exact host lists, block counter on the dashboard)
+- Real-time dashboard with active users, live traffic, bytes up/down, DNS hits, top hosts, and a bandwidth sparkline
+- **Admin console** at `/admin` (BASIC auth, separate credentials): user management, per-user usage drill-down, full connection audit trail, and admin action log
 - PAC auto-config file served at `/proxy.pac`
 - `/block-check?url=<url>` endpoint: fetches a target through the proxy and reports whether it is reachable from outside the filter (NOT BLOCKED / TIMEOUT)
 
@@ -41,6 +44,25 @@ A forward proxy that bypasses Cisco Umbrella content filters (DNS-level blocking
 - Default: `PROXY <PROXY_ADDR>; DIRECT` — all traffic tries the proxy first (Cisco block pages return HTTP 200, so the DIRECT fallback never triggers on filtered sites)
 - Direct exceptions (bypass proxy to keep video/QUIC and Apple services fast): `googlevideo.com` (YouTube video), `apple.com`, `icloud.com`, `apple-cloudkit.com`, `mzstatic.com`, `itunes.com`, plus LAN/loopback addresses
 - YouTube UI/API/comment hosts (`youtube.com`, `ytimg.com`, `yt3.ggpht.com`, `googleapis.com`, `google.com`, `gstatic.com`, `ggpht.com`, `googleusercontent.com`) route through the proxy so their DNS resolves at the proxy IP — this restores YouTube Restricted-Mode-gated content (e.g. hidden comments) that the on-device Umbrella profile forces via DNS
+
+**Admin console (`/admin` with `ADMIN_USER` / `ADMIN_PASS`):**
+- `/admin` — all users: bytes up/down, connection count, first/last seen, live indicator, devices (client IP + UA), plus add/delete user, set quota (GB), suspend/unsuspend
+- `/admin/user?name=<user>` — drill-down: per-host traffic summary and the last 100 activities
+- `/admin/logs` — full connection audit trail (status flows: `ok`, `http`, `dial_fail`, `ad_block`, `suspended`, `quota`) with user/host/status filters and pagination
+- `/admin/audit` — every admin action (add/delete/quota/suspend) with timestamps
+
+**Proxy environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| PROXY_USERS | Kong:KongPassword | Comma-separated `user:pass` auth pairs |
+| ADMIN_USER | admin | Admin console BASIC-auth user |
+| ADMIN_PASS | (required) | Admin console password |
+| PORT | 8080 | Listen port |
+| PROXY_ADDR | request Host | Proxy address embedded in the PAC / welcome flows |
+| LOG_RETENTION_DAYS | 30 | How long `conn_logs` rows are kept (admin_logs kept 90 days, per-user totals forever) |
+
+**SQLite stores** (`proxy_cache.db`, WAL mode): `proxy_users`, `user_settings` (quota + suspension), `user_hosts` (per-user per-host totals, flushed every 5s and reloaded on boot), `conn_logs` (append-only audit), `admin_logs`, `domain_rules`, `dns_records`.
 
 ---
 
@@ -94,7 +116,7 @@ go build -pgo=default.pgo -o net_server.exe net_server.go
 
 # Or build individually
 go build -pgo=default.pgo -o net_server.exe net_server.go
-go build -o proxy.exe proxy.go
+go build -o proxy.exe ansi_other.go proxy.go
 go build -o load-tester.exe load-tester.go
 ```
 
@@ -169,10 +191,14 @@ set PORT=5988 && proxy.exe
 
 # Proxy address used in the PAC file (defaults to request Host)
 set PROXY_ADDR=proxy.example.com:443
+
+# Admin console credentials
+set ADMIN_USER=admin && set ADMIN_PASS=changeme
 ```
 
 Dashboard at `http://127.0.0.1:[PORT]/`. PAC file at `/proxy.pac`.
 Block check: `http://127.0.0.1:[PORT]/block-check?url=https://example.com/`.
+Admin console: `http://127.0.0.1:[PORT]/admin` (use `ADMIN_USER`/`ADMIN_PASS`).
 
 ---
 
@@ -218,7 +244,8 @@ Benchmarks measure: HTTP proxy throughput (1/10/50 concurrency), CONNECT tunnels
 ```
 NetNinja/
 ├── net_server.go          # VLESS VPN + SNI Multiplexer (main component)
-├── proxy.go               # HTTP/HTTPS Forward Proxy
+├── proxy.go               # HTTP/HTTPS Forward Proxy (+ admin console, quotas, ad-block)
+├── ansi_other.go          # Proxy color helpers / supporting code
 ├── build.ps1              # Build script with PGO support
 ├── deploy.ps1             # One-command deployment orchestrator
 ├── install-service.ps1    # Windows service installer (NSSM)
