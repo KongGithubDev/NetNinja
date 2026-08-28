@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -318,6 +319,223 @@ func isAdBlockedHost(hostname string) bool {
 }
 var userTracker sync.Map // map[string]time.Time (IP -> last seen)
 
+// Per-user usage stats (keyed by proxy auth username)
+type userStat struct {
+	mu         sync.Mutex
+	bytesUp    int64
+	bytesDown  int64
+	conns      int64
+	lastSeen   time.Time
+	firstSeen  time.Time
+	devices    map[string]bool // distinct device keys (clientIP + UA)
+	lastDevice string
+}
+var userStats sync.Map // map[string]*userStat
+
+func authedUser(r *http.Request) string {
+	auth := r.Header.Get("Proxy-Authorization")
+	if !strings.HasPrefix(auth, "Basic ") {
+		return ""
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
+	if err != nil {
+		return ""
+	}
+	parts := strings.SplitN(string(raw), ":", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return parts[0]
+}
+
+func trackUserBytes(user string, up, down int64) {
+	if user == "" {
+		return
+	}
+	v, _ := userStats.LoadOrStore(user, &userStat{devices: map[string]bool{}})
+	st := v.(*userStat)
+	st.mu.Lock()
+	st.bytesUp += up
+	st.bytesDown += down
+	now := time.Now()
+	st.lastSeen = now
+	if st.firstSeen.IsZero() {
+		st.firstSeen = now
+	}
+	st.mu.Unlock()
+}
+
+func trackUserConn(user string) {
+	if user == "" {
+		return
+	}
+	v, _ := userStats.LoadOrStore(user, &userStat{devices: map[string]bool{}})
+	st := v.(*userStat)
+	st.mu.Lock()
+	st.conns++
+	st.mu.Unlock()
+}
+
+func trackUserDevice(user, clientIP, ua string) {
+	if user == "" {
+		return
+	}
+	v, _ := userStats.LoadOrStore(user, &userStat{devices: map[string]bool{}})
+	st := v.(*userStat)
+	key := clientIP
+	if ua != "" {
+		key = clientIP + " | " + ua
+	}
+	st.mu.Lock()
+	st.devices[key] = true
+	st.lastDevice = key
+	st.lastSeen = time.Now()
+	st.mu.Unlock()
+}
+
+// Per-user, per-host traffic summary (persisted to SQLite, reloaded on boot)
+type userHostStat struct {
+	bytesUp   int64
+	bytesDown int64
+	conns     int64
+	firstSeen time.Time
+	lastSeen  time.Time
+}
+var userHosts sync.Map // map[string]*userHostStat  (key = username + "\x00" + host)
+
+func touchUserHost(user, host string, up, down int64, conns int64) {
+	if user == "" || host == "" {
+		return
+	}
+	key := user + "\x00" + strings.ToLower(host)
+	v, _ := userHosts.LoadOrStore(key, &userHostStat{})
+	st := v.(*userHostStat)
+	now := time.Now()
+	if st.firstSeen.IsZero() {
+		st.firstSeen = now
+	}
+	st.bytesUp += up
+	st.bytesDown += down
+	st.conns += conns
+	st.lastSeen = now
+}
+
+// Connection audit log — batched writes via a background goroutine.
+// Entries: (username, client_ip, host, status, bytes_up, bytes_down, duration_ms)
+type connLogEntry struct {
+	username string
+	clientIP string
+	host     string
+	status   string
+	bytesUp  int64
+	bytesDown int64
+	durMs    int64
+}
+var connLogCh = make(chan connLogEntry, 4096)
+var connLogWriterStarted bool
+
+func startConnLogWriter() {
+	if connLogWriterStarted {
+		return
+	}
+	connLogWriterStarted = true
+	go func() {
+		buf := make([]connLogEntry, 0, 256)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case e, ok := <-connLogCh:
+				if !ok {
+					flushConnLogs(buf)
+					return
+				}
+				buf = append(buf, e)
+				if len(buf) >= 256 {
+					flushConnLogs(buf)
+					buf = buf[:0]
+				}
+			case <-ticker.C:
+				if len(buf) > 0 {
+					flushConnLogs(buf)
+					buf = buf[:0]
+				}
+			}
+		}
+	}()
+}
+
+func flushConnLogs(entries []connLogEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return
+	}
+	stmt, err := tx.Prepare("INSERT INTO conn_logs (ts, username, client_ip, host, status, bytes_up, bytes_down, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
+		return
+	}
+	now := time.Now().Format("2006-01-02 15:04:05")
+	for _, e := range entries {
+		_, _ = stmt.Exec(now, e.username, e.clientIP, e.host, e.status, e.bytesUp, e.bytesDown, e.durMs)
+	}
+	stmt.Close()
+	_ = tx.Commit()
+}
+
+func pushConnLog(e connLogEntry) {
+	select {
+	case connLogCh <- e:
+	default:
+		atomic.AddInt64(&errCount, 1) // table full → count as dropped
+	}
+}
+
+// Periodic retention pruning for conn_logs and admin_logs
+func startRetentionPruner() {
+	go func() {
+		days := os.Getenv("LOG_RETENTION_DAYS")
+		if days == "" {
+			days = "30"
+		}
+		if _, err := strconv.Atoi(days); err != nil || days == "0" {
+			days = "30"
+		}
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			var pruned int64
+			res, err := db.Exec("DELETE FROM conn_logs WHERE ts < datetime('now', ?)", "-"+days+" days")
+			if err == nil {
+				if n, er := res.RowsAffected(); er == nil {
+					pruned += n
+				}
+			}
+			// Keep admin_logs for 90 days; user_hosts kept forever (rolled into totals)
+			res, err = db.Exec("DELETE FROM admin_logs WHERE ts < datetime('now', '-90 days')")
+			if err == nil {
+				if n, er := res.RowsAffected(); er == nil {
+					pruned += n
+				}
+			}
+			if pruned > 0 {
+				log.Printf("%s[RETENTION]%s pruned %d log row(s) older than %s days", colorGray, colorReset, pruned, days)
+			}
+		}
+	}()
+}
+
+// Record an admin action into admin_logs
+func recordAdminLog(adminUser, action, target, detail string) {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	if _, err := db.Exec("INSERT INTO admin_logs (ts, admin_user, action, target, detail) VALUES (?, ?, ?, ?, ?)", ts, adminUser, action, target, detail); err != nil {
+		log.Printf("%s[ADMIN]%s failed to record audit %s %s: %v", colorRed, colorReset, action, target, err)
+	}
+}
+
 // Host traffic stats (host -> last seen + counters)
 type hostStat struct {
 	mu    sync.Mutex
@@ -394,6 +612,11 @@ func initDB() {
 	if err != nil {
 		log.Fatal("Failed to open SQLite:", err)
 	}
+	// SQLite hardening for production: WAL mode allows concurrent readers while
+	// writers wait on busy_timeout instead of failing with "database is locked".
+	_, _ = db.Exec("PRAGMA journal_mode=WAL")
+	_, _ = db.Exec("PRAGMA busy_timeout=5000")
+	_, _ = db.Exec("PRAGMA synchronous=NORMAL")
 
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS domain_rules (
 		domain TEXT PRIMARY KEY,
@@ -412,6 +635,98 @@ func initDB() {
 	)`)
 	if err != nil {
 		log.Fatal("Failed to create dns_records table:", err)
+	}
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS proxy_users (
+		username TEXT PRIMARY KEY,
+		password TEXT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	)`)
+	if err != nil {
+		log.Fatal("Failed to create proxy_users table:", err)
+	}
+
+	// Connection audit log (append-only, pruned by LOG_RETENTION_DAYS)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS conn_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		username TEXT,
+		client_ip TEXT,
+		host TEXT,
+		status TEXT,
+		bytes_up INTEGER DEFAULT 0,
+		bytes_down INTEGER DEFAULT 0,
+		duration_ms INTEGER DEFAULT 0
+	)`)
+	if err != nil {
+		log.Fatal("Failed to create conn_logs table:", err)
+	}
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_conn_logs_ts ON conn_logs(ts)")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_conn_logs_user ON conn_logs(username, ts)")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_conn_logs_host ON conn_logs(host, ts)")
+
+	// Per-user, per-host traffic summary (persisted, reloaded on boot)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS user_hosts (
+		username TEXT NOT NULL,
+		host TEXT NOT NULL,
+		bytes_up INTEGER DEFAULT 0,
+		bytes_down INTEGER DEFAULT 0,
+		conns INTEGER DEFAULT 0,
+		first_seen TIMESTAMP,
+		last_seen TIMESTAMP,
+		PRIMARY KEY (username, host)
+	)`)
+	if err != nil {
+		log.Fatal("Failed to create user_hosts table:", err)
+	}
+
+	// Admin actions audit — who added/deleted which user, when
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS admin_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		admin_user TEXT,
+		action TEXT,
+		target TEXT,
+		detail TEXT
+	)`)
+	if err != nil {
+		log.Fatal("Failed to create admin_logs table:", err)
+	}
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_admin_logs_ts ON admin_logs(ts)")
+
+	// Load persisted users into memory (env PROXY_USERS takes precedence overrides handled in main)
+	rowsU, err := db.Query("SELECT username, password FROM proxy_users")
+	if err == nil {
+		for rowsU.Next() {
+			var u, p string
+			if rowsU.Scan(&u, &p) == nil && u != "" {
+				proxyUsers[u] = p
+			}
+		}
+		rowsU.Close()
+	}
+
+	// Reload persisted per-user-host totals into memory on boot
+	rowsH, err := db.Query("SELECT username, host, bytes_up, bytes_down, conns, first_seen, last_seen FROM user_hosts")
+	if err == nil {
+		for rowsH.Next() {
+			var u, h, f, l string
+			var up, dn, cn int64
+			if rowsH.Scan(&u, &h, &up, &dn, &cn, &f, &l) == nil {
+				st := &userHostStat{}
+				st.bytesUp = up
+				st.bytesDown = dn
+				st.conns = cn
+				if t, err := time.Parse("2006-01-02 15:04:05", f); err == nil {
+					st.firstSeen = t
+				}
+				if t, err := time.Parse("2006-01-02 15:04:05", l); err == nil {
+					st.lastSeen = t
+				}
+				userHosts.Store(u+"\x00"+h, st)
+			}
+		}
+		rowsH.Close()
 	}
 
 	// Clean up old entries
@@ -524,6 +839,9 @@ func main() {
 	enableWindowsANSI()
 	initDB()
 	defer db.Close()
+	loadAdminCreds()
+	startConnLogWriter()
+	startRetentionPruner()
 
 	// Extreme Performance: Cache local IPs and preload rules
 	updateLocalIPs()
@@ -636,6 +954,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		if !authRequired(w, r) {
 			return
 		}
+		if u := authedUser(r); u != "" {
+			trackUserDevice(u, clientIP, r.Header.Get("User-Agent"))
+		}
 		handleConnect(w, r)
 		return
 	}
@@ -655,6 +976,24 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if path == "/ws" {
 			serveWS(w, r)
+			return
+		} else if path == "/admin" || path == "/admin/" {
+			serveAdmin(w, r)
+			return
+		} else if path == "/admin/add" {
+			handleAdminAdd(w, r)
+			return
+		} else if path == "/admin/delete" {
+			handleAdminDelete(w, r)
+			return
+		} else if path == "/admin/user" {
+			serveAdminUser(w, r)
+			return
+		} else if path == "/admin/logs" {
+			serveAdminLogs(w, r)
+			return
+		} else if path == "/admin/audit" {
+			serveAdminAudit(w, r)
 			return
 		} else if path == "/welcome" {
 			clientIP := getClientIP(r)
@@ -797,6 +1136,8 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 	<div class="footer">
 		<a href="/logs">view_full_logs</a> &nbsp;•&nbsp; 
 		<a href="/block-check">block_check</a> &nbsp;•&nbsp;
+		<a href="/admin">admin</a> &nbsp;•&nbsp;
+		<a href="/welcome" id="welcome_link" style="display:none">welcome</a> &nbsp;•&nbsp;
 		<span id="ws_status" style="color:#444">connecting_ws...</span>
 		<div style="margin-top:15px;color:#222;font-size:10px;text-transform:uppercase;letter-spacing:1px">
 			developed_by // Watcharapong Namsaeng
@@ -1292,7 +1633,18 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	// Native Zero-Copy: Let Go optimize data transfer
-	io.Copy(w, resp.Body)
+	n, _ := io.Copy(w, resp.Body)
+
+	// Audit log for forwarded HTTP request
+	if h := unwrappedHost; h != "" {
+		hName := h
+		if idx := strings.LastIndex(hName, ":"); idx != -1 {
+			hName = hName[:idx]
+		}
+		u := authedUser(r)
+		pushConnLog(connLogEntry{username: u, clientIP: clientIP, host: hName, status: "http", bytesDown: n, durMs: time.Since(start).Milliseconds()})
+		touchUserHost(u, hName, 0, n, 1)
+	}
 
 	// Nitro: Background logging to avoid blocking the request cleanup
 	go func() {
@@ -1311,6 +1663,8 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !strings.Contains(host, ":") {
 		host += ":443"
 	}
+	tunnelStart := time.Now()
+	tunnelUser := authedUser(r)
 
 	log.Printf("%s[TLS]%s CONNECT %s ← %s",
 		colorCyan, colorReset,
@@ -1354,6 +1708,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if isAdBlockedHost(hostname) {
 		atomic.AddInt64(&adBlocked, 1)
 		log.Printf("%s[AD-BLOCK]%s refused CONNECT %s ← %s", colorRed, colorReset, hostname, clientIP)
+		pushConnLog(connLogEntry{username: tunnelUser, clientIP: clientIP, host: hostname, status: "ad_block", durMs: time.Since(tunnelStart).Milliseconds()})
 		http.Error(w, "Forbidden (Ad-Blocked by NetNinja)", http.StatusForbidden)
 		return
 	}
@@ -1384,6 +1739,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&activeConns, -1)
 		atomic.AddInt64(&errCount, 1)
 		log.Printf("%s[ERR]%s CONNECT %s failed: %s", colorRed, colorReset, host, err)
+		pushConnLog(connLogEntry{username: tunnelUser, clientIP: clientIP, host: hostname, status: "dial_fail", durMs: time.Since(tunnelStart).Milliseconds()})
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
@@ -1427,17 +1783,24 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		clientIP, host,
 		colorGray, colorReset)
 
+	trackUserConn(tunnelUser)
+
 	errc := make(chan error, 2)
+	var tUp, tDown int64
 
 	// Client → dest (upload)
 	go func() {
 		n, err := io.Copy(destConn, clientConn)
 		atomic.AddInt64(&totalBytesUp, n)
+		tUp += n
 		if hs != nil {
 			hs.mu.Lock()
 			hs.bytes += n
 			hs.last = time.Now()
 			hs.mu.Unlock()
+		}
+		if n > 0 {
+			trackUserBytes(tunnelUser, n, 0)
 		}
 		destConn.Close()
 		errc <- err
@@ -1446,11 +1809,15 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		n, err := io.Copy(clientConn, destConn)
 		atomic.AddInt64(&totalBytesDown, n)
+		tDown += n
 		if hs != nil {
 			hs.mu.Lock()
 			hs.bytes += n
 			hs.last = time.Now()
 			hs.mu.Unlock()
+		}
+		if n > 0 {
+			trackUserBytes(tunnelUser, 0, n)
 		}
 		clientConn.Close()
 		errc <- err
@@ -1483,6 +1850,18 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	<-errc
 	activeTunnels.Delete(hostname)
+
+	// Audit log entry for this completed tunnel
+	pushConnLog(connLogEntry{
+		username:  tunnelUser,
+		clientIP:  clientIP,
+		host:      hostname,
+		status:    "ok",
+		bytesUp:   tUp,
+		bytesDown: tDown,
+		durMs:     time.Since(tunnelStart).Milliseconds(),
+	})
+	touchUserHost(tunnelUser, hostname, tUp, tDown, 1)
 }
 
 func bwSnapshot() []int64 {
@@ -1772,4 +2151,741 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Admin interface: manage proxy users + view per-user usage (ADMIN_PASS env)
+// ---------------------------------------------------------------------------
+
+var (
+	adminUser string
+	adminPass string
+)
+
+func loadAdminCreds() {
+	adminUser = os.Getenv("ADMIN_USER")
+	if adminUser == "" {
+		adminUser = "admin"
+	}
+	adminPass = os.Getenv("ADMIN_PASS")
+}
+
+func adminAuthRequired(w http.ResponseWriter, r *http.Request) bool {
+	if adminPass == "" {
+		http.Error(w, "Admin not configured", http.StatusForbidden)
+		return false
+	}
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Basic ") {
+		w.Header().Set("WWW-Authenticate", `Basic realm="NetNinja Admin"`)
+		http.Error(w, "Admin Authentication Required", http.StatusUnauthorized)
+		return false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="NetNinja Admin"`)
+		http.Error(w, "Admin Authentication Required", http.StatusUnauthorized)
+		return false
+	}
+	parts := strings.SplitN(string(raw), ":", 2)
+	if len(parts) != 2 || parts[0] != adminUser || parts[1] != adminPass {
+		w.Header().Set("WWW-Authenticate", `Basic realm="NetNinja Admin"`)
+		http.Error(w, "Admin Authentication Required", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+// userSnap is a consistent read of a single user's usage stats
+type userSnap struct {
+	name        string
+	bytesUp     int64
+	bytesDown   int64
+	conns       int64
+	firstSeen   time.Time
+	lastSeen    time.Time
+	deviceCount int
+	devices     []string
+}
+
+// snapshotUsers aggregates persisted per-host totals WITH live device info.
+// Bytes/conns come from user_hosts (survive restarts); devices come from live stats.
+func snapshotUsers() []userSnap {
+	agg := map[string]*userSnap{}
+	userHosts.Range(func(k, v interface{}) bool {
+		key := k.(string)
+		parts := strings.SplitN(key, "\x00", 2)
+		if len(parts) != 2 {
+			return true
+		}
+		u := parts[0]
+		st := v.(*userHostStat)
+		if st == nil {
+			return true
+		}
+		s, ok := agg[u]
+		if !ok {
+			s = &userSnap{name: u}
+			agg[u] = s
+		}
+		s.bytesUp += st.bytesUp
+		s.bytesDown += st.bytesDown
+		s.conns += st.conns
+		if !st.firstSeen.IsZero() && (s.firstSeen.IsZero() || st.firstSeen.Before(s.firstSeen)) {
+			s.firstSeen = st.firstSeen
+		}
+		if st.lastSeen.After(s.lastSeen) {
+			s.lastSeen = st.lastSeen
+		}
+		return true
+	})
+
+	// Merge live device info
+	userStats.Range(func(k, v interface{}) bool {
+		u := k.(string)
+		st := v.(*userStat)
+		s, ok := agg[u]
+		if !ok {
+			s = &userSnap{name: u}
+			agg[u] = s
+		}
+		st.mu.Lock()
+		for d := range st.devices {
+			if len(s.devices) < 8 {
+				s.devices = append(s.devices, d)
+			}
+			s.deviceCount++
+		}
+		if st.lastSeen.After(s.lastSeen) {
+			s.lastSeen = st.lastSeen
+		}
+		st.mu.Unlock()
+		return true
+	})
+
+	var out []userSnap
+	for _, s := range agg {
+		out = append(out, *s)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].bytesDown+out[i].bytesUp > out[j].bytesDown+out[j].bytesUp
+	})
+	return out
+}
+
+func adminPageTop(title, curPath string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>netninja admin — %s</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:13px/1.6 'Courier New',monospace;margin:0;padding:40px 20px}
+.w{max-width:1020px;margin:0 auto}
+h1{color:#fff;font-size:18px;margin:0 0 4px;font-weight:normal}
+h1 span{color:#ffa500;margin-right:10px}
+.sub{color:#444;font-size:11px;margin-bottom:16px;letter-spacing:1px}
+hr{border:0;border-top:1px solid #222;margin:25px 0}
+.nav{display:flex;gap:6px;margin:14px 0 20px;flex-wrap:wrap}
+.nav a{color:#999;text-decoration:none;border:1px solid #2a2a2a;background:#111;padding:6px 14px;border-radius:4px;font-size:12px}
+.nav a:hover{color:#fff;border-color:#ffa500}
+.nav a.cur{color:#ffa500;border-color:#ffa500}
+.msg{background:#191919;border:1px solid #2a3a2a;color:#8f8;padding:10px 14px;border-radius:4px;margin-bottom:18px}
+table{width:100%%;border-collapse:collapse;margin-bottom:20px}
+th{color:#666;text-transform:uppercase;font-size:10px;letter-spacing:1px;text-align:left;padding:6px 8px;border-bottom:1px solid #333}
+td{padding:8px;border-bottom:1px solid #151515;vertical-align:top}
+td b{color:#eee}
+td.ok{color:#0f0}
+td.err{color:#f77}
+td.num{color:#7af}
+td.dim{color:#555;font-size:11px}
+td.warn{color:#ffa500}
+a.u{color:#7af;text-decoration:none;font-weight:bold}
+a.u:hover{color:#fff;text-decoration:underline}
+.devc{color:#0f0;font-weight:bold}
+.devlist{margin-top:4px}
+.dev{color:#888;font-size:10px;background:#121212;border:1px solid #222;border-radius:3px;padding:1px 6px;margin:2px 0;display:inline-block}
+.dev.dim{color:#555}
+.btn-del{background:#3a0f0f;color:#f77;border:1px solid #722;border-radius:3px;padding:3px 10px;font:inherit;cursor:pointer}
+.btn-del:hover{background:#5a1515}
+.add-card{background:#111;border:1px solid #222;border-radius:6px;padding:16px;margin-top:10px}
+.add-card label{color:#666;font-size:10px;text-transform:uppercase;letter-spacing:1px;display:block;margin:8px 0 4px}
+.add-card input,.add-card select{background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:8px 10px;border-radius:3px;font:inherit;width:100%%;box-sizing:border-box}
+.add-card input:focus{outline:none;border-color:#ffa500}
+.btn-add{background:#5a3a00;color:#ffc966;border:1px solid #8a5c00;border-radius:3px;padding:10px 18px;font:inherit;font-weight:bold;cursor:pointer;margin-top:12px}
+.btn-add:hover{background:#6b4600}
+.btn{background:#111;color:#ccc;border:1px solid #333;border-radius:3px;padding:6px 14px;font:inherit;cursor:pointer}
+.btn:hover{color:#fff;border-color:#ffa500}
+.tots{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px}
+.tot{background:#111;border:1px solid #222;border-radius:6px;padding:10px 14px;flex:1;min-width:130px}
+.tot .k{color:#555;font-size:10px;text-transform:uppercase;letter-spacing:1px}
+.tot .v{color:#ffa500;font-size:16px;margin-top:3px}
+.tot .v.g{color:#0f0}
+.tot .v.r{color:#f77}
+.filters{background:#111;border:1px solid #222;border-radius:6px;padding:14px;margin-bottom:16px}
+.filters form{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.filters label{color:#555;font-size:10px;text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:4px}
+.filters input,.filters select{background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:6px 10px;border-radius:3px;font:inherit}
+.pager{display:flex;gap:12px;align-items:center;margin:14px 0}
+.pager a{color:#7af;text-decoration:none}
+.pager a:hover{color:#fff}
+.back{margin-top:30px;display:inline-block;color:#7af;text-decoration:none}
+.back:hover{color:#fff}
+.q{color:#ffa500}
+</style>
+</head>
+<body>
+<div class="w">
+	<h1><span>●</span> netninja admin</h1>
+	<div class="sub">%s</div>
+	<div class="nav">
+		<a href="/admin" %s>users</a>
+		<a href="/admin/logs" %s>access_logs</a>
+		<a href="/admin/audit" %s>admin_audit</a>
+		<a href="/">dashboard</a>
+	</div>
+`, html.EscapeString(title), html.EscapeString(title),
+		navCur(curPath, "/admin", "/admin/user"), navCur(curPath, "/admin/logs"), navCur(curPath, "/admin/audit"))
+}
+
+func navCur(curPath string, paths ...string) string {
+	for _, p := range paths {
+		if curPath == p {
+			return `class="cur"`
+		}
+	}
+	return ""
+}
+
+func adminPageEnd(extra string) string {
+	return `	<a class="back" href="/admin">&larr; admin</a>
+</div>
+</body>
+</html>` + extra
+}
+
+func fmtMB(b int64) string {
+	return fmt.Sprintf("%.2f MB", float64(b)/1048576)
+}
+
+func fmtDur(ms int64) string {
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	return fmt.Sprintf("%.1fs", float64(ms)/1000)
+}
+
+func serveAdmin(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+
+	snaps := snapshotUsers()
+
+	known := map[string]bool{}
+	for _, s := range snaps {
+		known[s.name] = true
+	}
+	// Add auth users that exist but never connected
+	for name := range proxyUsers {
+		if !known[name] {
+			snaps = append(snaps, userSnap{name: name})
+		}
+	}
+	sort.Slice(snaps, func(i, j int) bool {
+		return snaps[i].bytesDown+snaps[i].bytesUp > snaps[j].bytesDown+snaps[j].bytesUp
+	})
+
+	var totalUp, totalDown, totalConns int64
+	var totalDev int
+	for _, s := range snaps {
+		totalUp += s.bytesUp
+		totalDown += s.bytesDown
+		totalConns += s.conns
+		totalDev += s.deviceCount
+	}
+
+	// DB log counts
+	var logRows int64
+	_ = db.QueryRow("SELECT COUNT(*) FROM conn_logs").Scan(&logRows)
+
+	userRows := ""
+	for _, s := range snaps {
+		devList := ""
+		for _, d := range s.devices {
+			devList += fmt.Sprintf(`<div class="dev">%s</div>`, html.EscapeString(d))
+		}
+		if s.deviceCount > len(s.devices) {
+			devList += fmt.Sprintf(`<div class="dev dim">… +%d more</div>`, s.deviceCount-len(s.devices))
+		}
+		first, last := "--", "--"
+		if !s.firstSeen.IsZero() {
+			first = s.firstSeen.Format("2006-01-02 15:04")
+		}
+		if !s.lastSeen.IsZero() {
+			last = s.lastSeen.Format("2006-01-02 15:04")
+		}
+		ac := "no"
+		acCls := "dim"
+		if _, ok := proxyUsers[s.name]; ok {
+			ac = "yes"
+			acCls = "ok"
+		}
+		activeNow := ""
+		if time.Since(s.lastSeen) < 90*time.Second {
+			activeNow = `&nbsp;<span class="dev" style="color:#0f0;border-color:#040">● live</span>`
+		}
+		userRows += fmt.Sprintf(`<tr>
+			<td><a class="u" href="/admin/user?name=%s">%s</a>%s</td>
+			<td class="%s">%s</td>
+			<td class="num">%s</td>
+			<td class="num">%s</td>
+			<td class="num">%d</td>
+			<td class="dim">%s</td>
+			<td class="dim">%s</td>
+			<td><span class="devc">%d</span><div class="devlist">%s</div></td>
+			<td><form method="post" action="/admin/delete" onsubmit="return confirm('ลบ user &#39;%s&#39;?' )"><input type="hidden" name="user" value="%s"><button type="submit" class="btn-del">ลบ</button></form></td>
+		</tr>`,
+			url.QueryEscape(s.name), html.EscapeString(s.name), activeNow,
+			acCls, ac,
+			fmtMB(s.bytesUp), fmtMB(s.bytesDown), s.conns,
+			first, last,
+			s.deviceCount, devList,
+			html.EscapeString(s.name), html.EscapeString(s.name))
+	}
+
+	msg := r.URL.Query().Get("msg")
+	msgHTML := ""
+	if msg != "" {
+		msgHTML = fmt.Sprintf(`<div class="msg">%s</div>`, html.EscapeString(msg))
+	}
+
+	top := adminPageTop("user_management // usage_monitor", r.URL.Path)
+	body := fmt.Sprintf(`
+	<div class="tots">
+		<div class="tot"><div class="k">total_users</div><div class="v">%d</div></div>
+		<div class="tot"><div class="k">bytes_up</div><div class="v" style="color:#7af">%s</div></div>
+		<div class="tot"><div class="k">bytes_down</div><div class="v">%s</div></div>
+		<div class="tot"><div class="k">total_conns</div><div class="v">%d</div></div>
+		<div class="tot"><div class="k">total_devices</div><div class="v">%d</div></div>
+		<div class="tot"><div class="k">stored_log_rows</div><div class="v g">%d</div></div>
+	</div>
+
+	%s
+
+	<table>
+	<tr><th>user</th><th>active</th><th>bytes_up</th><th>bytes_down</th><th>conns</th><th>first_seen</th><th>last_seen</th><th>devices</th><th></th></tr>
+	%s
+	</table>
+
+	<div class="add-card">
+		<div style="color:#fff;margin-bottom:6px">เพิ่มผู้ใช้ใหม่</div>
+		<form method="post" action="/admin/add">
+			<label>username</label>
+			<input type="text" name="user" required autocomplete="off" placeholder="เช่น mama">
+			<label>password</label>
+			<input type="text" name="pass" required autocomplete="off" placeholder="รหัสผ่าน">
+			<button type="submit" class="btn-add">เพิ่มผู้ใช้</button>
+		</form>
+	</div>
+`, len(snaps), fmtMB(totalUp), fmtMB(totalDown), totalConns, totalDev, logRows,
+		msgHTML, userRows)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write([]byte(top + body + adminPageEnd("")))
+}
+
+// serveAdminUser — drill-down for one user: totals, devices, per-host summary, recent activity
+func serveAdminUser(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+
+	// Aggregate host totals for this user
+	type hostRow struct{ Host string; Up, Down, Conns int64; First, Last string }
+	var hosts []hostRow
+	userHosts.Range(func(k, v interface{}) bool {
+		parts := strings.SplitN(k.(string), "\x00", 2)
+		if len(parts) != 2 || parts[0] != name {
+			return true
+		}
+		st := v.(*userHostStat)
+		if st == nil {
+			return true
+		}
+		f, l := "--", "--"
+		if !st.firstSeen.IsZero() {
+			f = st.firstSeen.Format("2006-01-02 15:04")
+		}
+		if !st.lastSeen.IsZero() {
+			l = st.lastSeen.Format("2006-01-02 15:04")
+		}
+		hosts = append(hosts, hostRow{parts[1], st.bytesUp, st.bytesDown, st.conns, f, l})
+		return true
+	})
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Down > hosts[j].Down })
+
+	// Recent activity for this user
+	rows, _ := db.Query(`SELECT ts, client_ip, host, status, bytes_up, bytes_down, duration_ms FROM conn_logs WHERE username = ? ORDER BY id DESC LIMIT 100`, name)
+	defer rows.Close()
+	var acts []string
+	for rows.Next() {
+		var ts, ip, h, st string
+		var up, dn, dur int64
+		if rows.Scan(&ts, &ip, &h, &st, &up, &dn, &dur) == nil {
+			cls := "ok"
+			if st == "dial_fail" || st == "ad_block" {
+				cls = "err"
+			}
+			acts = append(acts, fmt.Sprintf(`<tr><td class="dim">%s</td><td class="%s">%s</td><td class="num">%s</td><td>%s</td><td class="num">%s</td><td class="num">%s</td><td class="dim">%s</td></tr>`,
+				html.EscapeString(ts), cls, html.EscapeString(st), html.EscapeString(ip),
+				html.EscapeString(h), fmtMB(up), fmtMB(dn), fmtDur(dur)))
+		}
+	}
+	actBody := strings.Join(acts, "\n")
+	if len(acts) == 0 {
+		actBody = `<tr><td colspan="7" class="dim">ยังไม่มี activity</td></tr>`
+	}
+
+	hostBody := ""
+	for _, h := range hosts {
+		hostBody += fmt.Sprintf(`<tr><td><b>%s</b></td><td class="num">%s</td><td class="num">%s</td><td class="num">%d</td><td class="dim">%s</td><td class="dim">%s</td></tr>`,
+			html.EscapeString(h.Host), fmtMB(h.Up), fmtMB(h.Down), h.Conns, h.First, h.Last)
+	}
+	if len(hosts) == 0 {
+		hostBody = `<tr><td colspan="6" class="dim">ยังไม่มีข้อมูล host</td></tr>`
+	}
+
+	var up, down, conns int64
+	for _, h := range hosts {
+		up += h.Up
+		down += h.Down
+		conns += h.Conns
+	}
+
+	top := adminPageTop("user_detail // " + name, r.URL.Path)
+	body := fmt.Sprintf(`
+	<div class="tots">
+		<div class="tot"><div class="k">user</div><div class="v" style="color:#7af">%s</div></div>
+		<div class="tot"><div class="k">bytes_up</div><div class="v" style="color:#7af">%s</div></div>
+		<div class="tot"><div class="k">bytes_down</div><div class="v">%s</div></div>
+		<div class="tot"><div class="k">conns</div><div class="v">%d</div></div>
+		<div class="tot"><div class="k">hosts</div><div class="v">%d</div></div>
+	</div>
+
+	<div class="section" style="margin-bottom:20px">
+		<div style="color:#555;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin:10px 0">hosts_by_bytes_down</div>
+		<table>
+		<tr><th>host</th><th>bytes_up</th><th>bytes_down</th><th>conns</th><th>first_seen</th><th>last_seen</th></tr>
+		%s
+		</table>
+	</div>
+
+	<div class="section" style="margin-bottom:20px">
+		<div style="color:#555;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin:10px 0">recent_activity (last 100)</div>
+		<table>
+		<tr><th>ts</th><th>status</th><th>client_ip</th><th>host</th><th>up</th><th>down</th><th>duration</th></tr>
+		%s
+		</table>
+	</div>
+`, html.EscapeString(name), fmtMB(up), fmtMB(down), conns, len(hosts), hostBody, actBody)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write([]byte(top + body + adminPageEnd("")))
+}
+
+// serveAdminLogs — filterable, paged connection log viewer
+func serveAdminLogs(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	q := r.URL.Query()
+	fUser := strings.TrimSpace(q.Get("user"))
+	fHost := strings.TrimSpace(q.Get("host"))
+	fStatus := strings.TrimSpace(q.Get("status"))
+	limit := 200
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	page := 1
+	if v := q.Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	offset := (page - 1) * limit
+
+	where := "WHERE 1=1"
+	args := []interface{}{}
+	if fUser != "" {
+		where += " AND username = ?"
+		args = append(args, fUser)
+	}
+	if fHost != "" {
+		where += " AND host LIKE ?"
+		args = append(args, "%"+fHost+"%")
+	}
+	if fStatus != "" {
+		where += " AND status = ?"
+		args = append(args, fStatus)
+	}
+
+	var total int64
+	_ = db.QueryRow("SELECT COUNT(*) FROM conn_logs "+where, args...).Scan(&total)
+
+	query := "SELECT ts, username, client_ip, host, status, bytes_up, bytes_down, duration_ms FROM conn_logs " + where +
+		" ORDER BY id DESC LIMIT ? OFFSET ?"
+	argsQ := append(append([]interface{}{}, args...), limit, offset)
+
+	rows, err := db.Query(query, argsQ...)
+	if err != nil {
+		http.Error(w, "query error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type rw struct{ Ts, User, IP, Host, Status string; Up, Down, Dur string }
+	var list []rw
+	for rows.Next() {
+		var ts, u, ip, h, st string
+		var up, dn, dur int64
+		if rows.Scan(&ts, &u, &ip, &h, &st, &up, &dn, &dur) == nil {
+			list = append(list, rw{ts, u, ip, h, st, fmtMB(up), fmtMB(dn), fmtDur(dur)})
+		}
+	}
+
+	// Build user select options
+	opts := "<option value=\"\">— ทุกคน —</option>"
+	users := make([]string, 0, len(proxyUsers))
+	for u := range proxyUsers {
+		users = append(users, u)
+	}
+	sort.Strings(users)
+	for _, u := range users {
+		sel := ""
+		if u == fUser {
+			sel = "selected"
+		}
+		opts += fmt.Sprintf(`<option value="%s" %s>%s</option>`, html.EscapeString(u), sel, html.EscapeString(u))
+	}
+
+	bodyRows := ""
+	for _, it := range list {
+		cls := "ok"
+		if it.Status == "dial_fail" || it.Status == "ad_block" {
+			cls = "err"
+		} else if it.Status == "http" {
+			cls = "warn"
+		}
+		bodyRows += fmt.Sprintf(`<tr><td class="dim">%s</td><td><a class="u" href="/admin/user?name=%s">%s</a></td><td>%s</td><td><b>%s</b></td><td class="%s">%s</td><td class="num">%s</td><td class="num">%s</td><td class="dim">%s</td></tr>`,
+			html.EscapeString(it.Ts), url.QueryEscape(it.User), html.EscapeString(it.User),
+			it.IP, html.EscapeString(it.Host), cls, html.EscapeString(it.Status),
+			it.Up, it.Down, it.Dur)
+	}
+	if len(list) == 0 {
+		bodyRows = `<tr><td colspan="8" class="dim">ไม่มี log ตรงตามเงื่อนไข</td></tr>`
+	}
+
+	pages := (int(total) + limit - 1) / limit
+	if pages < 1 {
+		pages = 1
+	}
+	if page > pages {
+		page = pages
+	}
+	mkLink := func(p int) string {
+		u := "/admin/logs?page=" + strconv.Itoa(p) + "&limit=" + strconv.Itoa(limit)
+		if fUser != "" {
+			u += "&user=" + url.QueryEscape(fUser)
+		}
+		if fHost != "" {
+			u += "&host=" + url.QueryEscape(fHost)
+		}
+		if fStatus != "" {
+			u += "&status=" + url.QueryEscape(fStatus)
+		}
+		return u
+	}
+	pager := fmt.Sprintf(`<div class="pager">
+		<span class="dim">%d rows / page %d of %d</span>
+		<div class="nav" style="margin:0">%s%s</div>
+	</div>`,
+		total, page, pages,
+		pgLink(page > 1, mkLink(page-1), "prev"),
+		pgLink(page < pages, mkLink(page+1), "next"))
+
+	top := adminPageTop("access_logs // audit_trail", r.URL.Path)
+	body := fmt.Sprintf(`
+	<div class="filters">
+		<form method="get" action="/admin/logs">
+			<div><label>user</label><select name="user">%s</select></div>
+			<div><label>host (contains)</label><input type="text" name="host" value="%s"></div>
+			<div><label>status</label>
+				<select name="status">
+					<option value="">— ทั้งหมด —</option>
+					%s
+				</select>
+			</div>
+			<div><label>per_page</label>
+				<select name="limit">
+					%s
+				</select>
+			</div>
+			<div><button type="submit" class="btn">ค้นหา</button></div>
+		</form>
+	</div>
+	%s
+	<table>
+	<tr><th>ts</th><th>user</th><th>client_ip</th><th>host</th><th>status</th><th>up</th><th>down</th><th>duration</th></tr>
+	%s
+	</table>
+	%s
+`, opts, html.EscapeString(fHost),
+		statusOpts(fStatus), limitOpts(limit),
+		pager, bodyRows, pager)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write([]byte(top + body + adminPageEnd("")))
+}
+
+func pgLink(show bool, href, label string) string {
+	if !show {
+		return `<a class="dim" style="color:#444;text-decoration:none">` + label + `</a>`
+	}
+	return fmt.Sprintf(`<a href="%s">%s</a>`, href, label)
+}
+
+func statusOpts(cur string) string {
+	opts := ""
+	for _, s := range []string{"ok", "http", "dial_fail", "ad_block"} {
+		sel := ""
+		if s == cur {
+			sel = "selected"
+		}
+		opts += fmt.Sprintf(`<option value="%s" %s>%s</option>`, s, sel, s)
+	}
+	return opts
+}
+
+func limitOpts(cur int) string {
+	opts := ""
+	for _, n := range []int{50, 100, 200, 500, 1000} {
+		sel := ""
+		if n == cur {
+			sel = "selected"
+		}
+		opts += fmt.Sprintf(`<option value="%d" %s>%d</option>`, n, sel, n)
+	}
+	return opts
+}
+
+// serveAdminAudit — record of admin actions
+func serveAdminAudit(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	rows, err := db.Query("SELECT ts, admin_user, action, target, detail FROM admin_logs ORDER BY id DESC LIMIT 300")
+	if err != nil {
+		http.Error(w, "query error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type rowT struct{ Ts, Admin, Action, Target, Detail string }
+	var list []rowT
+	for rows.Next() {
+		var ts, au, ac, tg, det string
+		if rows.Scan(&ts, &au, &ac, &tg, &det) == nil {
+			list = append(list, rowT{ts, au, ac, tg, det})
+		}
+	}
+	bodyRows := ""
+	for _, it := range list {
+		acCls := "ok"
+		if it.Action == "delete" {
+			acCls = "err"
+		}
+		bodyRows += fmt.Sprintf(`<tr><td class="dim">%s</td><td class="num">%s</td><td class="%s">%s</td><td><b>%s</b></td><td class="dim">%s</td></tr>`,
+			html.EscapeString(it.Ts), html.EscapeString(it.Admin), acCls, html.EscapeString(it.Action),
+			html.EscapeString(it.Target), html.EscapeString(it.Detail))
+	}
+	if len(list) == 0 {
+		bodyRows = `<tr><td colspan="5" class="dim">ยังไม่มีประวัติ admin action</td></tr>`
+	}
+
+	top := adminPageTop("admin_audit // trail", r.URL.Path)
+	body := fmt.Sprintf(`
+	<table>
+	<tr><th>ts</th><th>admin</th><th>action</th><th>target</th><th>detail</th></tr>
+	%s
+	</table>
+`, bodyRows)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write([]byte(top + body + adminPageEnd("")))
+}
+
+func handleAdminAdd(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	user := strings.TrimSpace(r.FormValue("user"))
+	pass := strings.TrimSpace(r.FormValue("pass"))
+	msg := "กรอกข้อมูลไม่ครบ"
+	if user != "" && pass != "" && !strings.Contains(user, ":") && !strings.Contains(user, ",") && !strings.Contains(pass, ":") && !strings.Contains(pass, ",") {
+		proxyUsers[user] = pass
+		go func() {
+			_, err := db.Exec("INSERT OR REPLACE INTO proxy_users (username, password, created_at) VALUES (?, ?, DATETIME('now'))", user, pass)
+			if err != nil {
+				log.Printf("%s[ADMIN]%s failed to persist user %s: %v", colorRed, colorReset, user, err)
+			}
+		}()
+		recordAdminLog(adminUser, "add", user, "created user")
+		log.Printf("%s[ADMIN]%s added user %q", colorGreen, colorReset, user)
+		msg = "เพิ่มผู้ใช้ '" + user + "' เรียบร้อย"
+	}
+	http.Redirect(w, r, "/admin?msg="+url.QueryEscape(msg), http.StatusFound)
+}
+
+func handleAdminDelete(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	user := strings.TrimSpace(r.FormValue("user"))
+	if user == "" {
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ไม่พบ user"), http.StatusFound)
+		return
+	}
+	if user == adminUser {
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ลบ admin เองไม่ได้"), http.StatusFound)
+		return
+	}
+	delete(proxyUsers, user)
+	userStats.Delete(user)
+	go func() {
+		_, _ = db.Exec("DELETE FROM proxy_users WHERE username = ?", user)
+	}()
+	recordAdminLog(adminUser, "delete", user, "removed user account")
+	log.Printf("%s[ADMIN]%s deleted user %q", colorYellow, colorReset, user)
+	http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ลบ user '"+user+"' แล้ว"), http.StatusFound)
 }
