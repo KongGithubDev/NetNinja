@@ -26,14 +26,21 @@ A VLESS server with built-in SNI multiplexer that listens on a single TCP/UDP po
 
 ### proxy (HTTP/HTTPS Forward Proxy)
 
-A forward proxy with domain-based filtering and Cisco Umbrella SSE unwrapping. Includes a low-overhead status dashboard.
+A forward proxy that bypasses Cisco Umbrella content filters (DNS-level blocking). It resolves DNS and originates connections from the proxy's own IP, which sits outside the filtering policy. Includes an HTTP(S) CONNECT tunnel, a PAC auto-config server, and a block-check endpoint.
 
 **Features:**
-- Cisco Umbrella SSE detection and transparent domain/IP unwrapping
+- HTTP Basic Auth via `PROXY_USERS="user:pass,user2:pass2"` (default `Kong:KongPassword`)
+- CONNECT tunneling over Go's high-performance goroutine engine
 - Dual DNS resolution (standard + DoH) for bypassing filtered resolvers
 - SQLite-backed persistent DNS cache and domain rule store
 - Real-time dashboard with active user tracking and connection metrics
 - PAC auto-config file served at `/proxy.pac`
+- `/block-check?url=<url>` endpoint: fetches a target through the proxy and reports whether it is reachable from outside the filter (NOT BLOCKED / TIMEOUT)
+
+**PAC routing (current):**
+- Default: `PROXY <PROXY_ADDR>; DIRECT` — all traffic tries the proxy first (Cisco block pages return HTTP 200, so the DIRECT fallback never triggers on filtered sites)
+- Direct exceptions (bypass proxy to keep video/QUIC and Apple services fast): `googlevideo.com` (YouTube video), `apple.com`, `icloud.com`, `apple-cloudkit.com`, `mzstatic.com`, `itunes.com`, plus LAN/loopback addresses
+- YouTube UI/API/comment hosts (`youtube.com`, `ytimg.com`, `yt3.ggpht.com`, `googleapis.com`, `google.com`, `gstatic.com`, `ggpht.com`, `googleusercontent.com`) route through the proxy so their DNS resolves at the proxy IP — this restores YouTube Restricted-Mode-gated content (e.g. hidden comments) that the on-device Umbrella profile forces via DNS
 
 ---
 
@@ -159,9 +166,13 @@ proxy.exe
 
 # Custom port
 set PORT=5988 && proxy.exe
+
+# Proxy address used in the PAC file (defaults to request Host)
+set PROXY_ADDR=proxy.example.com:443
 ```
 
 Dashboard at `http://127.0.0.1:[PORT]/`. PAC file at `/proxy.pac`.
+Block check: `http://127.0.0.1:[PORT]/block-check?url=https://example.com/`.
 
 ---
 

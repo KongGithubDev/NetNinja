@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -171,6 +173,13 @@ func hyperResolve(ctx context.Context, host string) (string, error) {
 	go func() {
 		ips, err := customResolver.LookupHost(ctx, host)
 		if err == nil && len(ips) > 0 {
+			// Prefer IPv4 for stability (IPv6 often breaks naive ip:port joins / no route)
+			for _, ip := range ips {
+				if ip4 := net.ParseIP(ip); ip4 != nil && ip4.To4() != nil {
+					ch <- res{ip: ip, err: nil}
+					return
+				}
+			}
 			ch <- res{ip: ips[0], err: nil}
 		} else {
 			ch <- res{ip: "", err: err}
@@ -520,9 +529,6 @@ func getClientIP(r *http.Request) string {
 	return ip
 }
 
-// Domains that go DIRECT (not through proxy) — for GFN streaming etc.
-var directDomains = []string{}
-
 // isVideoDomain returns true for video streaming CDN domains that benefit from shorter DNS TTL
 func isVideoDomain(host string) bool {
 	h := strings.ToLower(host)
@@ -571,6 +577,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	if isForSelf {
 		if path == "/proxy.pac" {
 			servePAC(w, r)
+			return
+		} else if path == "/block-check" {
+			serveBlockCheck(w, r)
 			return
 		} else if path == "/ws" {
 			serveWS(w, r)
@@ -761,27 +770,190 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 	handleHTTP(w, r)
 }
 
-// servePAC — default PROXY, GFN domains go DIRECT
+// serveBlockCheck — checks whether a given URL is reachable through the
+// proxy (i.e. whether it can bypass a Cisco/ISP content filter). It resolves
+// and fetches the origin from the proxy's own IP, which sits outside the filter.
+func serveBlockCheck(w http.ResponseWriter, r *http.Request) {
+	clientIP := getClientIP(r)
+	target := r.URL.Query().Get("url")
+	if target == "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" name="viewport" content="width=device-width,initial-scale=1">
+<title>NetNinja Block Check</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
+.c{max-width:480px;width:90%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
+h1{color:#fff;font-size:22px;margin:0 0 20px;font-weight:normal}
+input{width:100%;padding:12px;background:#0d0d0d;border:1px solid #333;border-radius:4px;color:#7af;font:14px 'Courier New',monospace;box-sizing:border-box;margin-bottom:16px}
+button{width:100%;padding:12px;background:#060;color:#fff;border:none;border-radius:4px;font:bold 14px 'Courier New',monospace;cursor:pointer}
+.footer{margin-top:24px;font-size:10px;color:#333;text-transform:uppercase;letter-spacing:1px}
+</style>
+</head>
+<body>
+<div class="c">
+<h1>NetNinja Block Check</h1>
+<form method="get" action="/block-check">
+<input type="text" name="url" placeholder="https://y8.com/" autofocus>
+<button type="submit">CHECK</button>
+</form>
+<p style="color:#555;font-size:11px">ทดสอบว่า URL นี้เปิดผ่าน proxy ได้ (ข้าม Cisco) หรือไม่</p>
+<div class="footer">netninja_engine</div>
+</div>
+</body>
+</html>`))
+		return
+	}
+
+	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+		target = "https://" + target
+	}
+
+	type result struct {
+		statusCode int
+		redirect   string
+		err        string
+		errKind    string
+	}
+	resCh := make(chan result, 1)
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	go func() {
+		client := &http.Client{
+			Timeout: 15 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return errors.New("too many redirects")
+				}
+				return nil
+			},
+		}
+		resp, err := client.Get(target)
+		if err != nil {
+			errStr := err.Error()
+			kind := "connection"
+			if timeoutCtx.Err() != nil {
+				kind = "timeout"
+			}
+			resCh <- result{err: errStr, errKind: kind}
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resCh <- result{statusCode: resp.StatusCode, redirect: resp.Request.URL.String()}
+	}()
+
+	select {
+	case res := <-resCh:
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if res.err != "" || res.statusCode == 0 {
+			color := "#f88"
+			verdict := "BLOCKED / UNREACHABLE"
+			if res.errKind == "timeout" {
+				verdict = "TIMEOUT (probable block)"
+			}
+			w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Block Check Result</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
+.c{max-width:480px;width:90%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
+h1{font-size:22px;margin:0 0 20px;font-weight:normal}
+.v{font-size:20px;font-weight:bold;padding:16px;border-radius:4px;margin-bottom:16px}
+.d{color:#888;font-size:12px;word-break:break-all;margin-bottom:20px}
+a{color:#7af}
+.back{display:inline-block;margin-top:20px;color:#7af;text-decoration:none}
+</style></head><body>
+<div class="c">
+<h1 style="color:%s">%s</h1>
+<div class="v" style="background:#150505;border:1px solid #600">Target not reachable through proxy</div>
+<div class="d">URL: %s<br>Error: %s</div>
+<a class="back" href="/block-check">&larr; ตรวจอีกครั้ง</a>
+</div></body></html>`, color, verdict, html.EscapeString(target), html.EscapeString(res.err))))
+			return
+		}
+
+		ok := res.statusCode >= 200 && res.statusCode < 400
+		center := html.EscapeString(res.redirect)
+		if center == "" {
+			center = html.EscapeString(target)
+		}
+		_ = center
+		if ok {
+			w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Block Check Result</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
+.c{max-width:480px;width:90%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
+h1{font-size:22px;margin:0 0 20px;font-weight:normal}
+.v{font-size:20px;font-weight:bold;padding:16px;border-radius:4px;margin-bottom:16px}
+.d{color:#888;font-size:12px;word-break:break-all;margin-bottom:20px}
+a{color:#7af}
+.back{display:inline-block;margin-top:20px;color:#7af;text-decoration:none}
+</style></head><body>
+<div class="c">
+<h1 style="color:#6f6">NOT BLOCKED</h1>
+<div class="v" style="background:#051505;border:1px solid #060">Reachable through proxy — HTTP %d</div>
+<div class="d">URL: %s</div>
+<a class="back" href="/block-check">&larr; ตรวจอีกครั้ง</a>
+</div></body></html>`, res.statusCode, center)))
+		} else {
+			w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Block Check Result</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
+.c{max-width:480px;width:90%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
+h1{font-size:22px;margin:0 0 20px;font-weight:normal}
+.v{font-size:20px;font-weight:bold;padding:16px;border-radius:4px;margin-bottom:16px}
+.d{color:#888;font-size:12px;word-break:break-all;margin-bottom:20px}
+a{color:#7af}
+.back{display:inline-block;margin-top:20px;color:#7af;text-decoration:none}
+</style></head><body>
+<div class="c">
+<h1 style="color:#fc0">CHECK RESULT</h1>
+<div class="v" style="background:#141005;border:1px solid #660">Server responded HTTP %d (site may be up but reachable only via proxy)</div>
+<div class="d">URL: %s</div>
+<a class="back" href="/block-check">&larr; ตรวจอีกครั้ง</a>
+</div></body></html>`, res.statusCode, center)))
+		}
+		log.Printf("%s[BLOCK-CHECK]%s %s → %d (%s)", colorCyan, colorReset, clientIP, res.statusCode, target)
+	case <-timeoutCtx.Done():
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Block Check Result</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:14px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
+.c{max-width:480px;width:90%;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px}
+h1{font-size:22px;margin:0 0 20px;font-weight:normal}
+.v{font-size:20px;font-weight:bold;padding:16px;border-radius:4px;margin-bottom:16px}
+.d{color:#888;font-size:12px;word-break:break-all;margin-bottom:20px}
+a{color:#7af}
+</style></head><body>
+<div class="c">
+<h1 style="color:#f88">TIMEOUT</h1>
+<div class="v" style="background:#150505;border:1px solid #600">Check timed out (20s)</div>
+<div class="d">URL: %s</div>
+</div></body></html>`, html.EscapeString(target))))
+	}
+}
+
+// servePAC — default PROXY (bypasses Cisco content filter since resolution
+// and connection happen from the proxy's IP, outside the filter); DIRECT only
+// for LAN/loopback and as a last-resort fallback if the proxy is unreachable.
 func servePAC(w http.ResponseWriter, r *http.Request) {
-	// PROXY_ADDR overrides the proxy address in PAC (useful when behind Caddy/nginx)
 	proxyHost := os.Getenv("PROXY_ADDR")
 	if proxyHost == "" {
 		proxyHost = r.Host
 	}
 	if proxyHost == "" {
 		proxyHost = "localhost"
-	}
-
-	var conditions []string
-	for _, domain := range directDomains {
-		if strings.HasPrefix(domain, "*.") {
-			bare := domain[2:]
-			conditions = append(conditions,
-				fmt.Sprintf(`    if (dnsDomainIs(host, "%s")) return "DIRECT";`, bare))
-		} else {
-			conditions = append(conditions,
-				fmt.Sprintf(`    if (host == "%s") return "DIRECT";`, domain))
-		}
 	}
 
 	pac := fmt.Sprintf(`function FindProxyForURL(url, host) {
@@ -793,10 +965,17 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
         host == "localhost") {
         return "DIRECT";
     }
-%s
+    if (dnsDomainIs(host, "googlevideo.com") ||
+        dnsDomainIs(host, "apple.com") ||
+        dnsDomainIs(host, "icloud.com") ||
+        dnsDomainIs(host, "apple-cloudkit.com") ||
+        dnsDomainIs(host, "mzstatic.com") ||
+        dnsDomainIs(host, "itunes.com")) {
+        return "DIRECT";
+    }
     return "PROXY %s; DIRECT";
 }
-`, strings.Join(conditions, "\n"), proxyHost)
+`, proxyHost)
 
 	w.Write([]byte(pac))
 
@@ -995,7 +1174,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		ip = hostname
 	}
 
-	destConn, err := customDialer.DialContext(r.Context(), "tcp", ip+":"+port)
+	destConn, err := customDialer.DialContext(r.Context(), "tcp", net.JoinHostPort(ip, port))
 	if err != nil {
 		atomic.AddInt64(&activeConns, -1)
 		log.Printf("%s[ERR]%s CONNECT %s failed: %s", colorRed, colorReset, host, err)
@@ -1115,7 +1294,7 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 		hostname = h
 		port = p
 	}
-	destConn, err := customDialer.DialContext(r.Context(), "tcp", hostname+":"+port)
+	destConn, err := customDialer.DialContext(r.Context(), "tcp", net.JoinHostPort(hostname, port))
 	if err != nil {
 		log.Printf("%s[ERR]%s WS Dial %s failed: %v", colorRed, colorReset, host, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)

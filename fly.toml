@@ -1,0 +1,13 @@
+app = "netninja-proxy"
+
+[build]
+
+[env]
+  PORT = "5988"
+
+[[services]]
+  internal_port = 5988
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 5988
