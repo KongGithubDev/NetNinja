@@ -2,14 +2,14 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/ssh"
 )
 
 // bufferPool for UDP: 4KB (handles all DNS responses without truncation)
@@ -48,21 +49,21 @@ var copyBufferPool = sync.Pool{
 }
 
 var (
-	portFlag    = flag.String("port", "443", "Listen port")
-	uuidFlag    = flag.String("uuid", "b831381d-6324-4d53-ad4f-8cda48b30811", "VLESS UUID")
-	pathFlag    = flag.String("path", "/", "WebSocket Path")
-	webSNIFlag  = flag.String("web-sni", "", "Proxy these SNIs to real web server (e.g. your-domain.com)")
-	webPortFlag = flag.String("webport", "8443", "Local web server port")
-	tlsFlag     = flag.Bool("tls", true, "Enable internal TLS termination")
-	certFlag    = flag.String("cert", "", "Path to real SSL certificate (fullchain.pem)")
-	keyFlag     = flag.String("key", "", "Path to real SSL private key (privkey.pem)")
-	pacFlag     = flag.String("pac", "/proxy.pac", "PAC file path")
-	proxyAddr   = flag.String("proxy-addr", "", "Override proxy address in PAC (e.g. your-domain.com)")
-	udpPortFlag = flag.String("udp-port", "*auto", "UDP port for QUIC/HTTP3 NAT relay (*auto = same as -port)")
+	portFlag     = flag.String("port", "443", "Listen port")
+	sshUserFlag  = flag.String("ssh-user", "vpn", "SSH username")
+	sshPassFlag  = flag.String("ssh-pass", "vpn", "SSH password")
+	sshHostKey   = flag.String("ssh-host-key", "", "SSH host key file (PEM); empty = ephemeral ed25519")
+	webSNIFlag   = flag.String("web-sni", "", "Proxy these SNIs to real web server (e.g. your-domain.com)")
+	webPortFlag  = flag.String("webport", "8443", "Local web server port")
+	tlsFlag      = flag.Bool("tls", true, "Enable internal TLS termination")
+	certFlag     = flag.String("cert", "", "Path to real SSL certificate (fullchain.pem)")
+	keyFlag      = flag.String("key", "", "Path to real SSL private key (privkey.pem)")
+	pacFlag      = flag.String("pac", "/proxy.pac", "PAC file path")
+	proxyAddr    = flag.String("proxy-addr", "", "Override proxy address in PAC (e.g. your-domain.com)")
+	udpPortFlag  = flag.String("udp-port", "*auto", "UDP port for QUIC/HTTP3 NAT relay (*auto = same as -port)")
 )
 
 var (
-	expectedUUID   []byte
 	netActiveConns int64
 	netTotalReqs   int64
 	netBytesUp     int64
@@ -246,11 +247,14 @@ func init() {
 	if envPort := os.Getenv("NET_PORT"); envPort != "" {
 		*portFlag = envPort
 	}
-	if envUUID := os.Getenv("NET_UUID"); envUUID != "" {
-		*uuidFlag = envUUID
+	if envSSHUser := os.Getenv("NET_SSH_USER"); envSSHUser != "" {
+		*sshUserFlag = envSSHUser
 	}
-	if envPath := os.Getenv("NET_PATH"); envPath != "" {
-		*pathFlag = envPath
+	if envSSHPass := os.Getenv("NET_SSH_PASS"); envSSHPass != "" {
+		*sshPassFlag = envSSHPass
+	}
+	if envSSHHostKey := os.Getenv("NET_SSH_HOST_KEY"); envSSHHostKey != "" {
+		*sshHostKey = envSSHHostKey
 	}
 	if envWebSNI := os.Getenv("NET_WEB_SNI"); envWebSNI != "" {
 		*webSNIFlag = envWebSNI
@@ -273,12 +277,6 @@ func init() {
 	}
 	if envProxyAddr := os.Getenv("NET_PROXY_ADDR"); envProxyAddr != "" {
 		*proxyAddr = envProxyAddr
-	}
-	u := strings.ReplaceAll(*uuidFlag, "-", "")
-	var err error
-	expectedUUID, err = hex.DecodeString(u)
-	if err != nil || len(expectedUUID) != 16 {
-		log.Fatalf("Invalid UUID format: %v", *uuidFlag)
 	}
 }
 
@@ -331,134 +329,97 @@ func (c *wsConnAdapter) SetDeadline(t time.Time) error {
 func (c *wsConnAdapter) SetReadDeadline(t time.Time) error  { return c.Conn.SetReadDeadline(t) }
 func (c *wsConnAdapter) SetWriteDeadline(t time.Time) error { return c.Conn.SetWriteDeadline(t) }
 
-func handleVLESS(w http.ResponseWriter, r *http.Request) {
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		return
-	}
-	atomic.AddInt64(&netTotalReqs, 1)
-	conn, err := netUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-	atomic.AddInt64(&netActiveConns, 1)
-	defer func() {
-		atomic.AddInt64(&netActiveConns, -1)
-		conn.Close()
-	}()
-	wsAdapter := &wsConnAdapter{Conn: conn}
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	conn.SetPingHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-		return conn.WriteControl(websocket.PongMessage, []byte{}, time.Now().Add(5*time.Second))
-	})
-	ver := make([]byte, 1)
-	if _, err := io.ReadFull(wsAdapter, ver); err != nil {
-		return
-	}
-	if ver[0] != 0 {
-		return
-	}
-	clientUUID := make([]byte, 16)
-	if _, err := io.ReadFull(wsAdapter, clientUUID); err != nil {
-		return
-	}
-	if !bytes.Equal(clientUUID, expectedUUID) {
-		log.Printf("[ERR] Unauthorized UUID attempt: %x", clientUUID)
-		return
-	}
-	addonLenBuf := make([]byte, 1)
-	if _, err := io.ReadFull(wsAdapter, addonLenBuf); err != nil {
-		return
-	}
-	if addonLenBuf[0] > 0 {
-		addon := make([]byte, addonLenBuf[0])
-		if _, err := io.ReadFull(wsAdapter, addon); err != nil {
-			return
-		}
-	}
-	cmdBuf := make([]byte, 1)
-	if _, err := io.ReadFull(wsAdapter, cmdBuf); err != nil {
-		return
-	}
-	cmd := int(cmdBuf[0])
-	portBuf := make([]byte, 2)
-	if _, err := io.ReadFull(wsAdapter, portBuf); err != nil {
-		return
-	}
-	targetPort := int(portBuf[0])<<8 | int(portBuf[1])
-	atypBuf := make([]byte, 1)
-	if _, err := io.ReadFull(wsAdapter, atypBuf); err != nil {
-		return
-	}
-	atyp := int(atypBuf[0])
-	var targetHost string
-	switch atyp {
-	case 1:
-		ip := make([]byte, 4)
-		if _, err := io.ReadFull(wsAdapter, ip); err != nil {
-			return
-		}
-		targetHost = fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])
-	case 2:
-		domainLenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(wsAdapter, domainLenBuf); err != nil {
-			return
-		}
-		domain := make([]byte, int(domainLenBuf[0]))
-		if _, err := io.ReadFull(wsAdapter, domain); err != nil {
-			return
-		}
-		targetHost = string(domain)
-	case 3:
-		ip := make([]byte, 16)
-		if _, err := io.ReadFull(wsAdapter, ip); err != nil {
-			return
-		}
-		targetHost = net.IP(ip).String()
-	default:
-		return
-	}
-	targetAddr := fmt.Sprintf("%s:%d", targetHost, targetPort)
+// ── SSH-over-WebSocket (NOPRO / NPV Tunnel / NetMod compatible) ───────────────
 
-	// Track destination for dashboard
-	if cmd == 1 && targetHost != "" {
-		if isVideoDomain(targetHost) {
-			v, _ := cdnAccess.LoadOrStore(targetHost, new(int64))
-			atomic.AddInt64(v.(*int64), 1)
+// handleSSHChannel routes SSH channels: "session" (noop shell) and
+// "direct-tcpip" (TCP forwarding). The latter is how NPV clients carry
+// outbound internet traffic through the SSH-over-WS tunnel.
+func handleSSHChannel(conn *ssh.ServerConn, newChan ssh.NewChannel) {
+	switch newChan.ChannelType() {
+	case "session":
+		// NPV/NetMod open a session for keepalive; we accept and discard.
+		ch, reqs, err := newChan.Accept()
+		if err != nil {
+			return
 		}
-		v, _ := activeDests.LoadOrStore(targetAddr, new(int64))
-		atomic.AddInt64(v.(*int64), 1)
-		defer func() {
-			if v, ok := activeDests.Load(targetAddr); ok {
-				atomic.AddInt64(v.(*int64), -1)
+		go func() {
+			for req := range reqs {
+				if req.Type == "shell" || req.Type == "exec" || req.Type == "subsystem" {
+					req.Reply(true, nil)
+				} else {
+					req.Reply(false, nil)
+				}
 			}
 		}()
-	}
+		go io.Copy(io.Discard, ch)
 
-	conn.SetReadDeadline(time.Time{})
-	wsAdapter.Write([]byte{0, 0})
-
-	if cmd == 1 {
-		dest, err := nitroDial(context.Background(), "tcp", targetAddr)
-		if err != nil {
-			log.Printf("[ERR] Failed to dial TCP %s: %v", targetAddr, err)
+	case "direct-tcpip":
+		type fwdData struct {
+			DestAddr string
+			DestPort uint32
+			SrcAddr  string
+			SrcPort  uint32
+		}
+		var d fwdData
+		if err := ssh.Unmarshal(newChan.ExtraData(), &d); err != nil {
+			newChan.Reject(ssh.Prohibited, fmt.Sprintf("bad data: %v", err))
 			return
 		}
-		defer dest.Close()
-		if tcpConn, ok := dest.(*net.TCPConn); ok {
+		dest := net.JoinHostPort(d.DestAddr, fmt.Sprintf("%d", d.DestPort))
+		log.Printf("[SSH] direct-tcpip %s -> %s", conn.RemoteAddr(), dest)
+
+		// Dashboard tracking (mirrors the old VLESS telemetry path).
+		if d.DestAddr != "" {
+			if isVideoDomain(d.DestAddr) {
+				v, _ := cdnAccess.LoadOrStore(d.DestAddr, new(int64))
+				atomic.AddInt64(v.(*int64), 1)
+			}
+			v, _ := activeDests.LoadOrStore(dest, new(int64))
+			atomic.AddInt64(v.(*int64), 1)
+		}
+		var decCount func()
+		if d.DestAddr != "" {
+			decCount = func() {
+				if v, ok := activeDests.Load(dest); ok {
+					atomic.AddInt64(v.(*int64), -1)
+				}
+			}
+		}
+		defer func() {
+			if decCount != nil {
+				decCount()
+			}
+		}()
+
+		remote, err := nitroDial(context.Background(), "tcp", dest)
+		if err != nil {
+			log.Printf("[ERR] dial TCP %s: %v", dest, err)
+			newChan.Reject(ssh.Prohibited, fmt.Sprintf("dial failed: %v", err))
+			return
+		}
+		defer remote.Close()
+		if tcpConn, ok := remote.(*net.TCPConn); ok {
 			tcpConn.SetNoDelay(true)
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetReadBuffer(512 * 1024)
 			tcpConn.SetWriteBuffer(512 * 1024)
 		}
-		destUp := &countingWriter{w: dest, count: &netBytesUp}
-		destDown := &countingWriter{w: wsAdapter, count: &netBytesDown}
+		ch, _, err := newChan.Accept()
+		if err != nil {
+			remote.Close()
+			return
+		}
+		defer ch.Close()
+
+		// up = client→remote, down = remote→client.
+		destUp := &countingWriter{w: remote, count: &netBytesUp}
+		destDown := &countingWriter{w: ch, count: &netBytesDown}
 		errc := make(chan error, 2)
 		go func() {
 			bufPtr := copyBufferPool.Get().(*[]byte)
 			defer copyBufferPool.Put(bufPtr)
-			_, err := io.CopyBuffer(destUp, wsAdapter, *bufPtr)
-			if tcpConn, ok := dest.(*net.TCPConn); ok {
+			_, err := io.CopyBuffer(destUp, ch, *bufPtr)
+			if tcpConn, ok := remote.(*net.TCPConn); ok {
 				tcpConn.CloseWrite()
 			}
 			errc <- err
@@ -466,57 +427,112 @@ func handleVLESS(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			bufPtr := copyBufferPool.Get().(*[]byte)
 			defer copyBufferPool.Put(bufPtr)
-			_, err := io.CopyBuffer(destDown, dest, *bufPtr)
-			conn.Close()
+			_, err := io.CopyBuffer(destDown, remote, *bufPtr)
+			ch.Close()
 			errc <- err
 		}()
 		<-errc
-	} else if cmd == 2 {
-		dest, err := net.DialTimeout("udp", targetAddr, 10*time.Second)
-		if err != nil {
-			log.Printf("[ERR] Failed to dial UDP %s: %v", targetAddr, err)
-			return
+
+	default:
+		newChan.Reject(ssh.UnknownChannelType, "unsupported channel type")
+	}
+}
+
+var (
+	embedSSHOnce   sync.Once
+	embedSSHConfig *ssh.ServerConfig
+)
+
+// getSSHServerConfig builds the SSH server config: password auth against
+// -ssh-user/-ssh-pass, host key from -ssh-host-key or a generated ed25519 key.
+func getSSHServerConfig() *ssh.ServerConfig {
+	embedSSHOnce.Do(func() {
+		config := &ssh.ServerConfig{
+			PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+				if c.User() == *sshUserFlag && string(pass) == *sshPassFlag {
+					return nil, nil
+				}
+				return nil, fmt.Errorf("auth failed for %q", c.User())
+			},
 		}
-		defer dest.Close()
-		errc := make(chan error, 2)
-		go func() {
-			bufPtr := bufferPool.Get().(*[]byte)
-			defer bufferPool.Put(bufPtr)
-			buf := *bufPtr
-			for {
-				n, err := dest.Read(buf)
-				if err != nil {
-					errc <- err
+		if *sshHostKey != "" {
+			if data, err := os.ReadFile(*sshHostKey); err == nil {
+				if key, err := ssh.ParsePrivateKey(data); err == nil {
+					config.AddHostKey(key)
+					log.Printf("[SSH] Loaded host key from %s", *sshHostKey)
+					embedSSHConfig = config
 					return
+				} else {
+					log.Printf("[SSH] Failed to parse host key: %v", err)
 				}
-				atomic.AddInt64(&netBytesDown, int64(n))
-				fullMsg := make([]byte, 2+n)
-				fullMsg[0] = byte(n >> 8)
-				fullMsg[1] = byte(n & 0xff)
-				copy(fullMsg[2:], buf[:n])
-				wsAdapter.Write(fullMsg)
+			} else {
+				log.Printf("[SSH] Failed to read host key file: %v", err)
 			}
-		}()
-		go func() {
-			lb := make([]byte, 2)
-			for {
-				if _, err := io.ReadFull(wsAdapter, lb); err != nil {
-					conn.Close()
-					errc <- err
-					return
-				}
-				n := int(lb[0])<<8 | int(lb[1])
-				pkt := make([]byte, n)
-				if _, err := io.ReadFull(wsAdapter, pkt); err != nil {
-					conn.Close()
-					errc <- err
-					return
-				}
-				dest.Write(pkt)
-				atomic.AddInt64(&netBytesUp, int64(n))
-			}
-		}()
-		<-errc
+		}
+		log.Printf("[SSH] Generating ephemeral ed25519 host key...")
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			log.Fatalf("[SSH] Failed to generate host key: %v", err)
+		}
+		signer, err := ssh.NewSignerFromKey(priv)
+		if err != nil {
+			log.Fatalf("[SSH] Failed to create signer: %v", err)
+		}
+		config.AddHostKey(signer)
+		embedSSHConfig = config
+	})
+	return embedSSHConfig
+}
+
+// handleSSHOverWS upgrades the HTTP request to a WebSocket (path-agnostic —
+// NPV clients send arbitrary paths), then runs an SSH server over the WS
+// stream. Header hardening is mandatory: NPV payloads frequently omit
+// Sec-WebSocket-Key/Version and use a non-GET method, which gorilla rejects.
+func handleSSHOverWS(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt64(&netTotalReqs, 1)
+
+	if r.Header.Get("Sec-WebSocket-Key") == "" {
+		k := make([]byte, 16)
+		rand.Read(k)
+		r.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(k))
+	}
+	if r.Header.Get("Sec-WebSocket-Version") == "" {
+		r.Header.Set("Sec-WebSocket-Version", "13")
+	}
+	origMethod := r.Method
+	r.Method = "GET"
+	conn, err := netUpgrader.Upgrade(w, r, nil)
+	r.Method = origMethod
+	if err != nil {
+		log.Printf("[WS] Upgrade failed: %v", err)
+		return
+	}
+	atomic.AddInt64(&netActiveConns, 1)
+	defer func() {
+		atomic.AddInt64(&netActiveConns, -1)
+		conn.Close()
+	}()
+
+	wsAdapter := &wsConnAdapter{Conn: conn}
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	conn.SetPingHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		return conn.WriteControl(websocket.PongMessage, []byte{}, time.Now().Add(5*time.Second))
+	})
+
+	sshConn, chans, reqs, err := ssh.NewServerConn(wsAdapter, getSSHServerConfig())
+	if err != nil {
+		log.Printf("[SSH] handshake failed from %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+	// Clear the pre-handshake deadline so long KEX/transfer sessions are not cut.
+	wsAdapter.SetReadDeadline(time.Time{})
+	defer sshConn.Close()
+	log.Printf("[SSH] %s connected as %q", sshConn.RemoteAddr(), sshConn.User())
+
+	go ssh.DiscardRequests(reqs)
+	for newChan := range chans {
+		go handleSSHChannel(sshConn, newChan)
 	}
 }
 
@@ -856,16 +872,6 @@ func main() {
 	netStartTime = time.Now()
 	go broadcastStats()
 
-	if *pathFlag != "/" {
-		http.HandleFunc(*pathFlag, func(w http.ResponseWriter, r *http.Request) {
-			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-				handleVLESS(w, r)
-				return
-			}
-			serveDashboard(w, r)
-		})
-	}
-
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := netUpgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -876,28 +882,23 @@ func main() {
 		netClientsMu.Unlock()
 	})
 
+	// Single path-agnostic handler. NPV/NetMod clients upgrade to WebSocket
+	// on arbitrary paths, so we key on the Upgrade header, not the path.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Host != "" {
+		if r.Method == http.MethodConnect || r.URL.IsAbs() {
 			handleProxy(w, r)
+			return
+		}
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			handleSSHOverWS(w, r)
 			return
 		}
 		if r.URL.Path == *pacFlag {
 			servePAC(w, r)
 			return
 		}
-		if r.URL.Path == *pathFlag {
-			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-				handleVLESS(w, r)
-				return
-			}
-		}
 		serveDashboard(w, r)
 	})
-
-	if *pacFlag != "/" {
-		http.HandleFunc(*pacFlag, servePAC)
-	}
-	http.HandleFunc("/proxy", handleProxy)
 
 	var tlsConfig *tls.Config
 	if *tlsFlag {
@@ -944,13 +945,17 @@ func main() {
 	}
 
 	log.Printf("========================================")
-	log.Printf("       NetNinja VLESS VPN Server        ")
-	log.Printf("             SNI Multiplexer            ")
+	log.Printf("     NetNinja SSH-over-WS Server        ")
+	log.Printf("        NOPRO / NPV Tunnel ready        ")
 	log.Printf("             [NITRO-ULTRA]             ")
 	log.Printf("========================================")
 	log.Printf("  Port     : %s", *portFlag)
-	log.Printf("  UUID     : %s", *uuidFlag)
-	log.Printf("  Path     : %s", *pathFlag)
+	log.Printf("  SSH User : %s", *sshUserFlag)
+	if *sshHostKey != "" {
+		log.Printf("  Host Key : %s", *sshHostKey)
+	} else {
+		log.Printf("  Host Key : (ephemeral ed25519)")
+	}
 	log.Printf("  Web SNI  : %s", *webSNIFlag)
 	log.Printf("  Web Port : %s", *webPortFlag)
 	log.Printf("  TLS      : %v", *tlsFlag)
@@ -1356,7 +1361,7 @@ h1 .dot{width:10px;height:10px;border-radius:50%;background:#0f0;display:inline-
 
 	<div class="footer">
 		<div class="ws" id="ws_status">connecting_ws...</div>
-		vless_core // sni_mux // nitro-engine
+		ssh_ws_core // sni_mux // nitro-engine
 	</div>
 </div>
 
