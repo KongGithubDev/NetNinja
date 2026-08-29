@@ -2,6 +2,8 @@
 
 NetNinja is a lightweight, high-performance networking toolkit written in Go. Its active component is an HTTP/HTTPS forward proxy with Cisco Umbrella bypass, DNS caching, quotas, ad-blocking, and Cloudflare-protected-site auto-hop egress. It also bundles a retired VLESS VPN/SNI-multiplexing tunnel stack under `legacy/`.
 
+<img src="preview.png" alt="NetNinja preview" width="720">
+
 ## Components
 
 ### net_server (VLESS VPN + SNI Multiplexer) — LEGACY

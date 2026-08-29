@@ -3427,6 +3427,17 @@ a.u:hover{color:#fff;text-decoration:underline}
 .filters form{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
 .filters label{color:#555;font-size:10px;text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:4px}
 .filters input,.filters select{background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:6px 10px;border-radius:3px;font:inherit}
+.charts{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px}
+.chart-card{background:#111;border:1px solid #222;border-radius:6px;padding:14px;flex:1;min-width:290px;box-sizing:border-box}
+.chart-card .ck{color:#555;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+.hbar{display:flex;align-items:center;gap:8px;margin:5px 0;font-size:11px}
+.hbar .hl{color:#7af;width:130px;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hbar .htrack{flex:1;background:#191919;border:1px solid #222;height:12px;border-radius:3px;overflow:hidden}
+.hbar .hfill{height:12px;border-radius:3px}
+.hbar .hv{color:#eee;width:70px;text-align:right;font-size:11px}
+.legend{margin-top:10px}
+.legend .li{display:flex;align-items:center;gap:8px;color:#bbb;font-size:11px;margin:4px 0}
+.legend .dot{width:10px;height:10px;border-radius:2px;display:inline-block}
 .pager{display:flex;gap:12px;align-items:center;margin:14px 0}
 .pager a{color:#7af;text-decoration:none}
 .pager a:hover{color:#fff}
@@ -3487,6 +3498,179 @@ func fmtDur(ms int64) string {
 		return fmt.Sprintf("%dms", ms)
 	}
 	return fmt.Sprintf("%.1fs", float64(ms)/1000)
+}
+
+// hbarRow renders one horizontal-bar row (label / track / value) — reused by the
+// admin charts for top hosts and per-user usage.
+func hbarRow(label string, val, max int64, color string) string {
+	pct := 0
+	if max > 0 {
+		pct = int(val * 100 / max)
+	}
+	if pct < 2 && val > 0 {
+		pct = 2
+	}
+	return fmt.Sprintf(`<div class="hbar"><span class="hl" title="%s">%s</span><div class="htrack"><div class="hfill" style="width:%d%%;background:%s"></div></div><span class="hv">%s</span></div>`,
+		html.EscapeString(label), html.EscapeString(label), pct, color,
+		html.EscapeString(fmtSize(val)))
+}
+
+// bwSparkSVG renders the rolling bandwidth history as an SVG area/line chart.
+func bwSparkSVG(data []int64, w, h int) string {
+	if len(data) == 0 {
+		return `<svg viewBox="0 0 ` + fmt.Sprintf("%d %d", w, h) + `" width="100%" height="68" style="background:#0d0d0d"><text x="8" y="30" fill="#555" font-size="11" font-family="Courier New,monospace">-- no data --</text></svg>`
+	}
+	max := int64(1)
+	for _, v := range data {
+		if v > max {
+			max = v
+		}
+	}
+	pts := ""
+	area := ""
+	for i, v := range data {
+		x := 2 + (float64(w-4) * float64(i) / float64(len(data)-1))
+		y := float64(h-2) - (float64(v)/float64(max))*float64(h-6)
+		pts += fmt.Sprintf("%.1f,%.1f ", x, y)
+		if i == len(data)-1 {
+			area += fmt.Sprintf("%.1f,%.1f ", x, float64(h-1))
+		}
+	}
+	area = pts + area
+	return `<svg viewBox="0 0 ` + fmt.Sprintf("%d %d", w, h) + `" width="100%" height="68" style="background:#0d0d0d" preserveAspectRatio="none">
+<defs><linearGradient id="bwg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0f0" stop-opacity="0.35"/><stop offset="100%" stop-color="#0f0" stop-opacity="0.02"/></linearGradient></defs>
+<polygon points="` + area + `" fill="url(#bwg)"/>
+<polyline points="` + pts + `" fill="none" stroke="#0f0" stroke-width="1.4"/>
+</svg>`
+}
+
+// adminCharts renders the admin dashboard charts section from live stats:
+// bandwidth history, top hosts by bytes, per-user usage, DNS hit/miss/doh, traffic mix.
+func adminCharts(snaps []userSnap) string {
+	// bandwidth history
+	bwHistoryMu.Lock()
+	bw := make([]int64, len(bwHistory))
+	copy(bw, bwHistory)
+	bwHistoryMu.Unlock()
+
+	// top hosts by bytes (biggest first)
+	type hrow struct{ host string; bytes int64 }
+	var hosts []hrow
+	hostStats.Range(func(k, v interface{}) bool {
+		st := v.(*hostStat)
+		st.mu.Lock()
+		hosts = append(hosts, hrow{k.(string), st.bytes})
+		st.mu.Unlock()
+		return true
+	})
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].bytes > hosts[j].bytes })
+	if len(hosts) > 8 {
+		hosts = hosts[:8]
+	}
+	hmax := int64(1)
+	for _, h := range hosts {
+		if h.bytes > hmax {
+			hmax = h.bytes
+		}
+	}
+	hostRows := ``
+	if len(hosts) == 0 {
+		hostRows = `<div class="dim" style="padding:8px 0">-- no traffic --</div>`
+	}
+	for _, h := range hosts {
+		hostRows += hbarRow(h.host, h.bytes, hmax, "#7af")
+	}
+
+	// per-user usage
+	var us []userSnap
+	for _, s := range snaps {
+		if s.bytesDown+s.bytesUp > 0 {
+			us = append(us, s)
+		}
+	}
+	sort.Slice(us, func(i, j int) bool { return us[i].bytesDown+us[i].bytesUp > us[j].bytesDown+us[j].bytesUp })
+	if len(us) > 8 {
+		us = us[:8]
+	}
+	umax := int64(1)
+	for _, s := range us {
+		if s.bytesDown+s.bytesUp > umax {
+			umax = s.bytesDown + s.bytesUp
+		}
+	}
+	userRows := ``
+	if len(us) == 0 {
+		userRows = `<div class="dim" style="padding:8px 0">-- no usage --</div>`
+	}
+	for _, s := range us {
+		userRows += hbarRow(s.name, s.bytesDown+s.bytesUp, umax, "#0f0")
+	}
+
+	// DNS hit / miss / DoH donut + traffic up/down
+	dnsH := atomic.LoadInt64(&dnsHits)
+	dnsM := atomic.LoadInt64(&dnsMisses)
+	dnsD := atomic.LoadInt64(&dohCalls)
+	dnsTotal := dnsH + dnsM + dnsD
+	if dnsTotal == 0 {
+		dnsTotal = 1
+	}
+	const circ = 251.33 // 2*pi*r for r=40
+	var donut strings.Builder
+	off := float64(0)
+	for _, segB := range []struct {
+		v     int64
+		color string
+	}{{dnsH, "#0f0"}, {dnsM, "#ffa500"}, {dnsD, "#7af"}} {
+		frac := float64(segB.v) / float64(dnsTotal)
+		dash := frac * circ
+		donut.WriteString(fmt.Sprintf(`<circle cx="50" cy="50" r="40" fill="none" stroke="%s" stroke-width="16" stroke-dasharray="%.1f %.1f" stroke-dashoffset="%.1f" transform="rotate(-90 50 50)"/>`, segB.color, dash, circ-dash, off))
+		off -= dash
+	}
+
+	up := atomic.LoadInt64(&totalBytesUp)
+	down := atomic.LoadInt64(&totalBytesDown)
+	dmix := int64(0)
+	if up+down > 0 {
+		dmix = int64(float64(down) / float64(up+down) * 100)
+	}
+
+	return fmt.Sprintf(`
+	<div class="charts">
+		<div class="chart-card">
+			<div class="ck">realtime_bandwidth (last 60s)</div>
+			%s
+		</div>
+		<div class="chart-card">
+			<div class="ck">top_hosts_by_bytes</div>
+			%s
+		</div>
+		<div class="chart-card">
+			<div class="ck">per_user_usage (up+down)</div>
+			%s
+		</div>
+		<div class="chart-card">
+			<div class="ck">dns_resolution</div>
+			<svg viewBox="0 0 100 100" width="120" height="120">%s<text x="50" y="55" text-anchor="middle" fill="#eee" font-size="16" font-family="Courier New,monospace">%s</text><text x="50" y="70" text-anchor="middle" fill="#555" font-size="9" font-family="Courier New,monospace">total</text></svg>
+			<div class="legend">
+				<div class="li"><span class="dot" style="background:#0f0"></span>cache_hit %s</div>
+				<div class="li"><span class="dot" style="background:#ffa500"></span>cache_miss %s</div>
+				<div class="li"><span class="dot" style="background:#7af"></span>doh_calls %s</div>
+			</div>
+		</div>
+		<div class="chart-card">
+			<div class="ck">traffic_mix (down share of up+down)</div>
+			<div class="hbar"><span class="hl">bytes_down</span><div class="htrack"><div class="hfill" style="width:%d%%;background:#7af"></div></div><span class="hv">%d%%</span></div>
+			<div class="hbar"><span class="hl">bytes_up</span><div class="htrack"><div class="hfill" style="width:%d%%;background:#888"></div></div><span class="hv">%d%%</span></div>
+			<div class="dim" style="margin-top:8px">down %s · up %s</div>
+		</div>
+	</div>`,
+		bwSparkSVG(bw, 600, 70),
+		hostRows,
+		userRows,
+		donut.String(), fmt.Sprintf("%d", dnsTotal),
+		html.EscapeString(fmtSize(dnsH)), html.EscapeString(fmtSize(dnsM)), html.EscapeString(fmtSize(dnsD)),
+		dmix, dmix, 100-dmix, 100-dmix,
+		html.EscapeString(fmtSize(down)), html.EscapeString(fmtSize(up)))
 }
 
 func serveAdmin(w http.ResponseWriter, r *http.Request) {
@@ -3666,6 +3850,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 	%s
 	%s
 	%s
+	%s
 
 	<table>
 	<tr><th>user</th><th>active</th><th>bytes_up</th><th>bytes_down</th><th>conns</th><th>first_seen</th><th>last_seen</th><th>devices</th><th>quota</th><th></th></tr>
@@ -3685,7 +3870,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 		</form>
 	</div>
 `, len(snaps), fmtMB(totalUp), fmtMB(totalDown), totalConns, totalDev, logRows,
-		blCard, gblCard, msgHTML, userRows)
+		adminCharts(snaps), blCard, gblCard, msgHTML, userRows)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
