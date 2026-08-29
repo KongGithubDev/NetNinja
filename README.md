@@ -1,10 +1,13 @@
 # NetNinja
 
-NetNinja is a lightweight, high-performance networking toolkit written in Go. It provides a VLESS VPN server with SNI multiplexing, an HTTP/HTTPS forward proxy with Cisco Umbrella bypass, and a suite of deployment and benchmarking tools.
+NetNinja is a lightweight, high-performance networking toolkit written in Go. Its active component is an HTTP/HTTPS forward proxy with Cisco Umbrella bypass, DNS caching, quotas, ad-blocking, and Cloudflare-protected-site auto-hop egress. It also bundles a retired VLESS VPN/SNI-multiplexing tunnel stack under `legacy/`.
 
 ## Components
 
-### net_server (VLESS VPN + SNI Multiplexer)
+### net_server (VLESS VPN + SNI Multiplexer) — LEGACY
+
+> **Retired.** Code moved to `legacy/` and excluded from the root `go build`. Retained for reference
+> and historical test vectors (`.npvt` payloads). See `legacy/` directory.
 
 A VLESS server with built-in SNI multiplexer that listens on a single TCP/UDP port (default 443) and transparently shares it with an existing web server. It inspects incoming TLS ClientHello packets to route traffic:
 
@@ -75,10 +78,11 @@ Each account can decide to stop using the proxy (devices then connect to the int
 | ADBLOCK_REFRESH_HOURS | 24 | How often to re-fetch ADBLOCK_URL |
 | PAC_DIRECT_DOMAINS | (none) | Comma-separated domains served `DIRECT` in /proxy.pac — the device skips the proxy for those hosts (useful when a site's Cloudflare blocks the datacenter/proxy IP, e.g. `animeruka.com`) |
 | HOP_DOMAINS | (none) | Comma-separated domains whose TCP connections are dialed out through a SOCKS5 server (`HOP_SOCKS5`, no-auth) instead of the proxy's own IP. DNS is still resolved at the proxy (bypasses Cisco), only the connection leaves from the hop's IP — for Cloudflare zones that block the Azure datacenter IP or geo-lock to Thailand |
+| HOP_AUTODETECT | 1 (on) | Auto-detect: any hostname that Cloudflare answers **403 / "Just a moment"** when tunnelled from the proxy's own IP is probed once on first use and then routed through `HOP_SOCKS5` automatically — no per-domain config needed. Detected hosts persist in SQLite (`hop_auto`) and are re-probed at most daily; set `0` to disable. If the hop is unreachable the proxy degrades to direct instead of failing |
 
 Without ADBLOCK_URL/PATH the proxy uses a small built-in list. Aggressive base ad-network domains (`*.doubleclick.net`, `*.googlesyndication.com`, …) are always merged into whatever list is loaded. Blocking walks the hostname + every parent label (a blocked domain covers its subdomains) with an `@@` allowlist honored first. Reload anytime at `/admin` → "โหลด blocklist ใหม่".
 
-**SQLite stores** (`proxy_cache.db`, WAL mode): `proxy_users`, `user_settings` (quota + suspension), `user_hosts` (per-user per-host totals, flushed every 5s and reloaded on boot), `conn_logs` (append-only audit), `admin_logs`, `domain_rules`, `dns_records`.
+**SQLite stores** (`proxy_cache.db`, WAL mode): `proxy_users`, `user_settings` (quota + suspension), `user_hosts` (per-user per-host totals, flushed every 5s and reloaded on boot), `conn_logs` (append-only audit), `admin_logs`, `domain_rules`, `dns_records`, `hop_auto` (auto-detected Cloudflare-blocked hosts).
 
 ---
 
@@ -122,25 +126,23 @@ go build -pgo=default.pgo -o net_server.exe net_server.go
 
 ### Prerequisites
 
-- Go 1.21 or later
+- Go 1.25 or later
 
 ### Build
 
 ```powershell
-# Build all components
-.\build.ps1
+# Build the proxy (main component)
+go build -o dist\proxy.exe .
 
-# Or build individually
-go build -pgo=default.pgo -o net_server.exe net_server.go
-go build -o proxy.exe ansi_other.go proxy.go
-go build -o load-tester.exe load-tester.go
+# Linux build (Azure VM deployment)
+go build -o dist\proxy_linux .
 ```
 
 ---
 
 ## Usage
 
-### 1. VPN Edge Server (net_server)
+### 1. VPN Edge Server (net_server) — LEGACY
 
 Runs on a VPS as the tunnel exit node.
 
@@ -259,24 +261,47 @@ Benchmarks measure: HTTP proxy throughput (1/10/50 concurrency), CONNECT tunnels
 
 ```
 NetNinja/
-├── net_server.go          # VLESS VPN + SNI Multiplexer (main component)
-├── proxy.go               # HTTP/HTTPS Forward Proxy (+ admin console, quotas, ad-block)
-├── ansi_other.go          # Proxy color helpers / supporting code
-├── build.ps1              # Build script with PGO support
-├── deploy.ps1             # One-command deployment orchestrator
-├── install-service.ps1    # Windows service installer (NSSM)
-├── configure-firewall.ps1 # Firewall rule configuration
-├── run-loadtest.ps1       # Load test orchestrator
-├── load-tester.go         # Benchmark program
-├── collect-pgo.ps1        # PGO profile collection
-├── profiling-load-gen.go  # PGO workload generator
-├── run-netserver.bat      # Quick launcher for net_server
-├── run-proxy.bat          # Quick launcher for proxy
-├── default.pgo            # PGO profile (auto-detected by Go compiler)
-├── DEPLOYMENT.md          # Full deployment checklist
-├── BENCHMARKS.md          # Benchmark interpretation guide
-└── xray-server-config.json # Xray/V2Ray configuration reference
+├── proxy.go               # Main binary: HTTP/HTTPS Forward Proxy (PAC, admin console,
+│                          #   DNS cache, quotas, ad-block, Cloudflare auto-hop egress)
+├── ansi_other.go          # ANSI color helpers (non-Windows)
+├── ansi_windows.go        # ANSI color helpers (Windows)
+├── go.mod / go.sum        # Go module (module netninja-proxy)
+├── Dockerfile             # Container build (Fly.io / generic)
+├── fly.toml               # Fly.io deployment config
+├── README.md
+├── LICENSE
+├── dist/                  # Prebuilt Linux binaries (gitignored, build via go build)
+└── legacy/                # Retired NPVT tunnel stack (kept for reference)
+    ├── NPVTUNNEL.py       #   Old protocol client (base64/gzip/pickle payloads)
+    ├── npvt_encoder.py    #   Payload encoder
+    ├── npvt_modify.py     #   Payload modifier
+    ├── npvt_tool.py       #   Payload inspection tool
+    ├── net_server.go      #   Old VLESS VPN + SNI multiplexer
+    ├── ws-tunnel.go       #   WebSocket tunnel helper
+    ├── npvt/              #   Test/sample .npvt payload vectors
+    ├── run.sh             #   Old bore-tunnel run script
+    ├── run-*.bat          #   Old Windows launchers
+    ├── admin.html         #   Old admin console snapshot
+    └── d.html             #   Old dashboard snapshot
 ```
+
+### Building
+
+The root contains only `proxy.go` (package main), so a plain `go build` works:
+
+```bash
+# Linux (deployed to Azure VM)
+go build -o dist/proxy_linux .
+
+# Windows
+go build -o dist/proxy_linux.exe .
+
+# Docker
+docker build -t netninja-proxy .
+```
+
+The `legacy/` Go files (`net_server.go`, `ws-tunnel.go`) are not part of the root module build
+and must be compiled individually if ever needed, e.g. `go build -o ws-tunnel legacy/ws-tunnel.go`.
 
 ---
 
