@@ -1301,32 +1301,30 @@ func autoClassify(host string) bool {
 		hopProbeMu.Unlock()
 		return r.blocked
 	}
-	if ch, dup := hopProbeIn[h]; dup {
+	if _, dup := hopProbeIn[h]; dup {
 		hopProbeMu.Unlock()
-		select {
-		case <-ch:
-			return hopAutoMatch(h)
-		case <-time.After(3500 * time.Millisecond):
-			return false
-		}
+		return false
 	}
 	ch := make(chan bool, 1)
 	hopProbeIn[h] = ch
 	hopProbeMu.Unlock()
 
-	blocked := cfBlockedDirect(h, 3000*time.Millisecond)
+	go func() {
+		blocked := cfBlockedDirect(h, 3000*time.Millisecond)
 
-	hopProbeMu.Lock()
-	hopProbeRes[h] = hopProbeResult{t: time.Now(), blocked: blocked}
-	delete(hopProbeIn, h)
-	hopProbeMu.Unlock()
-	ch <- blocked
+		hopProbeMu.Lock()
+		hopProbeRes[h] = hopProbeResult{t: time.Now(), blocked: blocked}
+		delete(hopProbeIn, h)
+		hopProbeMu.Unlock()
+		ch <- blocked
 
-	if blocked {
-		log.Printf("%s[HOP][auto]%s %s blocked via Azure — added to hop list", colorYellow, colorReset, h)
-		hopAutoAdd(h)
-	}
-	return blocked
+		if blocked {
+			log.Printf("%s[HOP][auto]%s %s blocked via Azure — added to hop list", colorYellow, colorReset, h)
+			hopAutoAdd(h)
+		}
+	}()
+
+	return false
 }
 
 func hopAutoMatch(h string) bool {
@@ -2634,8 +2632,8 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(pac))
 
 	clientIP := getClientIP(r)
-	log.Printf("%s[PAC]%s Served to %s",
-		colorCyan, colorReset, clientIP)
+	log.Printf("%s[PAC]%s Served to %s ua=%s",
+		colorCyan, colorReset, clientIP, r.Header.Get("User-Agent"))
 }
 
 func serveLogs(w http.ResponseWriter, r *http.Request) {
@@ -2677,6 +2675,10 @@ func serveLogs(w http.ResponseWriter, r *http.Request) {
 func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIP := getClientIP(r)
 	start := time.Now()
+
+	// Debug: log all incoming HTTP requests for tracing
+	log.Printf("%s[HTTP-REQ]%s %s %s ← %s ua=%s",
+		colorGreen, colorReset, r.Method, r.URL, clientIP, r.Header.Get("User-Agent"))
 
 	originalHost := r.URL.Host
 	unwrappedHost := unwrapCiscoDomain(originalHost)
@@ -2835,9 +2837,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		trackID = clientIP
 	}
 
-	log.Printf("%s[TLS]%s CONNECT %s ← %s",
+	log.Printf("%s[TLS]%s CONNECT %s ← %s ua=%s",
 		colorCyan, colorReset,
-		host, clientIP)
+		host, clientIP, r.Header.Get("User-Agent"))
 
 	atomic.AddInt64(&activeConns, 1)
 	defer atomic.AddInt64(&activeConns, -1)
@@ -2878,7 +2880,17 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&errCount, 1)
 		log.Printf("%s[BLOCKED]%s %s (ip=%s) proxy disabled — refused CONNECT %s", colorYellow, colorReset, tunnelUser, clientIP, host)
 		pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: hostname, status: "proxy_off", durMs: time.Since(tunnelStart).Milliseconds()})
-		http.Error(w, "Proxy Disabled for this account (connect directly)", http.StatusForbidden)
+		// Same as ad-block: reply 200 + close to avoid iOS bypassing proxy
+		hijack, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+		conn, _, err := hijack.Hijack()
+		if err != nil {
+			return
+		}
+		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		conn.Close()
 		return
 	}
 
@@ -2887,7 +2899,22 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&adBlocked, 1)
 		log.Printf("%s[AD-BLOCK]%s refused CONNECT %s ← %s", colorRed, colorReset, hostname, clientIP)
 		pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: hostname, status: "ad_block", durMs: time.Since(tunnelStart).Milliseconds()})
-		http.Error(w, "Forbidden (Ad-Blocked by NetNinja)", http.StatusForbidden)
+		// Reply 200 then close: iOS/macOS treat CONNECT403 as "proxy broken"
+		// and permanently bypass the proxy. A 200 + close is treated as a
+		// normal connection reset by the remote — the app retries via proxy.
+		hijack, ok := w.(http.Hijacker)
+		if !ok {
+			log.Printf("%s[AD-BLOCK-DBG]%s hijack not supported for %s", colorRed, colorReset, hostname)
+			return
+		}
+		conn, _, err := hijack.Hijack()
+		if err != nil {
+			log.Printf("%s[AD-BLOCK-DBG]%s hijack failed for %s: %v", colorRed, colorReset, hostname, err)
+			return
+		}
+		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		log.Printf("%s[AD-BLOCK-DBG]%s sent fake200+close for %s ← %s", colorYellow, colorReset, hostname, clientIP)
+		conn.Close()
 		return
 	}
 
