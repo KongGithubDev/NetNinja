@@ -25,5 +25,7 @@ proxy_linux*
 
 # Runtime data
 proxy_cache.db
+proxy_cache.db-shm
+proxy_cache.db-wal
 __pycache__/
 *.pyc

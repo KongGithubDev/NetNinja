@@ -73,7 +73,7 @@ Each account can decide to stop using the proxy (devices then connect to the int
 | PORT | 8080 | Listen port |
 | PROXY_ADDR | request Host | Proxy address embedded in the PAC / welcome flows |
 | LOG_RETENTION_DAYS | 30 | How long `conn_logs` rows are kept (admin_logs kept 90 days, per-user totals forever) |
-| TUNNEL_IDLE_SECONDS | 90 | Close established CONNECT tunnels idle this long (clean FIN before mobile NATs/Azure SLB silently drop them) |
+| TUNNEL_IDLE_SECONDS | 180 | Reap established CONNECT tunnels that have had NO traffic (both directions) this long — clean FIN before mobile NATs/Azure SLB can silently drop them; active streams (video) are never touched |
 | PROXY_DEBUG | (off) | Verbose per-tunnel idle-watchdog logging |
 | ADBLOCK_URL | (off) | Fetch an external blocklist (adblock / hosts / dnsmasq / plain-domain) on boot then refresh every ADBLOCK_REFRESH_HOURS — e.g. HaGeZi `https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/multi.txt` (~190k domains) |
 | ADBLOCK_PATH | (off) | Local blocklist file — loaded once at boot; takes precedence over ADBLOCK_URL |
