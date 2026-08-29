@@ -165,8 +165,8 @@ func cachedResolve(ctx context.Context, host string) (string, error) {
 		}
 	}
 
-	// cache results (5 min) - Nitro: Async DB write
-	exp := time.Now().Add(5 * time.Minute)
+	// cache results (30 min)
+	exp := time.Now().Add(30 * time.Minute)
 	dnsCache.Store(host, dnsEntry{ip: ip, expiry: exp})
 	go func() {
 		_, _ = db.Exec("INSERT OR REPLACE INTO dns_records (host, ip, expiry) VALUES (?, ?, ?)", host, ip, exp)
@@ -232,11 +232,8 @@ func hyperResolve(ctx context.Context, host string) (string, error) {
 		}
 	}
 	if bestIP != "" {
-		exp := time.Now().Add(5 * time.Minute)
+		exp := time.Now().Add(30 * time.Minute)
 		dnsCache.Store(host, dnsEntry{ip: bestIP, expiry: exp})
-		go func() {
-			_, _ = db.Exec("INSERT OR REPLACE INTO dns_records (host, ip, expiry) VALUES (?, ?, ?)", host, bestIP, exp)
-		}()
 		return bestIP, nil
 	}
 	return "", lastErr
@@ -1078,11 +1075,18 @@ type liveTunnel struct {
 var liveTunnelSeq atomic.Int64
 var liveTunnels sync.Map // id -> *liveTunnel
 
+var copyBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 256*1024)
+		return &buf
+	},
+}
+
 // startTunnelReaper closes CONNECT tunnels that have had no traffic in either
 // direction for TUNNEL_IDLE_SECONDS (default 180). Active streams (video etc.)
 // constantly mark activity so they are never touched.
 func startTunnelReaper() {
-	secs := 180
+	secs := 600
 	if v := os.Getenv("TUNNEL_IDLE_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			secs = n
@@ -1093,6 +1097,7 @@ func startTunnelReaper() {
 	for {
 		time.Sleep(15 * time.Second)
 		now := time.Now()
+		killed := 0
 		liveTunnels.Range(func(k, v interface{}) bool {
 			lt := v.(*liveTunnel)
 			cAge := now.Sub(lt.client.Last())
@@ -1102,6 +1107,10 @@ func startTunnelReaper() {
 					colorYellow, colorReset, lt.host, cAge.Round(time.Second), dAge.Round(time.Second), limit)
 				lt.client.Close()
 				lt.dest.Close()
+				killed++
+				if killed >= 2 {
+					return false
+				}
 			}
 			return true
 		})
@@ -2813,14 +2822,11 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		touchUserHost(u, hName, 0, n, 1)
 	}
 
-	// Nitro: Background logging to avoid blocking the request cleanup
-	go func() {
-		log.Printf("%s[HTTP]%s %s %s → %d %s(%s)%s",
-			colorGreen, colorReset,
-			r.Method, r.URL.Host,
-			resp.StatusCode,
-			colorGray, time.Since(start).Round(time.Millisecond), colorReset)
-	}()
+	log.Printf("%s[HTTP]%s %s %s → %d %s(%s)%s",
+		colorGreen, colorReset,
+		r.Method, r.URL.Host,
+		resp.StatusCode,
+		colorGray, time.Since(start).Round(time.Millisecond), colorReset)
 }
 
 // handleConnect handles HTTPS CONNECT tunneling
@@ -2974,16 +2980,20 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Track active tunnel start time
 	activeTunnels.Store(hostname, time.Now())
 
-	// God-Mode: Pure native performance + KeepAlive
+	// God-Mode: Pure native performance + KeepAlive + large buffers
 	if tc, ok := clientConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetReadBuffer(256 * 1024)
+		tc.SetWriteBuffer(256 * 1024)
 	}
 	if tc, ok := destConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetReadBuffer(256 * 1024)
+		tc.SetWriteBuffer(256 * 1024)
 	}
 
 	log.Printf("%s[TLS]%s %s ↔ %s %s(tunnel established)%s",
@@ -3012,7 +3022,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(destAct, clientAct)
+		buf := copyBufPool.Get().(*[]byte)
+		defer copyBufPool.Put(buf)
+		n, err := io.CopyBuffer(destAct, clientAct, *buf)
 		atomic.AddInt64(&totalBytesUp, n)
 		tUp += n
 		if hs != nil {
@@ -3031,7 +3043,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		n, err := io.Copy(clientAct, destAct)
+		buf := copyBufPool.Get().(*[]byte)
+		defer copyBufPool.Put(buf)
+		n, err := io.CopyBuffer(clientAct, destAct, *buf)
 		atomic.AddInt64(&totalBytesDown, n)
 		tDown += n
 		if hs != nil {
