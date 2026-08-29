@@ -624,9 +624,19 @@ func trackUserDevice(user, clientIP, ua string) {
 	}
 	v, _ := userStats.LoadOrStore(user, &userStat{devices: map[string]bool{}})
 	st := v.(*userStat)
-	key := clientIP
-	if ua != "" {
-		key = clientIP + " | " + ua
+	var key string
+	if user == clientIP {
+		// No-auth mode: user IS the IP, show just the UA
+		if ua != "" {
+			key = ua
+		} else {
+			key = clientIP
+		}
+	} else {
+		key = clientIP
+		if ua != "" {
+			key = clientIP + " | " + ua
+		}
 	}
 	st.mu.Lock()
 	st.devices[key] = true
@@ -1903,18 +1913,27 @@ startRetentionPruner()
 		ports = []string{"8080"}
 	}
 
-	if pu := os.Getenv("PROXY_USERS"); pu != "" {
-		for _, up := range strings.Split(pu, ",") {
-			if idx := strings.Index(up, ":"); idx > 0 {
-				proxyUsers[up[:idx]] = up[idx+1:]
-			}
-		}
-		fmt.Printf("Proxy auth enabled for %d user(s)\n", len(proxyUsers))
-	}
-
 	if v := os.Getenv("PROXY_AUTH_ENABLED"); v == "0" || v == "false" {
 		proxyAuthEnabled = false
 		fmt.Println("Proxy auth DISABLED (PROXY_AUTH_ENABLED=0)")
+		// Clear stale user data — track by IP only
+		proxyUsers = map[string]string{}
+		userHosts = sync.Map{}
+		userSettings = sync.Map{}
+		userQuotaUsed = sync.Map{}
+	}
+
+	if proxyAuthEnabled {
+		if pu := os.Getenv("PROXY_USERS"); pu != "" {
+			for _, up := range strings.Split(pu, ",") {
+				if idx := strings.Index(up, ":"); idx > 0 {
+					proxyUsers[up[:idx]] = up[idx+1:]
+				}
+			}
+			fmt.Printf("Proxy auth enabled for %d user(s)\n", len(proxyUsers))
+		}
+	} else {
+		fmt.Println("Running in no-auth mode — tracking by client IP")
 	}
 
 	bindAddr := os.Getenv("BIND_ADDR")
@@ -2727,6 +2746,12 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, dashURL, http.StatusFound)
 			return
 		}
+	}
+
+	if u := authedUser(r); u != "" {
+		trackUserDevice(u, clientIP, r.Header.Get("User-Agent"))
+	} else if !proxyAuthEnabled {
+		trackUserDevice(clientIP, clientIP, r.Header.Get("User-Agent"))
 	}
 
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
@@ -3855,6 +3880,23 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 	_ = db.QueryRow("SELECT COUNT(*) FROM conn_logs").Scan(&logRows)
 
 	userRows := ""
+	extraHeaders := ""
+	addCard := ""
+	if proxyAuthEnabled {
+		extraHeaders = `<th>quota</th><th></th>`
+		addCard = `<div class="add-card">
+		<div style="color:#fff;margin-bottom:6px">เพิ่มผู้ใช้ใหม่</div>
+		<form method="post" action="/admin/add">
+			<label>username</label>
+			<input type="text" name="user" required autocomplete="off" placeholder="เช่น mama">
+			<label>password</label>
+			<input type="text" name="pass" required autocomplete="off" placeholder="รหัสผ่าน">
+			<label>quota (GB — 0 = ไม่จำกัด)</label>
+			<input type="number" step="0.001" min="0" name="gbytes" placeholder="เช่น 2 = 2GB">
+			<button type="submit" class="btn-add">เพิ่มผู้ใช้</button>
+		</form>
+	</div>`
+	}
 	for _, s := range snaps {
 		devList := ""
 		for _, d := range s.devices {
@@ -3886,7 +3928,9 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 		}
 		// Quota cell: usage bar + data column
 		quotaCell := `<td class="dim">∞</td>`
-		if s.quotaBytes > 0 {
+		if !proxyAuthEnabled {
+			quotaCell = ""
+		} else if s.quotaBytes > 0 {
 			used := s.quotaUsed
 			if used > s.quotaBytes {
 				used = s.quotaBytes
@@ -3902,21 +3946,26 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 				fmtSize(used), fmtSize(s.quotaBytes), pct, color, pct)
 		}
 		suspendBtn := ""
-		if s.name != adminUser {
+		quotaForm := ""
+		proxyBtn := ""
+		adBtn := ""
+		deleteBtn := ""
+		if proxyAuthEnabled && s.name != adminUser {
 			if s.suspended {
 				suspendBtn = fmt.Sprintf(`<form method="post" action="/admin/suspend" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="action" value="unsuspend"><button type="submit" class="btn-ok">ปลดระงับ</button></form>`, html.EscapeString(s.name))
 			} else {
 				suspendBtn = fmt.Sprintf(`<form method="post" action="/admin/suspend" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="action" value="suspend"><button type="submit" class="btn-sus" onclick="return confirm('ระงับบัญชี &#39;%s&#39;?')">ระงับ</button></form>`, html.EscapeString(s.name), html.EscapeString(s.name))
 			}
+			quotaForm = fmt.Sprintf(`<form method="post" action="/admin/quota" style="display:inline"><input type="hidden" name="user" value="%s"><input type="number" step="0.001" min="0" name="gbytes" value="%s" style="width:70px;background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:4px;border-radius:3px;font:inherit"><button type="submit" class="btn">set (GB)</button></form>`, html.EscapeString(s.name), strconv.FormatFloat(float64(s.quotaBytes)/1073741824, 'f', 3, 64))
+			pe, ae := -1, -1
+			if v, ok := userSettings.Load(s.name); ok {
+				pe = v.(*userSetting).proxyEnabled
+				ae = v.(*userSetting).adblockEnabled
+			}
+			proxyBtn = fmt.Sprintf(`<form method="post" action="/admin/userflag" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="proxy_enabled"><input type="hidden" name="value" value="%d"><button type="submit" class="btn" title="off = ปิด proxy ให้ user นี้ต่อตรงเลย">proxy:%s</button></form>`, html.EscapeString(s.name), nextFlagVal(pe), flagTxt(pe))
+			adBtn = fmt.Sprintf(`<form method="post" action="/admin/userflag" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="adblock_enabled"><input type="hidden" name="value" value="%d"><button type="submit" class="btn" title="off = ปล่อยโฆษณาผ่าน (ไม่บล็อก)">ads:%s</button></form>`, html.EscapeString(s.name), nextFlagVal(ae), flagTxt(ae))
+			deleteBtn = fmt.Sprintf(`<form method="post" action="/admin/delete" style="display:inline" onsubmit="return confirm('ลบ user &#39;%s&#39;?' )"><input type="hidden" name="user" value="%s"><button type="submit" class="btn-del">ลบ</button></form>`, html.EscapeString(s.name), html.EscapeString(s.name))
 		}
-		quotaForm := fmt.Sprintf(`<form method="post" action="/admin/quota" style="display:inline"><input type="hidden" name="user" value="%s"><input type="number" step="0.001" min="0" name="gbytes" value="%s" style="width:70px;background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:4px;border-radius:3px;font:inherit"><button type="submit" class="btn">set (GB)</button></form>`, html.EscapeString(s.name), strconv.FormatFloat(float64(s.quotaBytes)/1073741824, 'f', 3, 64))
-		pe, ae := -1, -1
-		if v, ok := userSettings.Load(s.name); ok {
-			pe = v.(*userSetting).proxyEnabled
-			ae = v.(*userSetting).adblockEnabled
-		}
-		proxyBtn := fmt.Sprintf(`<form method="post" action="/admin/userflag" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="proxy_enabled"><input type="hidden" name="value" value="%d"><button type="submit" class="btn" title="off = ปิด proxy ให้ user นี้ต่อตรงเลย">proxy:%s</button></form>`, html.EscapeString(s.name), nextFlagVal(pe), flagTxt(pe))
-		adBtn := fmt.Sprintf(`<form method="post" action="/admin/userflag" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="adblock_enabled"><input type="hidden" name="value" value="%d"><button type="submit" class="btn" title="off = ปล่อยโฆษณาผ่าน (ไม่บล็อก)">ads:%s</button></form>`, html.EscapeString(s.name), nextFlagVal(ae), flagTxt(ae))
 		userRows += fmt.Sprintf(`<tr>
 			<td><a class="u" href="/admin/user?name=%s">%s</a>%s</td>
 			<td class="%s">%s</td>
@@ -3927,9 +3976,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 			<td class="dim">%s</td>
 			<td><span class="devc">%d</span><div class="devlist">%s</div></td>
 			%s
-			<td>%s %s %s %s
-				<form method="post" action="/admin/delete" style="display:inline" onsubmit="return confirm('ลบ user &#39;%s&#39;?' )"><input type="hidden" name="user" value="%s"><button type="submit" class="btn-del">ลบ</button></form>
-			</td>
+			<td>%s %s %s %s %s</td>
 		</tr>`,
 			url.QueryEscape(s.name), html.EscapeString(s.name), activeNow,
 			acCls, ac,
@@ -3937,8 +3984,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 			first, last,
 			s.deviceCount, devList,
 			quotaCell,
-			suspendBtn, proxyBtn, adBtn, quotaForm,
-			html.EscapeString(s.name), html.EscapeString(s.name))
+			suspendBtn, proxyBtn, adBtn, quotaForm, deleteBtn)
 	}
 
 	msg := r.URL.Query().Get("msg")
@@ -3993,24 +4039,13 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 	%s
 
 	<table>
-	<tr><th>user</th><th>active</th><th>bytes_up</th><th>bytes_down</th><th>conns</th><th>first_seen</th><th>last_seen</th><th>devices</th><th>quota</th><th></th></tr>
+	<tr><th>user</th><th>active</th><th>bytes_up</th><th>bytes_down</th><th>conns</th><th>first_seen</th><th>last_seen</th><th>devices</th>%s</tr>
 	%s
 	</table>
 
-	<div class="add-card">
-		<div style="color:#fff;margin-bottom:6px">เพิ่มผู้ใช้ใหม่</div>
-		<form method="post" action="/admin/add">
-			<label>username</label>
-			<input type="text" name="user" required autocomplete="off" placeholder="เช่น mama">
-			<label>password</label>
-			<input type="text" name="pass" required autocomplete="off" placeholder="รหัสผ่าน">
-			<label>quota (GB — 0 = ไม่จำกัด)</label>
-			<input type="number" step="0.001" min="0" name="gbytes" placeholder="เช่น 2 = 2GB">
-			<button type="submit" class="btn-add">เพิ่มผู้ใช้</button>
-		</form>
-	</div>
+	%s
 `, len(snaps), fmtMB(totalUp), fmtMB(totalDown), totalConns, totalDev, logRows,
-		adminCharts(snaps), blCard, gblCard, msgHTML, userRows)
+		adminCharts(snaps), blCard, gblCard, msgHTML, extraHeaders, userRows, addCard)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
