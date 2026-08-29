@@ -3376,85 +3376,98 @@ func adminPageTop(title, curPath string) string {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>netninja admin — %s</title>
-<style>
-body{background:#0a0a0a;color:#ccc;font:13px/1.6 'Courier New',monospace;margin:0;padding:40px 20px}
-.w{max-width:1020px;margin:0 auto}
-h1{color:#fff;font-size:18px;margin:0 0 4px;font-weight:normal}
-h1 span{color:#ffa500;margin-right:10px}
-.sub{color:#444;font-size:11px;margin-bottom:16px;letter-spacing:1px}
-hr{border:0;border-top:1px solid #222;margin:25px 0}
-.nav{display:flex;gap:6px;margin:14px 0 20px;flex-wrap:wrap}
-.nav a{color:#999;text-decoration:none;border:1px solid #2a2a2a;background:#111;padding:6px 14px;border-radius:4px;font-size:12px}
-.nav a:hover{color:#fff;border-color:#ffa500}
-.nav a.cur{color:#ffa500;border-color:#ffa500}
-.msg{background:#191919;border:1px solid #2a3a2a;color:#8f8;padding:10px 14px;border-radius:4px;margin-bottom:18px}
-table{width:100%%;border-collapse:collapse;margin-bottom:20px}
-th{color:#666;text-transform:uppercase;font-size:10px;letter-spacing:1px;text-align:left;padding:6px 8px;border-bottom:1px solid #333}
-td{padding:8px;border-bottom:1px solid #151515;vertical-align:top}
-td b{color:#eee}
-td.ok{color:#0f0}
-td.err{color:#f77}
-td.num{color:#7af}
-td.dim{color:#555;font-size:11px}
-td.warn{color:#ffa500}
-a.u{color:#7af;text-decoration:none;font-weight:bold}
-a.u:hover{color:#fff;text-decoration:underline}
-.devc{color:#0f0;font-weight:bold}
-.devlist{margin-top:4px}
-.dev{color:#888;font-size:10px;background:#121212;border:1px solid #222;border-radius:3px;padding:1px 6px;margin:2px 0;display:inline-block}
-.dev.dim{color:#555}
-.btn-del{background:#3a0f0f;color:#f77;border:1px solid #722;border-radius:3px;padding:3px 10px;font:inherit;cursor:pointer}
-.btn-del:hover{background:#5a1515}
-.btn-sus{background:#3a2a00;color:#ffc966;border:1px solid #6a4a00;border-radius:3px;padding:3px 10px;font:inherit;cursor:pointer;margin-right:4px}
-.btn-sus:hover{background:#5a3f00}
-.btn-ok{background:#0f2f0f;color:#8f8;border:1px solid #274;border-radius:3px;padding:3px 10px;font:inherit;cursor:pointer;margin-right:4px}
-.btn-ok:hover{background:#174017}
-.add-card{background:#111;border:1px solid #222;border-radius:6px;padding:16px;margin-top:10px}
-.add-card label{color:#666;font-size:10px;text-transform:uppercase;letter-spacing:1px;display:block;margin:8px 0 4px}
-.add-card input,.add-card select{background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:8px 10px;border-radius:3px;font:inherit;width:100%%;box-sizing:border-box}
-.add-card input:focus{outline:none;border-color:#ffa500}
-.btn-add{background:#5a3a00;color:#ffc966;border:1px solid #8a5c00;border-radius:3px;padding:10px 18px;font:inherit;font-weight:bold;cursor:pointer;margin-top:12px}
-.btn-add:hover{background:#6b4600}
-.btn{background:#111;color:#ccc;border:1px solid #333;border-radius:3px;padding:6px 14px;font:inherit;cursor:pointer}
-.btn:hover{color:#fff;border-color:#ffa500}
-.tots{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px}
-.tot{background:#111;border:1px solid #222;border-radius:6px;padding:10px 14px;flex:1;min-width:130px}
-.tot .k{color:#555;font-size:10px;text-transform:uppercase;letter-spacing:1px}
-.tot .v{color:#ffa500;font-size:16px;margin-top:3px}
-.tot .v.g{color:#0f0}
-.tot .v.r{color:#f77}
-.filters{background:#111;border:1px solid #222;border-radius:6px;padding:14px;margin-bottom:16px}
-.filters form{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
-.filters label{color:#555;font-size:10px;text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:4px}
-.filters input,.filters select{background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:6px 10px;border-radius:3px;font:inherit}
-.charts{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px}
-.chart-card{background:#111;border:1px solid #222;border-radius:6px;padding:14px;flex:1;min-width:290px;box-sizing:border-box}
-.chart-card .ck{color:#555;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
-.hbar{display:flex;align-items:center;gap:8px;margin:5px 0;font-size:11px}
-.hbar .hl{color:#7af;width:130px;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.hbar .htrack{flex:1;background:#191919;border:1px solid #222;height:12px;border-radius:3px;overflow:hidden}
-.hbar .hfill{height:12px;border-radius:3px}
-.hbar .hv{color:#eee;width:70px;text-align:right;font-size:11px}
-.legend{margin-top:10px}
-.legend .li{display:flex;align-items:center;gap:8px;color:#bbb;font-size:11px;margin:4px 0}
-.legend .dot{width:10px;height:10px;border-radius:2px;display:inline-block}
-.pager{display:flex;gap:12px;align-items:center;margin:14px 0}
-.pager a{color:#7af;text-decoration:none}
-.pager a:hover{color:#fff}
-.back{margin-top:30px;display:inline-block;color:#7af;text-decoration:none}
-.back:hover{color:#fff}
-.q{color:#ffa500}
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+	theme: {
+		extend: {
+			colors: {
+				ac:     '#ffa500',
+				link:   '#7af',
+				good:   '#0f0',
+				bad:    '#f77',
+				panel:  '#111',
+				canvas: '#0d0d0d',
+				line:   '#222',
+				faint:  '#444',
+				mut:    '#555',
+				soft:   '#888',
+				dim:    '#999',
+			},
+			fontFamily: {
+				mono: ['"Courier New"', 'ui-monospace', 'monospace'],
+			},
+		},
+	},
+};
+</script>
+<style type="text/tailwindcss">
+@layer components {
+	table { @apply w-full border-collapse mb-5; }
+	th { @apply text-mut uppercase text-[10px] tracking-wider text-left px-2 py-1.5 border-b border-[#333]; }
+	td { @apply px-2 py-2 border-b border-[#151515] align-top; }
+	td b { @apply text-[#eee]; }
+	td.ok { @apply text-good; }
+	td.err { @apply text-bad; }
+	td.num { @apply text-link; }
+	td.dim { @apply text-mut text-[11px]; }
+	td.warn { @apply text-ac; }
+	a.u { @apply text-link no-underline font-bold; }
+	a.u:hover { @apply text-white underline; }
+	.dev { @apply text-soft text-[10px] bg-[#121212] border border-line rounded px-1.5 py-0.5 mr-1 my-0.5 inline-block; }
+	.dev.dim { @apply text-mut; }
+	.devc { @apply text-good font-bold; }
+	.devlist { @apply mt-1; }
+	.btn-deL { @apply bg-[#3a0f0f] text-bad border border-[#722] rounded px-2.5 py-1 font-mono text-xs cursor-pointer; }
+	.btn-del { @apply bg-[#3a0f0f] text-bad border border-[#722] rounded px-2.5 py-1 font-mono text-xs cursor-pointer hover:bg-[#5a1515]; }
+	.btn-sus { @apply bg-[#3a2a00] text-[#ffc966] border border-[#6a4a00] rounded px-2.5 py-1 font-mono text-xs cursor-pointer hover:bg-[#5a3f00] mr-1; }
+	.btn-ok { @apply bg-[#0f2f0f] text-good border border-[#274] rounded px-2.5 py-1 font-mono text-xs cursor-pointer hover:bg-[#174017] mr-1; }
+	.btn-add { @apply bg-[#5a3a00] text-[#ffc966] border border-[#8a5c00] rounded px-4 py-2.5 font-mono font-bold cursor-pointer mt-3 hover:bg-[#6b4600]; }
+	.btn { @apply bg-panel text-[#ccc] border border-[#333] rounded px-3.5 py-1.5 font-mono text-xs cursor-pointer hover:text-white hover:border-ac; }
+	.add-card { @apply bg-panel border border-line rounded p-4 mt-2.5; }
+	.add-card label { @apply text-mut text-[10px] uppercase tracking-wider block my-2 mb-1; }
+	.add-card input[type="text"], .add-card input[type="number"], .add-card select { @apply bg-canvas border border-[#2a2a2a] text-[#eee] px-2.5 py-2 rounded font-mono w-full; }
+	.add-card input[type="checkbox"] { @apply accent-ac; }
+	.add-card input:focus, .add-card select:focus { @apply outline-none border-ac; }
+	.filters input, .filters select { @apply bg-canvas border border-[#2a2a2a] text-[#eee] px-2.5 py-2 rounded font-mono; }
+	.filters input:focus, .filters select:focus { @apply outline-none border-ac; }
+	.tots { @apply flex gap-3.5 flex-wrap mb-5; }
+	.tot { @apply bg-panel border border-line rounded px-3.5 py-2.5 flex-1 min-w-[130px]; }
+	.tot .k { @apply text-mut text-[10px] uppercase tracking-wider; }
+	.tot .v { @apply text-ac text-base mt-0.5; }
+	.tot .v.g { color:#0f0; }
+	.tot .v.r { color:#f77; }
+	.filters { @apply bg-panel border border-line rounded p-3.5 mb-4; }
+	.filters form { @apply flex gap-2.5 flex-wrap items-end; }
+	.filters label { @apply text-mut text-[10px] uppercase tracking-wider block mb-1; }
+	.pager { @apply flex gap-3 items-center my-3.5; }
+	.pager .nav { @apply flex gap-2; }
+	.pager a { @apply text-link no-underline; }
+	.back { @apply mt-8 inline-block text-link no-underline hover:text-white; }
+	.q { color:#ffa500; }
+	.msg { @apply bg-[#191919] border border-[#2a3a2a] text-good px-3.5 py-2.5 rounded mb-4; }
+	.hbar { @apply flex items-center gap-2 my-1 text-[11px]; }
+	.hbar .hl { @apply text-link w-[130px] text-right whitespace-nowrap overflow-hidden text-ellipsis shrink-0; }
+	.hbar .htrack { @apply flex-1 bg-[#191919] border border-line h-3 rounded overflow-hidden; }
+	.hbar .hfill { @apply h-3 rounded; }
+	.hbar .hv { @apply text-[#eee] w-[70px] text-right text-[11px] shrink-0; }
+	.legend { @apply mt-2.5; }
+	.legend .li { @apply flex items-center gap-2 text-[#bbb] text-[11px] my-1; }
+	.legend .dot { @apply w-2.5 h-2.5 rounded inline-block; }
+	.navlink { @apply text-dim border border-[#2a2a2a] bg-panel px-3.5 py-1.5 rounded text-xs hover:text-white hover:border-ac; }
+	.navlink-cur { @apply text-ac border-ac bg-panel px-3.5 py-1.5 rounded text-xs; }
+}
 </style>
 </head>
-<body>
-<div class="w">
-	<h1><span>●</span> netninja admin</h1>
-	<div class="sub">%s</div>
-	<div class="nav">
+<body class="bg-[#0a0a0a] text-[#ccc] font-mono p-5 sm:p-10">
+<div class="max-w-[1020px] mx-auto">
+	<h1 class="text-white text-lg mb-1 font-normal"><span class="text-ac mr-2.5">●</span> netninja admin</h1>
+	<div class="text-faint text-[11px] mb-4 tracking-widest">%s</div>
+	<div class="flex gap-1.5 mt-3.5 mb-5 flex-wrap">
 		<a href="/admin" %s>users</a>
 		<a href="/admin/logs" %s>access_logs</a>
 		<a href="/admin/audit" %s>admin_audit</a>
-		<a href="/">dashboard</a>
+		<a href="/" class="navlink">dashboard</a>
 	</div>
 `, html.EscapeString(title), html.EscapeString(title),
 		navCur(curPath, "/admin", "/admin/user"), navCur(curPath, "/admin/logs"), navCur(curPath, "/admin/audit"))
@@ -3463,10 +3476,10 @@ a.u:hover{color:#fff;text-decoration:underline}
 func navCur(curPath string, paths ...string) string {
 	for _, p := range paths {
 		if curPath == p {
-			return `class="cur"`
+			return `class="navlink-cur"`
 		}
 	}
-	return ""
+	return `class="navlink"`
 }
 
 func adminPageEnd(extra string) string {
