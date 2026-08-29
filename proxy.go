@@ -1055,6 +1055,7 @@ var hopOnce sync.Once
 var hopAutoOn bool
 var hopAuto map[string]bool
 var hopAutoMu sync.Mutex
+var hopAutoTTL time.Duration
 var hopProbeMu sync.Mutex
 var hopProbeIn map[string]chan bool
 var hopProbeRes map[string]hopProbeResult
@@ -1090,15 +1091,23 @@ func loadHopConfig() {
 			}
 		}
 		hopAutoOn = os.Getenv("HOP_AUTODETECT") != "0"
+		if ttl, err := time.ParseDuration(os.Getenv("HOP_AUTO_TTL")); err == nil {
+			hopAutoTTL = ttl
+		} else {
+			hopAutoTTL = 24 * time.Hour
+		}
 		hopAuto = map[string]bool{}
 		hopProbeIn = map[string]chan bool{}
 		hopProbeRes = map[string]hopProbeResult{}
 		if hopSocks5 != "" && db != nil {
-			rows, err := db.Query("SELECT host FROM hop_auto")
+			rows, err := db.Query("SELECT host, added_at FROM hop_auto")
 			if err == nil {
 				for rows.Next() {
-					var h string
-					if rows.Scan(&h) == nil {
+					var h, added string
+					if rows.Scan(&h, &added) == nil {
+						if t, terr := time.Parse(time.RFC3339, added); terr == nil && time.Since(t) > hopAutoTTL {
+							continue
+						}
 						hopAuto[h] = true
 					}
 				}
@@ -1106,7 +1115,7 @@ func loadHopConfig() {
 			}
 		}
 		if hopAutoOn && hopSocks5 != "" {
-			log.Printf("%s[HOP][auto]%s enabled — tunnelling any host that Cloudflare 403s from this IP; persisted=%d", colorGreen, colorReset, len(hopAuto))
+			log.Printf("%s[HOP][auto]%s enabled — tunnelling any host that Cloudflare 403s from this IP; persisted=%d ttl=%v", colorGreen, colorReset, len(hopAuto), hopAutoTTL)
 		}
 	})
 }
@@ -1207,6 +1216,52 @@ func hopAutoAdd(h string) {
 		_, _ = db.Exec("INSERT OR IGNORE INTO hop_auto(host, added_at) VALUES(?, ?)", h, time.Now().UTC().Format(time.RFC3339))
 	}
 	log.Printf("%s[HOP][auto]%s now tunnelling %d hosts via %s", colorGreen, colorReset, n, hopSocks5)
+}
+
+func hopAutoRemove(h string) {
+	hopAutoMu.Lock()
+	delete(hopAuto, h)
+	n := len(hopAuto)
+	hopAutoMu.Unlock()
+	if db != nil {
+		_, _ = db.Exec("DELETE FROM hop_auto WHERE host = ?", h)
+	}
+	log.Printf("%s[HOP][auto]%s host %s no longer blocked - removed from tunnel list (%d left)", colorYellow, colorReset, h, n)
+}
+
+// startHopAutoSweeper periodically re-probes tunnelled hosts; any host that no
+// longer gets a Cloudflare 403 (or no longer resolves) from the direct Azure
+// IP is dropped from the tunnel list so it doesn't stay there forever.
+func startHopAutoSweeper() {
+	if !hopAutoOn || hopSocks5 == "" || hopAutoTTL <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(hopAutoTTL / 2)
+		defer ticker.Stop()
+		for range ticker.C {
+			hosts := []string{}
+			hopAutoMu.Lock()
+			for h := range hopAuto {
+				hosts = append(hosts, h)
+			}
+			hopAutoMu.Unlock()
+			for _, h := range hosts {
+				isCfg := false
+				hopAutoMu.Lock()
+				if hopDomains[h] {
+					isCfg = true
+				}
+				hopAutoMu.Unlock()
+				if isCfg {
+					continue
+				}
+				if !cfBlockedDirect(h, 5*time.Second) {
+					hopAutoRemove(h)
+				}
+			}
+		}
+	}()
 }
 
 // cfBlockedDirect dials host directly (proxy's own IP), completes a minimal
@@ -1671,7 +1726,8 @@ func main() {
 	initDB()
 	defer db.Close()
 loadAppSettings()
-	loadHopConfig()
+loadHopConfig()
+	startHopAutoSweeper()
 	loadAdminCreds()
 	startConnLogWriter()
 startRetentionPruner()
@@ -2681,6 +2737,12 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// IMPORTANT: http.Server applies ReadTimeout/WriteTimeout deadlines to the
+	// inbound conn. They survive Hijack() and silently kill healthy idle
+	// tunnels at ~60-120s (iOS sees "connection closed unexpectedly" and does
+	// not reconnect until wifi toggle). Clear them before speaking on the conn.
+	clientConn.SetDeadline(time.Time{})
+
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	// Track active tunnel start time
@@ -2705,47 +2767,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	trackUserConn(tunnelUser)
 
-	// Idle watchdogs: mobile NATs / Azure SLB silently drop idle TCP (~4 min)
-	// with no FIN, leaving iOS with a zombie proxied connection until wifi
-	// restart. Wrap both ends with activity tracking and close the tunnel
-	// cleanly (FIN) once it has been fully idle too long, so clients reconnect
-	// immediately instead of hanging.
-	tunnelIdle := 90 * time.Second
-	if secs := os.Getenv("TUNNEL_IDLE_SECONDS"); secs != "" {
-		if n, err := strconv.Atoi(secs); err == nil && n > 0 && n <= 600 {
-			tunnelIdle = time.Duration(n) * time.Second
-		}
-	}
 	clientAct := &activityConn{Conn: clientConn}
 	destAct := &activityConn{Conn: destConn}
-	clientAct.mark()
-	destAct.mark()
 	tunnelDone := make(chan struct{})
-	go func() {
-		tick := time.NewTicker(15 * time.Second)
-		defer tick.Stop()
-		debug := os.Getenv("PROXY_DEBUG") != ""
-		for {
-			select {
-			case <-tunnelDone:
-				return
-			case <-tick.C:
-				now := time.Now().UnixNano()
-				ci := int64(tunnelIdle)
-				cu := now - clientAct.last.Load()
-				du := now - destAct.last.Load()
-				if debug {
-					log.Printf("%s[TLS]%s watchdog %s ↔ %s client_idle=%ds dest_idle=%ds limit=%ds", colorGray, colorReset, clientIP, host, cu/int64(time.Second), du/int64(time.Second), tunnelIdle/time.Second)
-				}
-				if cu > ci && du > ci {
-					log.Printf("%s[TLS]%s idle tunnel %s ↔ %s closed after %dms (no traffic)", colorYellow, colorReset, clientIP, host, tunnelIdle.Milliseconds())
-					clientAct.Close()
-					destAct.Close()
-					return
-				}
-			}
-		}
-	}()
 
 	errc := make(chan error, 2)
 	var wg sync.WaitGroup
@@ -2930,6 +2954,10 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 		return
 	}
 	defer clientConn.Close()
+
+	// Inherited http.Server ReadTimeout/WriteTimeout deadlines survive Hijack()
+	// and would kill the WS pipe at ~60-120s. Clear them before forwarding.
+	clientConn.SetDeadline(time.Time{})
 
 	// Overkill: Tuning client socket for WS
 	if tc, ok := clientConn.(*net.TCPConn); ok {
