@@ -2664,9 +2664,11 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIP := getClientIP(r)
 	start := time.Now()
 
-	// Debug: log all incoming HTTP requests for tracing
-	log.Printf("%s[HTTP-REQ]%s %s %s ← %s ua=%s",
-		colorGreen, colorReset, r.Method, r.URL, clientIP, r.Header.Get("User-Agent"))
+	// Debug: log all incoming HTTP requests for tracing (skip noisy static assets)
+	if r.URL.Path != "/favicon.ico" && r.URL.Path != "/favicon.svg" {
+		log.Printf("%s[HTTP-REQ]%s %s %s ← %s ua=%s",
+			colorGreen, colorReset, r.Method, r.URL, clientIP, r.Header.Get("User-Agent"))
+	}
 
 	originalHost := r.URL.Host
 	unwrappedHost := unwrapCiscoDomain(originalHost)
@@ -2788,7 +2790,9 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Printf("%s[ERR]%s %s → %s: %s", colorRed, colorReset, clientIP, r.URL.Host, err)
+		if !strings.Contains(err.Error(), "context canceled") {
+			log.Printf("%s[ERR]%s %s → %s: %s", colorRed, colorReset, clientIP, r.URL.Host, err)
+		}
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
