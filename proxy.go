@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1047,6 +1048,22 @@ var hopDomains map[string]bool
 var hopSocks5 string
 var hopOnce sync.Once
 
+// Auto-detect: when a host tunnelling directly (from the Azure IP) gets a
+// Cloudflare 403/"Just a moment", it is added to the hop list on the fly so
+// subsequent connections egress through HOP_SOCKS5. Results persist in SQLite
+// (hop_auto) across restarts. Disable with env HOP_AUTODETECT=0.
+var hopAutoOn bool
+var hopAuto map[string]bool
+var hopAutoMu sync.Mutex
+var hopProbeMu sync.Mutex
+var hopProbeIn map[string]chan bool
+var hopProbeRes map[string]hopProbeResult
+
+type hopProbeResult struct {
+	t       time.Time
+	blocked bool
+}
+
 func loadHopConfig() {
 	hopOnce.Do(func() {
 		if e := os.Getenv("HOP_DOMAINS"); e != "" {
@@ -1072,16 +1089,39 @@ func loadHopConfig() {
 				log.Printf("%s[HOP]%s domains=[%s] via socks5 %s", colorGreen, colorReset, strings.Join(names, ","), hopSocks5)
 			}
 		}
+		hopAutoOn = os.Getenv("HOP_AUTODETECT") != "0"
+		hopAuto = map[string]bool{}
+		hopProbeIn = map[string]chan bool{}
+		hopProbeRes = map[string]hopProbeResult{}
+		if hopSocks5 != "" && db != nil {
+			rows, err := db.Query("SELECT host FROM hop_auto")
+			if err == nil {
+				for rows.Next() {
+					var h string
+					if rows.Scan(&h) == nil {
+						hopAuto[h] = true
+					}
+				}
+				rows.Close()
+			}
+		}
+		if hopAutoOn && hopSocks5 != "" {
+			log.Printf("%s[HOP][auto]%s enabled — tunnelling any host that Cloudflare 403s from this IP; persisted=%d", colorGreen, colorReset, len(hopAuto))
+		}
 	})
 }
 
 func inHopDomains(host string) bool {
-	if len(hopDomains) == 0 || hopSocks5 == "" {
+	if hopSocks5 == "" {
 		return false
 	}
 	h := strings.ToLower(host)
 	for {
-		if hopDomains[h] {
+		hopAutoMu.Lock()
+		_, inConfig := hopDomains[h]
+		_, inAuto := hopAuto[h]
+		hopAutoMu.Unlock()
+		if inConfig || inAuto {
 			return true
 		}
 		i := strings.IndexByte(h, '.')
@@ -1092,13 +1132,148 @@ func inHopDomains(host string) bool {
 	}
 }
 
+// autoClassify probes an unknown host once: if Cloudflare 403s it from the
+// proxy's own IP it is routed through the hop (and persisted). Results are
+// cached 24h so each host is probed at most daily. In-flight probes are shared
+// so parallel connection attempts dedupe.
+func autoClassify(host string) bool {
+	if !hopAutoOn || hopSocks5 == "" {
+		return false
+	}
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "" || net.ParseIP(h) != nil || !strings.Contains(h, ".") {
+		return false
+	}
+	if hopAutoMatch(h) {
+		return true
+	}
+	hopProbeMu.Lock()
+	if r, ok := hopProbeRes[h]; ok && time.Since(r.t) < 24*time.Hour {
+		hopProbeMu.Unlock()
+		return r.blocked
+	}
+	if ch, dup := hopProbeIn[h]; dup {
+		hopProbeMu.Unlock()
+		select {
+		case <-ch:
+			return hopAutoMatch(h)
+		case <-time.After(3500 * time.Millisecond):
+			return false
+		}
+	}
+	ch := make(chan bool, 1)
+	hopProbeIn[h] = ch
+	hopProbeMu.Unlock()
+
+	blocked := cfBlockedDirect(h, 3000*time.Millisecond)
+
+	hopProbeMu.Lock()
+	hopProbeRes[h] = hopProbeResult{t: time.Now(), blocked: blocked}
+	delete(hopProbeIn, h)
+	hopProbeMu.Unlock()
+	ch <- blocked
+
+	if blocked {
+		log.Printf("%s[HOP][auto]%s %s blocked via Azure — added to hop list", colorYellow, colorReset, h)
+		hopAutoAdd(h)
+	}
+	return blocked
+}
+
+func hopAutoMatch(h string) bool {
+	hopAutoMu.Lock()
+	defer hopAutoMu.Unlock()
+	for {
+		if hopAuto[h] {
+			return true
+		}
+		i := strings.IndexByte(h, '.')
+		if i == -1 {
+			return false
+		}
+		h = h[i+1:]
+	}
+}
+
+func hopAutoAdd(h string) {
+	hopAutoMu.Lock()
+	if hopAuto == nil {
+		hopAuto = map[string]bool{}
+	}
+	hopAuto[h] = true
+	n := len(hopAuto)
+	hopAutoMu.Unlock()
+	if db != nil {
+		_, _ = db.Exec("INSERT OR IGNORE INTO hop_auto(host, added_at) VALUES(?, ?)", h, time.Now().UTC().Format(time.RFC3339))
+	}
+	log.Printf("%s[HOP][auto]%s now tunnelling %d hosts via %s", colorGreen, colorReset, n, hopSocks5)
+}
+
+// cfBlockedDirect dials host directly (proxy's own IP), completes a minimal
+// TLS handshake and reads the response status. True = Cloudflare block page
+// (403 / "Just a moment").
+func cfBlockedDirect(host string, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(addrs) == 0 {
+		d := &net.Dialer{Timeout: 2 * time.Second}
+		if c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, "443")); err == nil {
+			return probeHTTPStatus(c, host)
+		}
+		return false
+	}
+	tried := 0
+	for _, a := range addrs {
+		if tried >= 3 {
+			break
+		}
+		d := &net.Dialer{Timeout: 2 * time.Second}
+		c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(a.IP.String(), "443"))
+		if err != nil {
+			continue
+		}
+		tried++
+		if probeHTTPStatus(c, host) {
+			return true
+		}
+	}
+	return false
+}
+
+func probeHTTPStatus(c net.Conn, host string) bool {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3500 * time.Millisecond))
+	tc := tls.Client(c, &tls.Config{ServerName: host, InsecureSkipVerify: true})
+	if tc.Handshake() != nil {
+		return false
+	}
+	req := "GET / HTTP/1.1\r\nHost: " + host +
+		"\r\nUser-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" +
+		"\r\nAccept: text/html,application/xhtml+xml\r\nAccept-Language: th-TH,th;q=0.9,en;q=0.8\r\nConnection: close\r\n\r\n"
+	if _, err := tc.Write([]byte(req)); err != nil {
+		return false
+	}
+	buf := make([]byte, 4096)
+	n, err := tc.Read(buf)
+	if err != nil && n == 0 {
+		return false
+	}
+	s := string(buf[:n])
+	return strings.HasPrefix(s, "HTTP/1.1 403 ") || strings.HasPrefix(s, "HTTP/1.0 403 ") ||
+		strings.Contains(s, "Just a moment")
+}
+
 // dialHop opens a connection through the SOCKS5 server (no-auth).
 func dialHop(ctx context.Context, address string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	d := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 	c, err := d.DialContext(ctx, "tcp", hopSocks5)
 	if err != nil {
 		return nil, fmt.Errorf("hop dial %s: %w", hopSocks5, err)
 	}
+	// Bound the whole SOCKS handshake so a dead/unresponsive hop fails fast
+	// and we can fall back to direct instead of hanging the tunnel for ages.
+	_ = c.SetDeadline(time.Now().Add(8 * time.Second))
 	fail := func(e error) (net.Conn, error) {
 		c.Close()
 		return nil, fmt.Errorf("socks5 %s: %w", hopSocks5, e)
@@ -1142,6 +1317,8 @@ func dialHop(ctx context.Context, address string) (net.Conn, error) {
 	if err := readSocksReply(c); err != nil {
 		return fail(err)
 	}
+	// Handshake done — hand the (now clean) connection back to the tunnel.
+	_ = c.SetDeadline(time.Time{})
 	return c, nil
 }
 
@@ -1177,10 +1354,20 @@ func readSocksReply(c net.Conn) error {
 }
 
 // hopDial dials address, sending connections for matched hosts out through the
-// SOCKS5 hop and everything else via the normal custom dialer.
+// SOCKS5 hop and everything else via the normal custom dialer. Unknown hosts are
+// auto-classified: if Cloudflare 403s them from this IP they get hopped too. If
+// the hop is unreachable it degrades to direct instead of failing.
 func hopDial(ctx context.Context, network, hostname, address string) (net.Conn, error) {
-	if inHopDomains(hostname) {
-		return dialHop(ctx, address)
+	useHop := inHopDomains(hostname)
+	if !useHop {
+		useHop = autoClassify(hostname)
+	}
+	if useHop {
+		c, err := dialHop(ctx, address)
+		if err == nil {
+			return c, nil
+		}
+		log.Printf("%s[HOP][warn]%s %s: %v — direct fallback", colorYellow, colorReset, hostname, err)
 	}
 	return customDialer.DialContext(ctx, network, address)
 }
@@ -1232,6 +1419,14 @@ func initDB() {
 	)`)
 	if err != nil {
 		log.Fatal("Failed to create dns_records table:", err)
+	}
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS hop_auto (
+		host TEXT PRIMARY KEY,
+		added_at TEXT NOT NULL
+	)`)
+	if err != nil {
+		log.Fatal("Failed to create hop_auto table:", err)
 	}
 
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS proxy_users (

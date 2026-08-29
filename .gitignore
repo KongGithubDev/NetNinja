@@ -4,6 +4,10 @@ node_modules/
 # Environment
 .env
 
+# Secrets - NEVER commit
+azure-sg.key
+*.key
+
 # Go binary
 *.exe
 
@@ -14,3 +18,12 @@ Thumbs.db
 # Certificates
 fullchain.pem
 privkey.pem
+
+# Build artifacts
+dist/
+proxy_linux*
+
+# Runtime data
+proxy_cache.db
+__pycache__/
+*.pyc
