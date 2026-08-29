@@ -1774,9 +1774,18 @@ startRetentionPruner()
 		rows.Close()
 	}
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	portCfg := os.Getenv("PORT")
+	if portCfg == "" {
+		portCfg = "8080"
+	}
+	var ports []string
+	for _, p := range strings.Split(portCfg, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			ports = append(ports, p)
+		}
+	}
+	if len(ports) == 0 {
+		ports = []string{"8080"}
 	}
 
 	if pu := os.Getenv("PROXY_USERS"); pu != "" {
@@ -1794,7 +1803,6 @@ startRetentionPruner()
 	}
 
 	proxy := &http.Server{
-		Addr:         bindAddr + ":" + port,
 		Handler:      http.HandlerFunc(handleRequest),
 		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 120 * time.Second,
@@ -1802,17 +1810,32 @@ startRetentionPruner()
 	}
 
 	fmt.Println()
-	fmt.Println("=== NetNinja Go Proxy Running on Port " + port + " ===")
+	fmt.Println("=== NetNinja Go Proxy Running on Ports: " + strings.Join(ports, ", ") + " ===")
 	fmt.Println("DNS: Google 8.8.8.8 / Cloudflare 1.1.1.1")
 	fmt.Println("Engine: Go (High-Performance Goroutine-based)")
 	fmt.Println("==============================================")
 	fmt.Println()
 
-	ln, err := net.Listen("tcp", bindAddr+":"+port)
-	if err != nil {
-		log.Fatal("Failed to listen on "+bindAddr+":"+port+":", err)
+	var lns []net.Listener
+	for _, p := range ports {
+		ln, err := net.Listen("tcp", bindAddr+":"+p)
+		if err != nil {
+			log.Fatal("Failed to listen on "+bindAddr+":"+p+":", err)
+		}
+		lns = append(lns, ln)
+		fmt.Println("LISTEN " + bindAddr + ":" + p)
 	}
-	log.Fatal(proxy.Serve(keepAliveListener{ln}))
+	fmt.Println()
+
+	for _, ln := range lns {
+		ln := ln
+		go func() {
+			if err := proxy.Serve(keepAliveListener{ln}); err != nil && err != http.ErrServerClosed {
+				log.Fatal("proxy.Serve:", err)
+			}
+		}()
+	}
+	select {}
 }
 
 // keepAliveListener enables TCP keepalive probes on every accepted connection
@@ -2860,6 +2883,26 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	close(tunnelDone)
 	activeTunnels.Delete(hostname)
 
+	// Log WHY the tunnel closed — tells us if the server killed it (deadline/
+	// read/write error) or a peer vanished (EOF/RST). Crucial for the recurring
+	// "connection closed unexpectedly" the client sees after a few minutes.
+	var closeReasons []string
+	for i := 0; i < 2; i++ {
+		if err := <-errc; err != nil && err != io.EOF {
+			closeReasons = append(closeReasons, err.Error())
+		}
+	}
+	if len(closeReasons) > 0 {
+		log.Printf("%s[CLOSE]%s %s ↔ %s closed after %s up=%d down=%d reason=%s",
+			colorYellow, colorReset, clientIP, host,
+			time.Since(tunnelStart).Round(time.Millisecond), tUp, tDown,
+			strings.Join(closeReasons, " | "))
+	} else {
+		log.Printf("%s[CLOSE]%s %s ↔ %s closed after %s up=%d down=%d",
+			colorYellow, colorReset, clientIP, host,
+			time.Since(tunnelStart).Round(time.Millisecond), tUp, tDown)
+	}
+
 	// Audit log entry for this completed tunnel
 	pushConnLog(connLogEntry{
 		username:  tunnelUser,
@@ -3036,6 +3079,15 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+
+	// Inherited http.Server ReadTimeout/WriteTimeout deadlines survive the
+	// gorilla Hijack() and would kill the dashboard WS at ~60-120s. Clear them.
+	if tc, ok := conn.UnderlyingConn().(*net.TCPConn); ok {
+		tc.SetDeadline(time.Time{})
+		tc.SetNoDelay(true)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+	}
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
