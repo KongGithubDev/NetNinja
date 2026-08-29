@@ -1062,60 +1062,11 @@ func startBwSampler() {
 // Active tunnel list for the dashboard
 var activeTunnels sync.Map // map[string]time.Time (host -> start time)
 
-// liveTunnel tracks an open CONNECT tunnel end-to-end so the idle reaper can
-// FIN-close genuinely idle ones (zero bytes BOTH directions) with a clean FIN
-// before a middlebox (home NAT / Azure SLB) silently drops them — the recurring
-// "proxy dead until wifi toggle" symptom.
-type liveTunnel struct {
-	id     int64
-	host   string
-	client *activityConn
-	dest   *activityConn
-}
-
-var liveTunnelSeq atomic.Int64
-var liveTunnels sync.Map // id -> *liveTunnel
-
 var copyBufPool = sync.Pool{
 	New: func() interface{} {
 		buf := make([]byte, 256*1024)
 		return &buf
 	},
-}
-
-// startTunnelReaper closes CONNECT tunnels that have had no traffic in either
-// direction for TUNNEL_IDLE_SECONDS (default 180). Active streams (video etc.)
-// constantly mark activity so they are never touched.
-func startTunnelReaper() {
-	secs := 600
-	if v := os.Getenv("TUNNEL_IDLE_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			secs = n
-		}
-	}
-	limit := time.Duration(secs) * time.Second
-	log.Printf("%s[REAP]%s idle-tunnel reaper active (TUNNEL_IDLE_SECONDS=%d)", colorCyan, colorReset, secs)
-	for {
-		time.Sleep(15 * time.Second)
-		now := time.Now()
-		killed := 0
-		liveTunnels.Range(func(k, v interface{}) bool {
-			lt := v.(*liveTunnel)
-			cAge := now.Sub(lt.client.Last())
-			dAge := now.Sub(lt.dest.Last())
-			if cAge >= limit && dAge >= limit {
-				log.Printf("%s[REAP]%s idle tunnel %s closed (client_idle=%s dest_idle=%s limit=%s)",
-					colorYellow, colorReset, lt.host, cAge.Round(time.Second), dAge.Round(time.Second), limit)
-				lt.client.Close()
-				lt.dest.Close()
-				killed++
-				if killed >= 2 {
-					return false
-				}
-			}
-			return true
-		})
-	}
 }
 
 // startMapSweeper periodically prunes stale entries from hostStats and
@@ -1950,7 +1901,6 @@ startRetentionPruner()
 	}
 
 	go startBwSampler()
-	go startTunnelReaper()
 	startMapSweeper()
 
 	proxy := &http.Server{
@@ -3068,14 +3018,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientAct := &activityConn{Conn: clientConn}
 	destAct := &activityConn{Conn: destConn}
-	tunnelDone := make(chan struct{})
-
-	// Register live tunnel for the idle reaper.
-	lt := &liveTunnel{id: liveTunnelSeq.Add(1), host: host, client: clientAct, dest: destAct}
-	clientAct.mark()
-	destAct.mark()
-	liveTunnels.Store(lt.id, lt)
-	defer liveTunnels.Delete(lt.id)
 
 	errc := make(chan error, 2)
 	var wg sync.WaitGroup
@@ -3129,7 +3071,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	// the last 60s of aggregate traffic regardless of active tunnels.
 
 	wg.Wait()
-	close(tunnelDone)
 	activeTunnels.Delete(hostname)
 
 	// Log WHY the tunnel closed — tells us if the server killed it (deadline/
