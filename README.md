@@ -73,6 +73,7 @@ Each account can decide to stop using the proxy (devices then connect to the int
 | ADBLOCK_URL | (off) | Fetch an external blocklist (adblock / hosts / dnsmasq / plain-domain) on boot then refresh every ADBLOCK_REFRESH_HOURS — e.g. HaGeZi `https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/multi.txt` (~190k domains) |
 | ADBLOCK_PATH | (off) | Local blocklist file — loaded once at boot; takes precedence over ADBLOCK_URL |
 | ADBLOCK_REFRESH_HOURS | 24 | How often to re-fetch ADBLOCK_URL |
+| PAC_DIRECT_DOMAINS | (none) | Comma-separated domains served `DIRECT` in /proxy.pac — the device skips the proxy for those hosts (useful when a site's Cloudflare blocks the datacenter/proxy IP, e.g. `animeruka.com`) |
 
 Without ADBLOCK_URL/PATH the proxy uses a small built-in list. Aggressive base ad-network domains (`*.doubleclick.net`, `*.googlesyndication.com`, …) are always merged into whatever list is loaded. Blocking walks the hostname + every parent label (a blocked domain covers its subdomains) with an `@@` allowlist honored first. Reload anytime at `/admin` → "โหลด blocklist ใหม่".
 

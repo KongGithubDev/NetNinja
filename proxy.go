@@ -2006,6 +2006,24 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
 		proxyHost = "localhost"
 	}
 
+	direct := []string{
+		"googlevideo.com", "apple.com", "icloud.com",
+		"apple-cloudkit.com", "mzstatic.com", "itunes.com",
+	}
+	if extra := os.Getenv("PAC_DIRECT_DOMAINS"); extra != "" {
+		for _, d := range strings.Split(extra, ",") {
+			d = strings.TrimSpace(d)
+			if strings.Trim(d, `"` + `'`) != "" {
+				direct = append(direct, strings.Trim(d, `"` + `'`))
+			}
+		}
+	}
+	var directCond []string
+	for _, d := range direct {
+		directCond = append(directCond, `dnsDomainIs(host, "`+d+`")`)
+	}
+	directList := strings.Join(directCond, " || ")
+
 	pac := fmt.Sprintf(`function FindProxyForURL(url, host) {
     if (isPlainHostName(host) ||
         shExpMatch(host, "10.*") ||
@@ -2015,17 +2033,12 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
         host == "localhost") {
         return "DIRECT";
     }
-    if (dnsDomainIs(host, "googlevideo.com") ||
-        dnsDomainIs(host, "apple.com") ||
-        dnsDomainIs(host, "icloud.com") ||
-        dnsDomainIs(host, "apple-cloudkit.com") ||
-        dnsDomainIs(host, "mzstatic.com") ||
-        dnsDomainIs(host, "itunes.com")) {
+    if (%s) {
         return "DIRECT";
     }
     return "PROXY %s; DIRECT";
 }
-`, proxyHost)
+`, directList, proxyHost)
 
 	w.Write([]byte(pac))
 
