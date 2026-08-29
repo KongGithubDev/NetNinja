@@ -1139,6 +1139,26 @@ var customDialer = &net.Dialer{
 	},
 }
 
+// setTCPKeepAliveFD sets TCP keepalive via syscall on a hijacked connection's
+// raw fd. Go's net.TCPConn.SetKeepAlive works on normal connections but may not
+// persist after HTTP Hijack(). This sets TCP_KEEPIDLE, TCP_KEEPINTVL, and
+// TCP_KEEPCNT directly on the socket fd via syscall.
+func setTCPKeepAliveFD(conn net.Conn, seconds int) {
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	raw.Control(func(fd uintptr) {
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, seconds)
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, seconds)
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPCNT, 3)
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Optional second-hop egress: when HOP_DOMAINS lists a host, tunnels to it are
 // dialed through a SOCKS5 server (HOP_SOCKS5, e.g. a Thai-VPS or home reverse
@@ -1950,7 +1970,7 @@ func (k keepAliveListener) Accept() (net.Conn, error) {
 		if tc, ok := c.(*net.TCPConn); ok {
 			tc.SetNoDelay(true)
 			tc.SetKeepAlive(true)
-			tc.SetKeepAlivePeriod(30 * time.Second)
+			tc.SetKeepAlivePeriod(10 * time.Second)
 		}
 	}
 	return c, err
@@ -2997,17 +3017,24 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if tc, ok := clientConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetKeepAlivePeriod(10 * time.Second)
 		tc.SetReadBuffer(256 * 1024)
 		tc.SetWriteBuffer(256 * 1024)
 	}
 	if tc, ok := destConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetKeepAlivePeriod(10 * time.Second)
 		tc.SetReadBuffer(256 * 1024)
 		tc.SetWriteBuffer(256 * 1024)
 	}
+
+	// Azure LB idle timeout bypass: set TCP_KEEPIDLE via syscall on hijacked fd
+	// Azure Standard LB drops idle connections after 240s. TCP keepalive ACKs
+	// are not counted as "data" by Azure's SNAT. We set keepalive to 10s via
+	// syscall to ensure the kernel sends probes on the raw socket fd.
+	setTCPKeepAliveFD(clientConn, 10)
+	setTCPKeepAliveFD(destConn, 10)
 
 	log.Printf("%s[TLS]%s %s ↔ %s %s(tunnel established)%s",
 		colorGreen, colorReset,
@@ -3276,7 +3303,7 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		tc.SetDeadline(time.Time{})
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetKeepAlivePeriod(10 * time.Second)
 	}
 
 	ticker := time.NewTicker(3 * time.Second)
