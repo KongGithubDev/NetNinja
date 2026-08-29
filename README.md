@@ -61,6 +61,8 @@ A forward proxy that bypasses Cisco Umbrella content filters (DNS-level blocking
 | PORT | 8080 | Listen port |
 | PROXY_ADDR | request Host | Proxy address embedded in the PAC / welcome flows |
 | LOG_RETENTION_DAYS | 30 | How long `conn_logs` rows are kept (admin_logs kept 90 days, per-user totals forever) |
+| TUNNEL_IDLE_SECONDS | 90 | Close established CONNECT tunnels idle this long (clean FIN before mobile NATs/Azure SLB silently drop them) |
+| PROXY_DEBUG | (off) | Verbose per-tunnel idle-watchdog logging |
 
 **SQLite stores** (`proxy_cache.db`, WAL mode): `proxy_users`, `user_settings` (quota + suspension), `user_hosts` (per-user per-host totals, flushed every 5s and reloaded on boot), `conn_logs` (append-only audit), `admin_logs`, `domain_rules`, `dns_records`.
 

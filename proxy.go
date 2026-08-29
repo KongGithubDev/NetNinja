@@ -623,6 +623,22 @@ func startRetentionPruner() {
 	}()
 }
 
+// Periodic heartbeat stats — helps diagnose connectivity issues after the fact
+func startHeartbeatStats() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			var tunnels int
+			activeTunnels.Range(func(k, v interface{}) bool { tunnels++; return true })
+			log.Printf("%s[STATS]%s active_conns=%d tunnels=%d requests=%d dropped=%d ad_blocked=%d",
+				colorGray, colorReset,
+				atomic.LoadInt64(&activeConns), tunnels,
+				atomic.LoadInt64(&totalRequests), atomic.LoadInt64(&errCount), atomic.LoadInt64(&adBlocked))
+		}
+	}()
+}
+
 // Record an admin action into admin_logs
 func recordAdminLog(adminUser, action, target, detail string) {
 	ts := time.Now().Format("2006-01-02 15:04:05")
@@ -639,6 +655,32 @@ type hostStat struct {
 	last  time.Time
 }
 var hostStats sync.Map // map[string]*hostStat
+
+// activityConn wraps a net.Conn and tracks when bytes last flowed on it, so an
+// idle tunnel watchdog can close fully-idle connections with a clean FIN before
+// a middlebox (home NAT / Azure SLB) silently drops them.
+type activityConn struct {
+	net.Conn
+	last atomic.Int64 // unix nanos of last read OR write activity
+}
+
+func (c *activityConn) mark()      { c.last.Store(time.Now().UnixNano()) }
+func (c *activityConn) Read(p []byte) (int, error) {
+	if n, err := c.Conn.Read(p); n > 0 {
+		c.mark()
+		return n, err
+	} else {
+		return n, err
+	}
+}
+func (c *activityConn) Write(p []byte) (int, error) {
+	if n, err := c.Conn.Write(p); n > 0 {
+		c.mark()
+		return n, err
+	} else {
+		return n, err
+	}
+}
 
 func (h *hostStat) addConn(n int64) {
 	h.mu.Lock()
@@ -961,6 +1003,7 @@ func main() {
 	startConnLogWriter()
 startRetentionPruner()
 	startUserHostsFlusher()
+	startHeartbeatStats()
 
 	// Extreme Performance: Cache local IPs and preload rules
 	updateLocalIPs()
@@ -1007,7 +1050,7 @@ startRetentionPruner()
 		Handler:      http.HandlerFunc(handleRequest),
 		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  180 * time.Second,
+		IdleTimeout:  90 * time.Second,
 	}
 
 	fmt.Println()
@@ -1017,7 +1060,28 @@ startRetentionPruner()
 	fmt.Println("==============================================")
 	fmt.Println()
 
-	log.Fatal(proxy.ListenAndServe())
+	ln, err := net.Listen("tcp", bindAddr+":"+port)
+	if err != nil {
+		log.Fatal("Failed to listen on "+bindAddr+":"+port+":", err)
+	}
+	log.Fatal(proxy.Serve(keepAliveListener{ln}))
+}
+
+// keepAliveListener enables TCP keepalive probes on every accepted connection
+// (30s period) so home NATs and Azure SLB never silently drop idle proxied
+// connections — the #1 cause of "proxy dies until I restart wifi".
+type keepAliveListener struct{ net.Listener }
+
+func (k keepAliveListener) Accept() (net.Conn, error) {
+	c, err := k.Listener.Accept()
+	if err == nil {
+		if tc, ok := c.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+			tc.SetKeepAlive(true)
+			tc.SetKeepAlivePeriod(30 * time.Second)
+		}
+	}
+	return c, err
 }
 
 func isLocalIP(ip string) bool {
@@ -1924,12 +1988,57 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	trackUserConn(tunnelUser)
 
+	// Idle watchdogs: mobile NATs / Azure SLB silently drop idle TCP (~4 min)
+	// with no FIN, leaving iOS with a zombie proxied connection until wifi
+	// restart. Wrap both ends with activity tracking and close the tunnel
+	// cleanly (FIN) once it has been fully idle too long, so clients reconnect
+	// immediately instead of hanging.
+	tunnelIdle := 90 * time.Second
+	if secs := os.Getenv("TUNNEL_IDLE_SECONDS"); secs != "" {
+		if n, err := strconv.Atoi(secs); err == nil && n > 0 && n <= 600 {
+			tunnelIdle = time.Duration(n) * time.Second
+		}
+	}
+	clientAct := &activityConn{Conn: clientConn}
+	destAct := &activityConn{Conn: destConn}
+	clientAct.mark()
+	destAct.mark()
+	tunnelDone := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(15 * time.Second)
+		defer tick.Stop()
+		debug := os.Getenv("PROXY_DEBUG") != ""
+		for {
+			select {
+			case <-tunnelDone:
+				return
+			case <-tick.C:
+				now := time.Now().UnixNano()
+				ci := int64(tunnelIdle)
+				cu := now - clientAct.last.Load()
+				du := now - destAct.last.Load()
+				if debug {
+					log.Printf("%s[TLS]%s watchdog %s ↔ %s client_idle=%ds dest_idle=%ds limit=%ds", colorGray, colorReset, clientIP, host, cu/int64(time.Second), du/int64(time.Second), tunnelIdle/time.Second)
+				}
+				if cu > ci && du > ci {
+					log.Printf("%s[TLS]%s idle tunnel %s ↔ %s closed after %dms (no traffic)", colorYellow, colorReset, clientIP, host, tunnelIdle.Milliseconds())
+					clientAct.Close()
+					destAct.Close()
+					return
+				}
+			}
+		}
+	}()
+
 	errc := make(chan error, 2)
+	var wg sync.WaitGroup
 	var tUp, tDown int64
 
 	// Client → dest (upload)
+	wg.Add(1)
 	go func() {
-		n, err := io.Copy(destConn, clientConn)
+		defer wg.Done()
+		n, err := io.Copy(destAct, clientAct)
 		atomic.AddInt64(&totalBytesUp, n)
 		tUp += n
 		if hs != nil {
@@ -1941,12 +2050,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		if n > 0 {
 			trackUserBytes(tunnelUser, n, 0)
 		}
-		destConn.Close()
+		destAct.Close()
 		errc <- err
 	}()
 	// dest → client (download)
+	wg.Add(1)
 	go func() {
-		n, err := io.Copy(clientConn, destConn)
+		defer wg.Done()
+		n, err := io.Copy(clientAct, destAct)
 		atomic.AddInt64(&totalBytesDown, n)
 		tDown += n
 		if hs != nil {
@@ -1958,7 +2069,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		if n > 0 {
 			trackUserBytes(tunnelUser, 0, n)
 		}
-		clientConn.Close()
+		clientAct.Close()
 		errc <- err
 	}()
 
@@ -1981,13 +2092,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 					bwHistory = bwHistory[len(bwHistory)-60:]
 				}
 				bwHistoryMu.Unlock()
-			case <-errc:
+			case <-tunnelDone:
 				return
 			}
 		}
 	}()
 
-	<-errc
+	wg.Wait()
+	close(tunnelDone)
 	activeTunnels.Delete(hostname)
 
 	// Audit log entry for this completed tunnel
