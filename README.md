@@ -63,6 +63,11 @@ A forward proxy that bypasses Cisco Umbrella content filters (DNS-level blocking
 | LOG_RETENTION_DAYS | 30 | How long `conn_logs` rows are kept (admin_logs kept 90 days, per-user totals forever) |
 | TUNNEL_IDLE_SECONDS | 90 | Close established CONNECT tunnels idle this long (clean FIN before mobile NATs/Azure SLB silently drop them) |
 | PROXY_DEBUG | (off) | Verbose per-tunnel idle-watchdog logging |
+| ADBLOCK_URL | (off) | Fetch an external blocklist (adblock / hosts / dnsmasq / plain-domain) on boot then refresh every ADBLOCK_REFRESH_HOURS — e.g. HaGeZi `https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/multi.txt` (~190k domains) |
+| ADBLOCK_PATH | (off) | Local blocklist file — loaded once at boot; takes precedence over ADBLOCK_URL |
+| ADBLOCK_REFRESH_HOURS | 24 | How often to re-fetch ADBLOCK_URL |
+
+Without ADBLOCK_URL/PATH the proxy uses a small built-in list. Aggressive base ad-network domains (`*.doubleclick.net`, `*.googlesyndication.com`, …) are always merged into whatever list is loaded. Blocking walks the hostname + every parent label (a blocked domain covers its subdomains) with an `@@` allowlist honored first. Reload anytime at `/admin` → "โหลด blocklist ใหม่".
 
 **SQLite stores** (`proxy_cache.db`, WAL mode): `proxy_users`, `user_settings` (quota + suspension), `user_hosts` (per-user per-host totals, flushed every 5s and reloaded on boot), `conn_logs` (append-only audit), `admin_logs`, `domain_rules`, `dns_records`.
 
