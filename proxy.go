@@ -2603,6 +2603,11 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
 	if proxyHost == "" {
 		proxyHost = "localhost"
 	}
+	// Extract bare IP for PAC DIRECT match (browser may send host without port)
+	proxyIP := proxyHost
+	if h, _, err := net.SplitHostPort(proxyHost); err == nil {
+		proxyIP = h
+	}
 
 	direct := []string{
 		"googlevideo.com", "apple.com", "icloud.com",
@@ -2628,6 +2633,8 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
         shExpMatch(host, "172.16.*") ||
         shExpMatch(host, "192.168.*") ||
         host == "127.0.0.1" ||
+        host == "%s" ||
+        host == "%s" ||
         host == "localhost") {
         return "DIRECT";
     }
@@ -2636,7 +2643,7 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
     }
     return "PROXY %s; DIRECT";
 }
-`, directList, proxyHost)
+`, proxyIP, proxyHost, directList, proxyHost)
 
 	w.Write([]byte(pac))
 
