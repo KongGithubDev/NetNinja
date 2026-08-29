@@ -34,7 +34,7 @@ A VLESS server with built-in SNI multiplexer that listens on a single TCP/UDP po
 A forward proxy that bypasses Cisco Umbrella content filters (DNS-level blocking). It resolves DNS and originates connections from the proxy's own IP, which sits outside the filtering policy. Includes an HTTP(S) CONNECT tunnel, a PAC auto-config server, and a block-check endpoint.
 
 **Features:**
-- HTTP Basic Auth via `PROXY_USERS="user:pass,user2:pass2"` (default `Kong:KongPassword`); additional users managed live via the admin console
+- HTTP Basic Auth via `PROXY_USERS="user:pass,user2:pass2"` (default `Kong:KongPassword`); additional users managed live via the admin console. Disable with `PROXY_AUTH_ENABLED=0` — when auth is off, the admin dashboard tracks connections by client IP instead of username
 - CONNECT tunneling over Go's high-performance goroutine engine
 - Dual DNS resolution (standard + DoH) for bypassing filtered resolvers
 - SQLite-backed persistent DNS cache and domain rule store (WAL mode, busy-timeout hardened)
@@ -68,6 +68,7 @@ Each account can decide to stop using the proxy (devices then connect to the int
 | Variable | Default | Description |
 |----------|---------|-------------|
 | PROXY_USERS | Kong:KongPassword | Comma-separated `user:pass` auth pairs |
+| PROXY_AUTH_ENABLED | 1 (on) | Set `0` or `false` to disable proxy authentication — anyone can use the proxy without credentials. Admin dashboard tracks connections by client IP instead of username |
 | ADMIN_USER | admin | Admin console BASIC-auth user |
 | ADMIN_PASS | (required) | Admin console password |
 | PORT | 8080 | Listen port |

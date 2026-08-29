@@ -22,6 +22,7 @@ privkey.pem
 # Build artifacts
 dist/
 proxy_linux*
+netninja-proxy-linux
 
 # Runtime data
 proxy_cache.db
