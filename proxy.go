@@ -3097,41 +3097,8 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		errc <- err
 	}()
 
-	// Conservative REAP: close idle tunnels BEFORE CGNAT timeout (~5 min)
-	// to prevent iOS from seeing RST (which triggers "proxy broken" cache).
-	// Sends TCP FIN (graceful close) instead of letting CGNAT send RST.
-	const reapIdleTimeout = 210 * time.Second // 3.5 min (< CGNAT ~5 min)
-	const reapCheckInterval = 30 * time.Second
-	reapDone := make(chan struct{})
-	var reapDoneOnce sync.Once
-	closeReapDone := func() { reapDoneOnce.Do(func() { close(reapDone) }) }
-	defer closeReapDone()
-	go func() {
-		ticker := time.NewTicker(reapCheckInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				idle := time.Since(clientAct.Last())
-				if idle >= reapIdleTimeout {
-					log.Printf("%s[REAP]%s %s ↔ %s idle=%s — sending FIN to beat CGNAT",
-						colorCyan, colorReset, clientIP, host,
-						idle.Round(time.Second))
-					// Send TCP FIN on both sides (graceful close)
-					if tc, ok := clientConn.(*net.TCPConn); ok {
-						tc.CloseWrite()
-					}
-					if tc, ok := destConn.(*net.TCPConn); ok {
-						tc.CloseWrite()
-					}
-					closeReapDone()
-					return
-				}
-			case <-reapDone:
-				return
-			}
-		}
-	}()
+	// Conservative REAP: DISABLED — iOS caches "proxy broken" from both
+	// FIN and RST. No server-side close helps; only IPv6 or Thai VPS works.
 
 	// Bandwidth history is maintained by the global sampler started once at
 	// boot (startBwSampler) — NOT per tunnel — so the realtime chart always has
