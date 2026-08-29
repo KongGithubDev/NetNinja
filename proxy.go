@@ -1019,6 +1019,28 @@ func (h *hostStat) addConn(n int64) {
 var bwHistory []int64
 var bwHistoryMu sync.Mutex
 
+// startBwSampler appends one aggregate traffic sample per second so the admin
+// realtime_bandwidth chart always has the last 60s of data, even with no
+// tunnels active (the old per-tunnel sampler left the chart empty between runs).
+func startBwSampler() {
+	var lastUp, lastDown int64
+	t := time.NewTicker(1 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		cu := atomic.LoadInt64(&totalBytesUp)
+		cd := atomic.LoadInt64(&totalBytesDown)
+		sample := cu + cd - lastUp - lastDown
+		lastUp = cu
+		lastDown = cd
+		bwHistoryMu.Lock()
+		bwHistory = append(bwHistory, sample)
+		if len(bwHistory) > 60 {
+			bwHistory = bwHistory[len(bwHistory)-60:]
+		}
+		bwHistoryMu.Unlock()
+	}
+}
+
 // Active tunnel list for the dashboard
 var activeTunnels sync.Map // map[string]time.Time (host -> start time)
 
@@ -1801,6 +1823,8 @@ startRetentionPruner()
 	if bindAddr == "" {
 		bindAddr = "0.0.0.0"
 	}
+
+	go startBwSampler()
 
 	proxy := &http.Server{
 		Handler:      http.HandlerFunc(handleRequest),
@@ -2854,30 +2878,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		errc <- err
 	}()
 
-	// Record bandwidth history every second (decoupled)
-	go func() {
-		t := time.NewTicker(1 * time.Second)
-		defer t.Stop()
-		var lastUp, lastDown int64
-		for {
-			select {
-			case <-t.C:
-				cu := atomic.LoadInt64(&totalBytesUp)
-				cd := atomic.LoadInt64(&totalBytesDown)
-				sample := cu + cd - lastUp - lastDown
-				lastUp = cu
-				lastDown = cd
-				bwHistoryMu.Lock()
-				bwHistory = append(bwHistory, sample)
-				if len(bwHistory) > 60 {
-					bwHistory = bwHistory[len(bwHistory)-60:]
-				}
-				bwHistoryMu.Unlock()
-			case <-tunnelDone:
-				return
-			}
-		}
-	}()
+	// Bandwidth history is maintained by the global sampler started once at
+	// boot (startBwSampler) — NOT per tunnel — so the realtime chart always has
+	// the last 60s of aggregate traffic regardless of active tunnels.
 
 	wg.Wait()
 	close(tunnelDone)
@@ -3454,6 +3457,11 @@ tailwind.config = {
 	.legend { @apply mt-2.5; }
 	.legend .li { @apply flex items-center gap-2 text-[#bbb] text-[11px] my-1; }
 	.legend .dot { @apply w-2.5 h-2.5 rounded inline-block; }
+	.charts { @apply grid gap-3.5 mb-5 grid-cols-1; }
+	@media (min-width:768px) { .charts { @apply grid-cols-2; } }
+	@media (min-width:1180px) { .charts { @apply grid-cols-3; } }
+	.chart-card { @apply bg-panel border border-line rounded p-3.5; }
+	.chart-card .ck { @apply text-mut text-[10px] uppercase tracking-wider mb-2.5; }
 	.navlink { @apply text-dim border border-[#2a2a2a] bg-panel px-3.5 py-1.5 rounded text-xs hover:text-white hover:border-ac; }
 	.navlink-cur { @apply text-ac border-ac bg-panel px-3.5 py-1.5 rounded text-xs; }
 }
@@ -3624,7 +3632,9 @@ func adminCharts(snaps []userSnap) string {
 	dnsM := atomic.LoadInt64(&dnsMisses)
 	dnsD := atomic.LoadInt64(&dohCalls)
 	dnsTotal := dnsH + dnsM + dnsD
+	dnsLabel := fmt.Sprintf("%d", dnsTotal)
 	if dnsTotal == 0 {
+		dnsLabel = "--"
 		dnsTotal = 1
 	}
 	const circ = 251.33 // 2*pi*r for r=40
@@ -3680,7 +3690,7 @@ func adminCharts(snaps []userSnap) string {
 		bwSparkSVG(bw, 600, 70),
 		hostRows,
 		userRows,
-		donut.String(), fmt.Sprintf("%d", dnsTotal),
+		donut.String(), dnsLabel,
 		html.EscapeString(fmtSize(dnsH)), html.EscapeString(fmtSize(dnsM)), html.EscapeString(fmtSize(dnsD)),
 		dmix, dmix, 100-dmix, 100-dmix,
 		html.EscapeString(fmtSize(down)), html.EscapeString(fmtSize(up)))
