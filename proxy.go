@@ -557,6 +557,7 @@ func startAdBlockRefresher() {
 	}()
 }
 var userTracker sync.Map // map[string]time.Time (IP -> last seen)
+var userConns sync.Map  // map[string]*atomic.Int32 (IP -> concurrent CONNECT count)
 
 // Per-user usage stats (keyed by proxy auth username)
 type userStat struct {
@@ -2612,6 +2613,7 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
 	direct := []string{
 		"googlevideo.com", "apple.com", "icloud.com",
 		"apple-cloudkit.com", "mzstatic.com", "itunes.com",
+		"ookla.com", "speedtest.net", "ooklaserver.net",
 	}
 	if extra := os.Getenv("PAC_DIRECT_DOMAINS"); extra != "" {
 		for _, d := range strings.Split(extra, ",") {
@@ -2850,12 +2852,45 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		trackID = clientIP
 	}
 
+	// Per-IP concurrent CONNECT limit (prevent speedtest floods)
+	if v, ok := userConns.Load(clientIP); ok {
+		cur := v.(*atomic.Int32)
+		if cur.Load() >= 20 {
+			atomic.AddInt64(&errCount, 1)
+			log.Printf("%s[RATE]%s %s CONNECT %s rejected (concurrent=%d limit=20)",
+				colorRed, colorReset, clientIP, host, cur.Load())
+			pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: host, status: "rate_limit", durMs: time.Since(tunnelStart).Milliseconds()})
+			hijack, ok := w.(http.Hijacker)
+			if !ok {
+				return
+			}
+			conn, _, err := hijack.Hijack()
+			if err != nil {
+				return
+			}
+			conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+			conn.Close()
+			return
+		}
+	}
+
 	log.Printf("%s[TLS]%s CONNECT %s ← %s ua=%s",
 		colorCyan, colorReset,
 		host, clientIP, r.Header.Get("User-Agent"))
 
 	atomic.AddInt64(&activeConns, 1)
 	defer atomic.AddInt64(&activeConns, -1)
+
+	// Track per-IP concurrent connections
+	var ipConnCount *atomic.Int32
+	if v, ok := userConns.Load(clientIP); ok {
+		ipConnCount = v.(*atomic.Int32)
+	} else {
+		ipConnCount = &atomic.Int32{}
+		userConns.Store(clientIP, ipConnCount)
+	}
+	ipConnCount.Add(1)
+	defer ipConnCount.Add(-1)
 
 	// extract hostname and port for cached DNS
 	hostname := host
