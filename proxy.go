@@ -1037,9 +1037,162 @@ var customDialer = &net.Dialer{
 	},
 }
 
+// ---------------------------------------------------------------------------
+// Optional second-hop egress: when HOP_DOMAINS lists a host, tunnels to it are
+// dialed through a SOCKS5 server (HOP_SOCKS5, e.g. a Thai-VPS or home reverse
+// tunnel). DNS is still resolved here (bypasses Cisco Umbrella), only the TCP
+// connection leaves from the hop's IP, so Cloudflare zones that block the
+// Azure datacenter IP (or geo-lock to Thailand) accept the connection.
+var hopDomains map[string]bool
+var hopSocks5 string
+var hopOnce sync.Once
+
+func loadHopConfig() {
+	hopOnce.Do(func() {
+		if e := os.Getenv("HOP_DOMAINS"); e != "" {
+			m := map[string]bool{}
+			for _, d := range strings.Split(e, ",") {
+				d = strings.ToLower(strings.TrimSpace(d))
+				if d != "" {
+					m[d] = true
+				}
+			}
+			hopDomains = m
+		}
+		hopSocks5 = strings.TrimSpace(os.Getenv("HOP_SOCKS5"))
+		if len(hopDomains) > 0 {
+			names := make([]string, 0, len(hopDomains))
+			for d := range hopDomains {
+				names = append(names, d)
+			}
+			sort.Strings(names)
+			if hopSocks5 == "" {
+				log.Printf("%s[HOP]%s HOP_DOMAINS set but HOP_SOCKS5 empty — hop disabled", colorYellow, colorReset)
+			} else {
+				log.Printf("%s[HOP]%s domains=[%s] via socks5 %s", colorGreen, colorReset, strings.Join(names, ","), hopSocks5)
+			}
+		}
+	})
+}
+
+func inHopDomains(host string) bool {
+	if len(hopDomains) == 0 || hopSocks5 == "" {
+		return false
+	}
+	h := strings.ToLower(host)
+	for {
+		if hopDomains[h] {
+			return true
+		}
+		i := strings.IndexByte(h, '.')
+		if i == -1 {
+			return false
+		}
+		h = h[i+1:]
+	}
+}
+
+// dialHop opens a connection through the SOCKS5 server (no-auth).
+func dialHop(ctx context.Context, address string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	c, err := d.DialContext(ctx, "tcp", hopSocks5)
+	if err != nil {
+		return nil, fmt.Errorf("hop dial %s: %w", hopSocks5, err)
+	}
+	fail := func(e error) (net.Conn, error) {
+		c.Close()
+		return nil, fmt.Errorf("socks5 %s: %w", hopSocks5, e)
+	}
+	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return fail(err)
+	}
+	rep := make([]byte, 2)
+	if _, err := io.ReadFull(c, rep); err != nil {
+		return fail(err)
+	}
+	if rep[0] != 0x05 || rep[1] != 0x00 {
+		return fail(fmt.Errorf("handshake rejected (ver=%d method=%d)", rep[0], rep[1]))
+	}
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return fail(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fail(err)
+	}
+	req := []byte{0x05, 0x01, 0x00}
+	if ip4 := net.ParseIP(host).To4(); ip4 != nil {
+		req = append(req, 0x01)
+		req = append(req, ip4...)
+	} else if ip16 := net.ParseIP(host).To16(); ip16 != nil {
+		req = append(req, 0x04)
+		req = append(req, ip16...)
+	} else {
+		if len(host) > 255 {
+			return fail(fmt.Errorf("hostname too long"))
+		}
+		req = append(req, 0x03, byte(len(host)))
+		req = append(req, []byte(host)...)
+	}
+	req = append(req, byte(port>>8), byte(port&0xff))
+	if _, err := c.Write(req); err != nil {
+		return fail(err)
+	}
+	if err := readSocksReply(c); err != nil {
+		return fail(err)
+	}
+	return c, nil
+}
+
+func readSocksReply(c net.Conn) error {
+	hdr := make([]byte, 4)
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		return err
+	}
+	if hdr[0] != 0x05 {
+		return fmt.Errorf("bad reply version %d", hdr[0])
+	}
+	if hdr[1] != 0x00 {
+		return fmt.Errorf("connect failed status=%d", hdr[1])
+	}
+	n := 6
+	switch hdr[3] {
+	case 0x01:
+		n = 6
+	case 0x04:
+		n = 18
+	case 0x03:
+		var ln [1]byte
+		if _, err := io.ReadFull(c, ln[:]); err != nil {
+			return err
+		}
+		n = int(ln[0]) + 2
+	default:
+		return fmt.Errorf("bad ATYP %d", hdr[3])
+	}
+	buf := make([]byte, n)
+	_, err := io.ReadFull(c, buf)
+	return err
+}
+
+// hopDial dials address, sending connections for matched hosts out through the
+// SOCKS5 hop and everything else via the normal custom dialer.
+func hopDial(ctx context.Context, network, hostname, address string) (net.Conn, error) {
+	if inHopDomains(hostname) {
+		return dialHop(ctx, address)
+	}
+	return customDialer.DialContext(ctx, network, address)
+}
 // Custom transport — God-Mode concurrency for heavy video streaming
 var proxyTransport = &http.Transport{
-	DialContext:           customDialer.DialContext,
+	DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		h, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			h = addr
+		}
+		return hopDial(ctx, network, h, addr)
+	},
 	MaxIdleConns:          5000,
 	MaxIdleConnsPerHost:   100,
 	IdleConnTimeout:       60 * time.Second,
@@ -1322,7 +1475,8 @@ func main() {
 	enableWindowsANSI()
 	initDB()
 	defer db.Close()
-	loadAppSettings()
+loadAppSettings()
+	loadHopConfig()
 	loadAdminCreds()
 	startConnLogWriter()
 startRetentionPruner()
@@ -2308,7 +2462,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		ip = hostname
 	}
 
-	destConn, err := customDialer.DialContext(r.Context(), "tcp", net.JoinHostPort(ip, port))
+	destConn, err := hopDial(r.Context(), "tcp", hostname, net.JoinHostPort(ip, port))
 	if err != nil {
 		atomic.AddInt64(&errCount, 1)
 		log.Printf("%s[ERR]%s CONNECT %s failed: %s", colorRed, colorReset, host, err)
@@ -2554,7 +2708,7 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 		hostname = h
 		port = p
 	}
-	destConn, err := customDialer.DialContext(r.Context(), "tcp", net.JoinHostPort(hostname, port))
+	destConn, err := hopDial(r.Context(), "tcp", hostname, net.JoinHostPort(hostname, port))
 	if err != nil {
 		log.Printf("%s[ERR]%s WS Dial %s failed: %v", colorRed, colorReset, host, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
