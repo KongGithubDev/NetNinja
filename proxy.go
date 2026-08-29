@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -285,37 +287,252 @@ var startTime time.Time
 
 // Ad-block: banner/tracking domains are refused at the proxy so the
 // client falls back gracefully (no banner/ad network round-trips).
-// Suffix list matches the domain and every subdomain under it.
-var adBlockSuffixes = []string{
-	".doubleclick.net", ".doubleclick.com",
-	".googlesyndication.com", ".googleadservices.com",
-	".googletagmanager.com", ".google-analytics.com", ".googletagservices.com",
-	".doubleverify.com", ".adsafeprotected.com", ".moatads.com", ".scorecardresearch.com",
-	".criteo.com", ".criteo.net", ".taboola.com", ".outbrain.com",
-	".adnxs.com", ".adsrvr.org", ".casalemedia.com", ".rubiconproject.com",
-	".pubmatic.com", ".openx.net", ".smartadserver.com", ".spotxchange.com",
-	".contextweb.com", ".emxdgt.com", ".tidaltv.com", ".teads.tv",
-	".amazon-adsystem.com", ".quantserve.com", ".advertising.com",
-	".adcolony.com", ".vungle.com", ".imrworldwide.com", ".thebrighttag.com",
+//
+// The rule set is loaded at boot from ADBLOCK_PATH (local file) or
+// ADBLOCK_URL (fetched at boot + refreshed every ADBLOCK_REFRESH_HOURS),
+// in adblock (`||domain^`), hosts (`0.0.0.0 domain`), dnsmasq
+// (`address=/domain/`) or plain-domain-list formats. When neither is set
+// a small built-in list is used as a zero-config fallback.
+//
+// Matching walks the full hostname and every parent label, so a blocked
+// domain covers itself and any subdomain (`||doubleclick.net^` blocks
+// `*.doubleclick.net` too). The whole set is swapped atomically on reload.
+var (
+	adBlockMu      sync.RWMutex
+	adBlockDomains map[string]struct{} // blocked domain → struct{}
+	adBlockAllow   map[string]struct{} // @@ allowlist domain → struct{}
+)
+
+var adBlockSource string
+var adBlockUpdated time.Time
+var adBlockCount int64
+
+// Built-in fallback list (kept so the proxy still ads-blocks out of the box).
+var adBlockFallbackDomains = []string{
+	"doubleclick.net", "doubleclick.com",
+	"googlesyndication.com", "googleadservices.com",
+	"googletagmanager.com", "google-analytics.com", "googletagservices.com",
+	"doubleverify.com", "adsafeprotected.com", "moatads.com", "scorecardresearch.com",
+	"criteo.com", "criteo.net", "taboola.com", "outbrain.com",
+	"adnxs.com", "adsrvr.org", "casalemedia.com", "rubiconproject.com",
+	"pubmatic.com", "openx.net", "smartadserver.com", "spotxchange.com",
+	"contextweb.com", "emxdgt.com", "tidaltv.com", "teads.tv",
+	"amazon-adsystem.com", "quantserve.com", "advertising.com",
+	"adcolony.com", "vungle.com", "imrworldwide.com", "thebrighttag.com",
+	"adservice.google.com", "adservice.google.co.th",
+	"pagead2.googlesyndication.com", "googleads.g.doubleclick.net",
 }
-var adBlockExact = map[string]bool{ // exact hostname match
-	"adservice.google.com":     true,
-	"adservice.google.co.th":   true,
-	"pagead2.googlesyndication.com": true,
-	"googleads.g.doubleclick.net":   true,
+
+func normalizeAdHost(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	h = strings.TrimSuffix(h, ".")
+	if i := strings.LastIndexByte(h, ':'); i > 0 {
+		if _, err := strconv.Atoi(h[i+1:]); err == nil { // trailing :port → strip
+			h = h[:i]
+		}
+		if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") { // [v6]
+			h = strings.TrimSuffix(h, "]")
+			h = strings.TrimPrefix(h, "[")
+		}
+	}
+	return h
 }
 
 func isAdBlockedHost(hostname string) bool {
-	h := strings.ToLower(strings.TrimSuffix(hostname, "."))
-	if adBlockExact[h] {
-		return true
+	adBlockMu.RLock()
+	doms, allow := adBlockDomains, adBlockAllow
+	adBlockMu.RUnlock()
+	if doms == nil {
+		return false
 	}
-	for _, suf := range adBlockSuffixes {
-		if strings.HasSuffix(h, suf) {
+	h := normalizeAdHost(hostname)
+	// allowlist first: an @@ domain (and its subdomains) is never blocked
+	for p := h; p != ""; {
+		if _, ok := allow[p]; ok {
+			return false
+		}
+		i := strings.IndexByte(p, '.')
+		if i < 0 {
+			break
+		}
+		p = p[i+1:]
+	}
+	for p := h; p != ""; {
+		if _, ok := doms[p]; ok {
 			return true
 		}
+		i := strings.IndexByte(p, '.')
+		if i < 0 {
+			return false
+		}
+		p = p[i+1:]
 	}
 	return false
+}
+
+// parseAdLine extracts a domain from one adblock-style entry:
+// `||domain^` (+ optional `$modifiers`), `*.domain`, dnsmasq
+// `address=/domain/`, or a bare domain.
+func parseAdLine(line string) (string, bool) {
+	s := line
+	if strings.HasPrefix(s, "||") {
+		s = strings.TrimPrefix(s, "||")
+	}
+	if strings.HasPrefix(s, "address=/") {
+		s = strings.TrimPrefix(s, "address=/")
+		if i := strings.IndexByte(s, '/'); i >= 0 {
+			s = s[:i]
+		}
+	}
+	s = strings.TrimPrefix(s, "*.")
+	if i := strings.IndexByte(s, '$'); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimSuffix(s, "^")
+	s = strings.TrimSpace(s)
+	if s == "" || strings.ContainsAny(s, " *#/") {
+		return "", false
+	}
+	s = strings.ToLower(s)
+	if !strings.Contains(s, ".") { // single label: too broad for suffix blocking
+		return "", false
+	}
+	return s, true
+}
+
+func parseAdBlock(r io.Reader) (doms, allow map[string]struct{}, parsed, skipped int, err error) {
+	doms = make(map[string]struct{})
+	allow = make(map[string]struct{})
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "!") || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
+			continue
+		}
+		if strings.HasPrefix(line, "@@") {
+			if d, ok := parseAdLine(strings.TrimPrefix(line, "@@")); ok {
+				allow[d] = struct{}{}
+				parsed++
+			} else {
+				skipped++
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "0.0.0.0") || strings.HasPrefix(line, "127.0.0.1") ||
+			strings.HasPrefix(line, "::1") || strings.HasPrefix(line, ":: ") {
+			f := strings.Fields(line)
+			if len(f) >= 2 {
+				if d, ok := parseAdLine(f[1]); ok {
+					doms[d] = struct{}{}
+					parsed++
+				} else {
+					skipped++
+				}
+			}
+			continue
+		}
+		if d, ok := parseAdLine(line); ok {
+			doms[d] = struct{}{}
+			parsed++
+		} else {
+			skipped++
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, nil, 0, 0, err
+	}
+	return doms, allow, parsed, skipped, nil
+}
+
+func swapAdBlock(doms, allow map[string]struct{}, src string, n int) {
+	adBlockMu.Lock()
+	adBlockDomains = doms
+	adBlockAllow = allow
+	adBlockMu.Unlock()
+	adBlockSource = src
+	adBlockUpdated = time.Now()
+	atomic.StoreInt64(&adBlockCount, int64(n))
+}
+
+func loadAdBlockFromReader(r io.Reader, src string) (int, error) {
+	doms, allow, parsed, skipped, err := parseAdBlock(r)
+	if err != nil {
+		return 0, err
+	}
+	// Always merge the aggressive base ad-network domains into any external
+	// list — curated lists like HaGeZi deliberately omit the parent domains
+	// (only specific endpoints), so without this `*.doubleclick.net` would
+	// slip through.
+	for _, d := range adBlockFallbackDomains {
+		if _, ok := doms[d]; !ok {
+			doms[d] = struct{}{}
+			parsed++
+		}
+	}
+	swapAdBlock(doms, allow, src, parsed)
+	log.Printf("%s[AD-BLOCK]%s loaded %d domains from %s (skipped %d)", colorGreen, colorReset, parsed, src, skipped)
+	return parsed, nil
+}
+
+func reloadAdBlock() error {
+	if p := os.Getenv("ADBLOCK_PATH"); p != "" {
+		if f, err := os.Open(p); err == nil {
+			defer f.Close()
+			_, err := loadAdBlockFromReader(f, "file:"+p)
+			return err
+		} else {
+			log.Printf("%s[AD-BLOCK]%s cannot read ADBLOCK_PATH=%s: %v — falling back", colorYellow, colorReset, p, err)
+		}
+	}
+	if u := os.Getenv("ADBLOCK_URL"); u != "" {
+		client := &http.Client{Timeout: 90 * time.Second}
+		resp, err := client.Get(u)
+		if err != nil {
+			log.Printf("%s[AD-BLOCK]%s fetch %s failed: %v — keeping current list", colorYellow, colorReset, u, err)
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("adblock fetch %s → HTTP %d", u, resp.StatusCode)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		_, err = loadAdBlockFromReader(bytes.NewReader(body), "url:"+u)
+		return err
+	}
+	// built-in fallback (zero-config)
+	doms := make(map[string]struct{}, len(adBlockFallbackDomains))
+	for _, d := range adBlockFallbackDomains {
+		doms[d] = struct{}{}
+	}
+	swapAdBlock(doms, nil, "builtin", len(doms))
+	log.Printf("%s[AD-BLOCK]%s using built-in fallback (%d domains); set ADBLOCK_PATH/ADBLOCK_URL for a fuller list (e.g. HaGeZi)", colorGray, colorReset, len(doms))
+	return nil
+}
+
+func startAdBlockRefresher() {
+	u := os.Getenv("ADBLOCK_URL")
+	if u == "" {
+		return
+	}
+	hours := 24
+	if s := os.Getenv("ADBLOCK_REFRESH_HOURS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			hours = v
+		}
+	}
+	go func() {
+		for {
+			time.Sleep(time.Duration(hours) * time.Hour)
+			log.Printf("%s[AD-BLOCK]%s refreshing blocklist from %s ...", colorYellow, colorReset, u)
+			if err := reloadAdBlock(); err != nil {
+				log.Printf("%s[AD-BLOCK]%s refresh failed: %v", colorRed, colorReset, err)
+			}
+		}
+	}()
 }
 var userTracker sync.Map // map[string]time.Time (IP -> last seen)
 
@@ -631,10 +848,10 @@ func startHeartbeatStats() {
 		for range ticker.C {
 			var tunnels int
 			activeTunnels.Range(func(k, v interface{}) bool { tunnels++; return true })
-			log.Printf("%s[STATS]%s active_conns=%d tunnels=%d requests=%d dropped=%d ad_blocked=%d",
+			log.Printf("%s[STATS]%s active_conns=%d tunnels=%d requests=%d dropped=%d ad_blocked=%d blocklist=%d",
 				colorGray, colorReset,
 				atomic.LoadInt64(&activeConns), tunnels,
-				atomic.LoadInt64(&totalRequests), atomic.LoadInt64(&errCount), atomic.LoadInt64(&adBlocked))
+				atomic.LoadInt64(&totalRequests), atomic.LoadInt64(&errCount), atomic.LoadInt64(&adBlocked), atomic.LoadInt64(&adBlockCount))
 		}
 	}()
 }
@@ -1004,6 +1221,8 @@ func main() {
 startRetentionPruner()
 	startUserHostsFlusher()
 	startHeartbeatStats()
+	reloadAdBlock()
+	startAdBlockRefresher()
 
 	// Extreme Performance: Cache local IPs and preload rules
 	updateLocalIPs()
@@ -1190,6 +1409,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if path == "/admin/suspend" {
 			handleAdminSuspend(w, r)
+			return
+		} else if path == "/admin/blocklist" {
+			handleAdminBlocklist(w, r)
 			return
 		} else if path == "/welcome" {
 			clientIP := getClientIP(r)
@@ -2785,6 +3007,22 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	top := adminPageTop("user_management // usage_monitor", r.URL.Path)
+	blSrc := adBlockSource
+	if blSrc == "" {
+		blSrc = "-"
+	}
+	blUpdated := adBlockUpdated.Format("2006-01-02 15:04")
+	if adBlockUpdated.IsZero() {
+		blUpdated = "-"
+	}
+	blCard := fmt.Sprintf(`
+	<div class="add-card" style="margin:12px 0">
+		<div style="color:#fff;margin-bottom:6px">ad-block blocklist</div>
+		<div class="dim" style="margin-bottom:8px">domains: <b>%d</b> &nbsp;·&nbsp; source: %s &nbsp;·&nbsp; loaded: %s &nbsp;·&nbsp; blocked_total: <b>%d</b>&nbsp;&nbsp;<a class="pager" style="color:#7af" href="/">ad-block-on dashboard</a></div>
+		<form method="post" action="/admin/blocklist" style="display:inline"><button type="submit" class="btn">โหลด blocklist ใหม่</button></form>
+	</div>
+	`, atomic.LoadInt64(&adBlockCount), html.EscapeString(blSrc), html.EscapeString(blUpdated), atomic.LoadInt64(&adBlocked))
+
 	body := fmt.Sprintf(`
 	<div class="tots">
 		<div class="tot"><div class="k">total_users</div><div class="v">%d</div></div>
@@ -2795,6 +3033,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 		<div class="tot"><div class="k">stored_log_rows</div><div class="v g">%d</div></div>
 	</div>
 
+	%s
 	%s
 
 	<table>
@@ -2815,7 +3054,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 		</form>
 	</div>
 `, len(snaps), fmtMB(totalUp), fmtMB(totalDown), totalConns, totalDev, logRows,
-		msgHTML, userRows)
+		blCard, msgHTML, userRows)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -3313,4 +3552,26 @@ func handleAdminSuspend(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s[ADMIN]%s unsuspended user %q", colorGreen, colorReset, user)
 		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ปลดระงับ '"+user+"' แล้ว"), http.StatusFound)
 	}
+}
+
+func handleAdminBlocklist(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	before := atomic.LoadInt64(&adBlockCount)
+	start := time.Now()
+	if err := reloadAdBlock(); err != nil {
+		recordAdminLog(adminUser, "blocklist", "-", "reload FAILED: "+err.Error())
+		log.Printf("%s[ADMIN]%s blocklist reload failed: %v", colorRed, colorReset, err)
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("โหลด blocklist ไม่สำเร็จ: "+err.Error()), http.StatusFound)
+		return
+	}
+	after := atomic.LoadInt64(&adBlockCount)
+	recordAdminLog(adminUser, "blocklist", "-", fmt.Sprintf("reloaded (%d → %d domains, %s)", before, after, time.Since(start).Round(time.Millisecond)))
+	log.Printf("%s[ADMIN]%s blocklist reloaded: %d → %d domains", colorGreen, colorReset, before, after)
+	http.Redirect(w, r, "/admin?msg="+url.QueryEscape(fmt.Sprintf("โหลด blocklist แล้ว (%d domains)", after)), http.StatusFound)
 }
