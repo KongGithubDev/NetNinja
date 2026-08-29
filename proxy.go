@@ -623,11 +623,101 @@ var userHosts sync.Map // map[string]*userHostStat  (key = username + "\x00" + h
 
 // Per-user account settings (persisted in user_settings table)
 type userSetting struct {
-	quotaBytes int64 // 0 = unlimited
-	suspended  bool
-	updatedAt  time.Time
+	quotaBytes     int64 // 0 = unlimited
+	suspended      bool
+	proxyEnabled   int // -1 inherit global, 0 off (connect direct), 1 on
+	adblockEnabled int // -1 inherit global, 0 off, 1 on
+	updatedAt      time.Time
 }
 var userSettings sync.Map // map[string]*userSetting (key = username)
+
+// Global master switches (settings table). 1 = enabled (default).
+var globalProxyEnabled int64 = 1
+var globalAdblockEnabled int64 = 1
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// proxyEnabledFor: can this user keep using the proxy? Effective = per-user
+// override if set, otherwise the global switch. When off, the proxy refuses
+// their traffic so the device falls back to a direct connection.
+func proxyEnabledFor(user string) bool {
+	if v, ok := userSettings.Load(user); ok {
+		if st := v.(*userSetting); st.proxyEnabled != -1 {
+			return st.proxyEnabled == 1
+		}
+	}
+	return atomic.LoadInt64(&globalProxyEnabled) == 1
+}
+
+// adblockEnabledFor: should ad/tracking hosts be refused for this user?
+// Effective = per-user override if set, otherwise the global switch.
+func adblockEnabledFor(user string) bool {
+	if v, ok := userSettings.Load(user); ok {
+		if st := v.(*userSetting); st.adblockEnabled != -1 {
+			return st.adblockEnabled == 1
+		}
+	}
+	return atomic.LoadInt64(&globalAdblockEnabled) == 1
+}
+
+// setAppSetting persists a global switch and applies it immediately.
+func setAppSetting(key string, on bool) {
+	v := int64(0)
+	if on {
+		v = 1
+	}
+	switch key {
+	case "proxy_enabled":
+		atomic.StoreInt64(&globalProxyEnabled, v)
+	case "adblock_enabled":
+		atomic.StoreInt64(&globalAdblockEnabled, v)
+	}
+	_, _ = db.Exec("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, on)
+}
+
+// loadAppSettings reads the global switches from the settings table.
+func loadAppSettings() {
+	rows, err := db.Query("SELECT key, value FROM settings")
+	if err != nil {
+		log.Printf("%s[SETTINGS]%s failed to read settings: %v", colorRed, colorReset, err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k string
+		var on bool
+		if rows.Scan(&k, &on) == nil {
+			setAppSetting(k, on)
+		}
+	}
+}
+
+// saveUserSetting persists a per-user flag set (proxy_enabled / adblock_enabled; -1 = inherit).
+func saveUserSetting(user string, proxyOn, adsOn int) {
+	old := userSetting{proxyEnabled: -1, adblockEnabled: -1}
+	if v, ok := userSettings.Load(user); ok {
+		old = *v.(*userSetting)
+	}
+	ns := userSetting{quotaBytes: old.quotaBytes, suspended: old.suspended,
+		proxyEnabled: proxyOn, adblockEnabled: adsOn, updatedAt: time.Now()}
+	userSettings.Store(user, &ns)
+	_, _ = db.Exec(`INSERT INTO user_settings (username, quota_bytes, suspended, proxy_enabled, adblock_enabled, updated_at) VALUES (?,?,?,?,?,DATETIME('now'))
+		ON CONFLICT(username) DO UPDATE SET quota_bytes=excluded.quota_bytes, suspended=excluded.suspended, proxy_enabled=excluded.proxy_enabled, adblock_enabled=excluded.adblock_enabled, updated_at=excluded.updated_at`,
+		user, ns.quotaBytes, boolInt(ns.suspended), ns.proxyEnabled, ns.adblockEnabled)
+}
+
+// flagLabel renders a human state for the per-user flag buttons.
+func flagLabel(v int) string {
+	if v == 0 {
+		return "off"
+	}
+	return "on"
+}
 
 // Live bytes used per user, seeded from persisted user_hosts and incremented as
 // traffic flows. Used for quota enforcement BEFORE the SQLite flush catches up.
@@ -1053,18 +1143,34 @@ func initDB() {
 		username TEXT PRIMARY KEY,
 		quota_bytes INTEGER DEFAULT 0,
 		suspended INTEGER DEFAULT 0,
+		proxy_enabled INTEGER DEFAULT -1,
+		adblock_enabled INTEGER DEFAULT -1,
 		updated_at TIMESTAMP
 	)`)
 	if err != nil {
 		log.Fatal("Failed to create user_settings table:", err)
 	}
-	rowsS, err := db.Query("SELECT username, quota_bytes, suspended FROM user_settings")
+	// Migrate older DBs that lack the flag columns (ignore duplicate-column errors)
+	_, _ = db.Exec("ALTER TABLE user_settings ADD COLUMN proxy_enabled INTEGER NOT NULL DEFAULT -1")
+	_, _ = db.Exec("ALTER TABLE user_settings ADD COLUMN adblock_enabled INTEGER NOT NULL DEFAULT -1")
+
+	// Global settings key/value (proxy_enabled, adblock_enabled master switches)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS settings (
+		key TEXT PRIMARY KEY,
+		value INTEGER NOT NULL DEFAULT 1
+	)`)
+	if err != nil {
+		log.Fatal("Failed to create settings table:", err)
+	}
+
+	// Per-user account settings (quota + suspension); applies to env and DB users alike
+	rowsS, err := db.Query("SELECT username, quota_bytes, suspended, proxy_enabled, adblock_enabled FROM user_settings")
 	if err == nil {
 		for rowsS.Next() {
 			var u string
-			var qb, sus int64
-			if rowsS.Scan(&u, &qb, &sus) == nil && u != "" {
-				userSettings.Store(u, &userSetting{quotaBytes: qb, suspended: sus == 1})
+			var qb, sus, pe, ad int64
+			if rowsS.Scan(&u, &qb, &sus, &pe, &ad) == nil && u != "" {
+				userSettings.Store(u, &userSetting{quotaBytes: qb, suspended: sus == 1, proxyEnabled: int(pe), adblockEnabled: int(ad)})
 			}
 		}
 		rowsS.Close()
@@ -1216,6 +1322,7 @@ func main() {
 	enableWindowsANSI()
 	initDB()
 	defer db.Close()
+	loadAppSettings()
 	loadAdminCreds()
 	startConnLogWriter()
 startRetentionPruner()
@@ -1412,6 +1519,15 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if path == "/admin/blocklist" {
 			handleAdminBlocklist(w, r)
+			return
+		} else if path == "/admin/settings" {
+			handleAdminSettings(w, r)
+			return
+		} else if path == "/admin/userflag" {
+			handleAdminUserFlag(w, r)
+			return
+		} else if path == "/settings" {
+			serveSettings(w, r)
 			return
 		} else if path == "/welcome" {
 			clientIP := getClientIP(r)
@@ -1979,8 +2095,16 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		setDomainRule(unwrappedHost, rule, isCisco)
 	}
 
+	// Account policy: proxy disabled? user must connect direct
+	if u := authedUser(r); u != "" && !proxyEnabledFor(u) {
+		log.Printf("%s[BLOCKED]%s %s (ip=%s) proxy disabled — refused HTTP %s", colorYellow, colorReset, u, clientIP, unwrappedHost)
+		pushConnLog(connLogEntry{username: u, clientIP: clientIP, host: unwrappedHost, status: "proxy_off", durMs: 0})
+		http.Error(w, "Proxy Disabled for this account (connect directly)", http.StatusForbidden)
+		return
+	}
+
 	// Ad-block: refuse explicit ad/tracking hosts on plain HTTP too
-	if isAdBlockedHost(unwrappedHost) {
+	if u := authedUser(r); adblockEnabledFor(u) && isAdBlockedHost(unwrappedHost) {
 		atomic.AddInt64(&adBlocked, 1)
 		log.Printf("%s[AD-BLOCK]%s refused HTTP %s ← %s", colorRed, colorReset, unwrappedHost, clientIP)
 		http.Error(w, "Forbidden (Ad-Blocked by NetNinja)", http.StatusForbidden)
@@ -2132,8 +2256,17 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		setDomainRule(hostname, "PROXY", true)
 	}
 
+	// Account policy: proxy disabled? user must connect direct
+	if tunnelUser != "" && !proxyEnabledFor(tunnelUser) {
+		atomic.AddInt64(&errCount, 1)
+		log.Printf("%s[BLOCKED]%s %s (ip=%s) proxy disabled — refused CONNECT %s", colorYellow, colorReset, tunnelUser, clientIP, host)
+		pushConnLog(connLogEntry{username: tunnelUser, clientIP: clientIP, host: hostname, status: "proxy_off", durMs: time.Since(tunnelStart).Milliseconds()})
+		http.Error(w, "Proxy Disabled for this account (connect directly)", http.StatusForbidden)
+		return
+	}
+
 	// Ad-block: refuse tunnels to ad/tracking networks before dialing
-	if isAdBlockedHost(hostname) {
+	if adblockEnabledFor(tunnelUser) && isAdBlockedHost(hostname) {
 		atomic.AddInt64(&adBlocked, 1)
 		log.Printf("%s[AD-BLOCK]%s refused CONNECT %s ← %s", colorRed, colorReset, hostname, clientIP)
 		pushConnLog(connLogEntry{username: tunnelUser, clientIP: clientIP, host: hostname, status: "ad_block", durMs: time.Since(tunnelStart).Milliseconds()})
@@ -2976,6 +3109,13 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		quotaForm := fmt.Sprintf(`<form method="post" action="/admin/quota" style="display:inline"><input type="hidden" name="user" value="%s"><input type="number" step="0.001" min="0" name="gbytes" value="%s" style="width:70px;background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:4px;border-radius:3px;font:inherit"><button type="submit" class="btn">set (GB)</button></form>`, html.EscapeString(s.name), strconv.FormatFloat(float64(s.quotaBytes)/1073741824, 'f', 3, 64))
+		pe, ae := -1, -1
+		if v, ok := userSettings.Load(s.name); ok {
+			pe = v.(*userSetting).proxyEnabled
+			ae = v.(*userSetting).adblockEnabled
+		}
+		proxyBtn := fmt.Sprintf(`<form method="post" action="/admin/userflag" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="proxy_enabled"><input type="hidden" name="value" value="%d"><button type="submit" class="btn" title="off = ปิด proxy ให้ user นี้ต่อตรงเลย">proxy:%s</button></form>`, html.EscapeString(s.name), nextFlagVal(pe), flagTxt(pe))
+		adBtn := fmt.Sprintf(`<form method="post" action="/admin/userflag" style="display:inline"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="adblock_enabled"><input type="hidden" name="value" value="%d"><button type="submit" class="btn" title="off = ปล่อยโฆษณาผ่าน (ไม่บล็อก)">ads:%s</button></form>`, html.EscapeString(s.name), nextFlagVal(ae), flagTxt(ae))
 		userRows += fmt.Sprintf(`<tr>
 			<td><a class="u" href="/admin/user?name=%s">%s</a>%s</td>
 			<td class="%s">%s</td>
@@ -2986,7 +3126,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 			<td class="dim">%s</td>
 			<td><span class="devc">%d</span><div class="devlist">%s</div></td>
 			%s
-			<td>%s %s
+			<td>%s %s %s %s
 				<form method="post" action="/admin/delete" style="display:inline" onsubmit="return confirm('ลบ user &#39;%s&#39;?' )"><input type="hidden" name="user" value="%s"><button type="submit" class="btn-del">ลบ</button></form>
 			</td>
 		</tr>`,
@@ -2996,7 +3136,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 			first, last,
 			s.deviceCount, devList,
 			quotaCell,
-			suspendBtn, quotaForm,
+			suspendBtn, proxyBtn, adBtn, quotaForm,
 			html.EscapeString(s.name), html.EscapeString(s.name))
 	}
 
@@ -3018,10 +3158,23 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 	blCard := fmt.Sprintf(`
 	<div class="add-card" style="margin:12px 0">
 		<div style="color:#fff;margin-bottom:6px">ad-block blocklist</div>
-		<div class="dim" style="margin-bottom:8px">domains: <b>%d</b> &nbsp;·&nbsp; source: %s &nbsp;·&nbsp; loaded: %s &nbsp;·&nbsp; blocked_total: <b>%d</b>&nbsp;&nbsp;<a class="pager" style="color:#7af" href="/">ad-block-on dashboard</a></div>
+		<div class="dim" style="margin-bottom:8px">domains: <b>%d</b> &nbsp;·&nbsp; source: %s &nbsp;·&nbsp; loaded: %s &nbsp;·&nbsp; blocked_total: <b>%d</b></div>
 		<form method="post" action="/admin/blocklist" style="display:inline"><button type="submit" class="btn">โหลด blocklist ใหม่</button></form>
 	</div>
 	`, atomic.LoadInt64(&adBlockCount), html.EscapeString(blSrc), html.EscapeString(blUpdated), atomic.LoadInt64(&adBlocked))
+
+	gProxy := atomic.LoadInt64(&globalProxyEnabled) == 1
+	gAd := atomic.LoadInt64(&globalAdblockEnabled) == 1
+	gblCard := fmt.Sprintf(`
+	<div class="add-card" style="margin:12px 0">
+		<div style="color:#fff;margin-bottom:6px">global settings (ทุก user)</div>
+		<form method="post" action="/admin/settings" style="display:flex;gap:18px;align-items:center;flex-wrap:wrap">
+			<label style="color:#bbb;font-size:12px"><input type="checkbox" name="proxy" value="on" %s> ปิด proxy (ให้ทุกคนต่อตรง)</label>
+			<label style="color:#bbb;font-size:12px"><input type="checkbox" name="adblock" value="on" %s> ปิด ads block (ปล่อยโฆษณาผ่าน)</label>
+			<button type="submit" class="btn">บันทึก global</button>
+		</form>
+	</div>
+	`, checked(!gProxy), checked(!gAd))
 
 	body := fmt.Sprintf(`
 	<div class="tots">
@@ -3033,6 +3186,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 		<div class="tot"><div class="k">stored_log_rows</div><div class="v g">%d</div></div>
 	</div>
 
+	%s
 	%s
 	%s
 
@@ -3054,7 +3208,7 @@ func serveAdmin(w http.ResponseWriter, r *http.Request) {
 		</form>
 	</div>
 `, len(snaps), fmtMB(totalUp), fmtMB(totalDown), totalConns, totalDev, logRows,
-		blCard, msgHTML, userRows)
+		blCard, gblCard, msgHTML, userRows)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -3108,7 +3262,7 @@ func serveAdminUser(w http.ResponseWriter, r *http.Request) {
 		var up, dn, dur int64
 		if rows.Scan(&ts, &ip, &h, &st, &up, &dn, &dur) == nil {
 			cls := "ok"
-			if st == "dial_fail" || st == "ad_block" {
+			if st == "dial_fail" || st == "ad_block" || st == "proxy_off" || st == "suspended" || st == "quota" {
 				cls = "err"
 			}
 			acts = append(acts, fmt.Sprintf(`<tr><td class="dim">%s</td><td class="%s">%s</td><td class="num">%s</td><td>%s</td><td class="num">%s</td><td class="num">%s</td><td class="dim">%s</td></tr>`,
@@ -3335,7 +3489,7 @@ func pgLink(show bool, href, label string) string {
 
 func statusOpts(cur string) string {
 	opts := ""
-	for _, s := range []string{"ok", "http", "dial_fail", "ad_block", "suspended", "quota"} {
+	for _, s := range []string{"ok", "http", "dial_fail", "ad_block", "proxy_off", "suspended", "quota"} {
 		sel := ""
 		if s == cur {
 			sel = "selected"
@@ -3476,12 +3630,12 @@ func handleAdminDelete(w http.ResponseWriter, r *http.Request) {
 
 // setUserQuota updates the in-memory setting and persists to SQLite
 func setUserQuota(user string, qb int64) {
-	old := userSetting{}
+	old := userSetting{proxyEnabled: -1, adblockEnabled: -1}
 	if v, ok := userSettings.Load(user); ok {
 		old = *v.(*userSetting)
 	}
-	userSettings.Store(user, &userSetting{quotaBytes: qb, suspended: old.suspended, updatedAt: time.Now()})
-	_, _ = db.Exec("INSERT INTO user_settings (username, quota_bytes, suspended, updated_at) VALUES (?, ?, 0, DATETIME('now')) ON CONFLICT(username) DO UPDATE SET quota_bytes=excluded.quota_bytes, updated_at=excluded.updated_at", user, qb)
+	userSettings.Store(user, &userSetting{quotaBytes: qb, suspended: old.suspended, proxyEnabled: old.proxyEnabled, adblockEnabled: old.adblockEnabled, updatedAt: time.Now()})
+	_, _ = db.Exec("INSERT INTO user_settings (username, quota_bytes, suspended, proxy_enabled, adblock_enabled, updated_at) VALUES (?, ?, 0, ?, ?, DATETIME('now')) ON CONFLICT(username) DO UPDATE SET quota_bytes=excluded.quota_bytes, updated_at=excluded.updated_at", user, qb, old.proxyEnabled, old.adblockEnabled)
 }
 
 func handleAdminQuota(w http.ResponseWriter, r *http.Request) {
@@ -3533,16 +3687,16 @@ func handleAdminSuspend(w http.ResponseWriter, r *http.Request) {
 	}
 	action := r.FormValue("action")
 	suspend := action == "suspend"
-	old := userSetting{}
+	old := userSetting{proxyEnabled: -1, adblockEnabled: -1}
 	if v, ok := userSettings.Load(user); ok {
 		old = *v.(*userSetting)
 	}
-	userSettings.Store(user, &userSetting{quotaBytes: old.quotaBytes, suspended: suspend, updatedAt: time.Now()})
+	userSettings.Store(user, &userSetting{quotaBytes: old.quotaBytes, suspended: suspend, proxyEnabled: old.proxyEnabled, adblockEnabled: old.adblockEnabled, updatedAt: time.Now()})
 	sus := 0
 	if suspend {
 		sus = 1
 	}
-	_, _ = db.Exec("INSERT INTO user_settings (username, quota_bytes, suspended, updated_at) VALUES (?, ?, ?, DATETIME('now')) ON CONFLICT(username) DO UPDATE SET suspended=excluded.suspended, updated_at=excluded.updated_at", user, old.quotaBytes, sus)
+	_, _ = db.Exec("INSERT INTO user_settings (username, quota_bytes, suspended, proxy_enabled, adblock_enabled, updated_at) VALUES (?, ?, ?, ?, ?, DATETIME('now')) ON CONFLICT(username) DO UPDATE SET suspended=excluded.suspended, updated_at=excluded.updated_at", user, old.quotaBytes, sus, old.proxyEnabled, old.adblockEnabled)
 	if suspend {
 		recordAdminLog(adminUser, "suspend", user, "account suspended")
 		log.Printf("%s[ADMIN]%s suspended user %q", colorYellow, colorReset, user)
@@ -3574,4 +3728,293 @@ func handleAdminBlocklist(w http.ResponseWriter, r *http.Request) {
 	recordAdminLog(adminUser, "blocklist", "-", fmt.Sprintf("reloaded (%d → %d domains, %s)", before, after, time.Since(start).Round(time.Millisecond)))
 	log.Printf("%s[ADMIN]%s blocklist reloaded: %d → %d domains", colorGreen, colorReset, before, after)
 	http.Redirect(w, r, "/admin?msg="+url.QueryEscape(fmt.Sprintf("โหลด blocklist แล้ว (%d domains)", after)), http.StatusFound)
+}
+
+// settingsUser returns the logged-in account for /settings. Accepts the
+// proxy-account credentials from either header (browsers send "Authorization",
+// proxy clients send "Proxy-Authorization") or the admin account.
+func settingsUser(r *http.Request) string {
+	check := func(hdr string) string {
+		auth := r.Header.Get(hdr)
+		if !strings.HasPrefix(auth, "Basic ") {
+			return ""
+		}
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
+		if err != nil {
+			return ""
+		}
+		parts := strings.SplitN(string(raw), ":", 2)
+		if len(parts) != 2 {
+			return ""
+		}
+		if p, ok := proxyUsers[parts[0]]; ok && p == parts[1] {
+			return parts[0]
+		}
+		if parts[0] == adminUser && parts[1] == adminPass {
+			return parts[0]
+		}
+		return ""
+	}
+	if u := check("Authorization"); u != "" {
+		return u
+	}
+	return check("Proxy-Authorization")
+}
+
+func validProxyUser(r *http.Request) string {
+	auth := r.Header.Get("Proxy-Authorization")
+	if !strings.HasPrefix(auth, "Basic ") {
+		return ""
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
+	if err != nil {
+		return ""
+	}
+	parts := strings.SplitN(string(raw), ":", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	if p, ok := proxyUsers[parts[0]]; ok && p == parts[1] {
+		return parts[0]
+	}
+	return ""
+}
+
+func settingsPage(u string, msg string) string {
+	pe, ae := -1, -1
+	if v, ok := userSettings.Load(u); ok {
+		pe = v.(*userSetting).proxyEnabled
+		ae = v.(*userSetting).adblockEnabled
+	}
+	peEff := proxyEnabledFor(u)
+	aeEff := adblockEnabledFor(u)
+	peTxt, aeTxt := flagTxt(pe), flagTxt(ae)
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Settings — NetNinja</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:13px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.w{max-width:430px;width:92%%;padding:30px;background:#111;border:1px solid #222;border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+h1{color:#fff;font-size:20px;margin:0 0 4px;font-weight:normal}
+h1 span{color:#0a0;margin-right:8px}
+.sub{color:#555;font-size:11px;margin-bottom:18px}
+.row{background:#151515;border:1px solid #232323;border-radius:6px;padding:14px;margin-bottom:10px}
+.row .t{color:#fff;font-size:13px;margin-bottom:2px}
+.row .d{color:#666;font-size:11px;margin-bottom:10px}
+.tag{display:inline-block;padding:1px 8px;border-radius:3px;font-size:11px;margin-left:6px}
+.tag.on{background:#040;color:#0f0;border:1px solid #0a0}
+.tag.off{background:#300;color:#f77;border:1px solid #a22}
+.tag.inh{background:#222;color:#999;border:1px solid #333}
+.row form{display:inline}
+button{background:#0d0d0d;border:1px solid #2a2a2a;color:#eee;padding:6px 12px;border-radius:3px;font:inherit;cursor:pointer}
+button:hover{border-color:#0a0}
+.btn-small{opacity:.6;font-size:11px;padding:5px 8px}
+.msg{background:#050;border:1px solid #0a0;color:#9f9;padding:8px 12px;border-radius:4px;margin-bottom:14px}
+.glob{background:#101010;border:1px solid #2a2a2a;border-radius:6px;padding:12px 14px;margin-bottom:16px;font-size:12px}
+.glob b{color:#fff}
+a{color:#7af;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="w">
+	<h1><span>●</span> settings</h1>
+	<div class="sub">user: %s</div>
+	%s
+	<div class="glob">global · proxy=<b>%s</b> · ads-block=<b>%s</b></div>
+	<div class="row">
+		<div class="t">Proxy ใช้งานได้ <span class="tag %s">%s</span> → <b>%s</b></div>
+		<div class="d">%s</div>
+		<form method="post" action="/settings"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="proxy_enabled"><button type="submit">สลับ → %s</button></form>
+		<form method="post" action="/settings"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="proxy_enabled"><input type="hidden" name="value" value="-1"><button type="submit" class="btn-small">reset inherit</button></form>
+	</div>
+	<div class="row">
+		<div class="t">Ads block <span class="tag %s">%s</span> → <b>%s</b></div>
+		<div class="d">%s</div>
+		<form method="post" action="/settings"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="adblock_enabled"><button type="submit">สลับ → %s</button></form>
+		<form method="post" action="/settings"><input type="hidden" name="user" value="%s"><input type="hidden" name="flag" value="adblock_enabled"><input type="hidden" name="value" value="-1"><button type="submit" class="btn-small">reset inherit</button></form>
+	</div>
+	<div style="text-align:center"><a href="/">← dashboard</a></div>
+</div>
+</body>
+</html>`,
+		html.EscapeString(u), msg,
+		flagTxt(boolInt(atomic.LoadInt64(&globalProxyEnabled) == 1)), flagTxt(boolInt(atomic.LoadInt64(&globalAdblockEnabled) == 1)),
+		flagCls(pe), peTxt, flagTxt(boolInt(peEff)), proxyHelp(peEff),
+		html.EscapeString(u), toggleLbl(peEff, "proxy"),
+		html.EscapeString(u),
+		flagCls(ae), aeTxt, flagTxt(boolInt(aeEff)), adHelp(aeEff),
+		html.EscapeString(u), toggleLbl(aeEff, "adblock"),
+		html.EscapeString(u))
+}
+
+// toggleLbl names the action the "สลับ" button will perform.
+func toggleLbl(effOn bool, which string) string {
+	if which == "proxy" {
+		if effOn {
+			return "ปิด (ต่อตรง)"
+		}
+		return "เปิด (ใช้ proxy)"
+	}
+	if effOn {
+		return "ปิด ads block"
+	}
+	return "เปิด ads block"
+}
+
+func flagTxt(v int) string {
+	switch v {
+	case 0:
+		return "off"
+	case 1:
+		return "on"
+	default:
+		return "inherit"
+	}
+}
+
+func checked(on bool) string {
+	if on {
+		return "checked"
+	}
+	return ""
+}
+
+func flagCls(v int) string {
+	if v == 1 {
+		return "on"
+	}
+	if v == 0 {
+		return "off"
+	}
+	return "inh"
+}
+
+func nextFlagVal(v int) int {
+	if v == 0 {
+		return -1
+	}
+	if v == 1 {
+		return 0
+	}
+	return 1
+}
+
+func proxyHelp(effOn bool) string {
+	if effOn {
+		return "Traffic ผ่าน proxy นี้ตามปกติ"
+	}
+	return "Proxy ถูกปิด — อุปกรณ์จะต่อตรงไปยังปลายทางเลย"
+}
+
+func adHelp(effOn bool) string {
+	if effOn {
+		return "ปฏิเสธ host โฆษณา/tracking (list ที่โหลดไว้)"
+	}
+	return "ปล่อยโฆษณาผ่าน ไม่บล็อก"
+}
+
+func serveSettings(w http.ResponseWriter, r *http.Request) {
+	u := settingsUser(r)
+	if u == "" {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="NetNinja"`)
+		w.Header().Set("WWW-Authenticate", `Basic realm="NetNinja Settings"`)
+		http.Error(w, "Authentication Required — use your proxy user/password", http.StatusUnauthorized)
+		return
+	}
+	msg := ""
+	if r.Method == http.MethodPost {
+		target := strings.TrimSpace(r.FormValue("user"))
+		flag := r.FormValue("flag")
+		if target != u {
+			msg = `<div class="msg" style="background:#300;border-color:#a22;color:#f99">แก้ได้เฉพาะบัญชีตัวเอง</div>`
+		} else {
+			pe, ae := -1, -1
+			if v, ok := userSettings.Load(u); ok {
+				pe = v.(*userSetting).proxyEnabled
+				ae = v.(*userSetting).adblockEnabled
+			}
+			// Explicit value given (inherit link) or toggle the effective state?
+			if val := strings.TrimSpace(r.FormValue("value")); val != "" {
+				if n, err := strconv.Atoi(val); err == nil && n >= -1 && n <= 1 {
+					if flag == "proxy_enabled" {
+						pe = n
+					} else if flag == "adblock_enabled" {
+						ae = n
+					}
+				}
+			} else {
+				switch flag {
+				case "proxy_enabled":
+					pe = boolInt(!proxyEnabledFor(u))
+				case "adblock_enabled":
+					ae = boolInt(!adblockEnabledFor(u))
+				}
+			}
+			saveUserSetting(u, pe, ae)
+			recordAdminLog(u, "settings", u, flag+" → "+flagTxt(pe)+"/"+flagTxt(ae))
+			msg = `<div class="msg">บันทึกแล้ว</div>`
+		}
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write([]byte(settingsPage(u, msg)))
+}
+
+func handleAdminSettings(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	oldP, oldA := atomic.LoadInt64(&globalProxyEnabled), atomic.LoadInt64(&globalAdblockEnabled)
+	setAppSetting("proxy_enabled", r.FormValue("proxy") != "on")
+	setAppSetting("adblock_enabled", r.FormValue("adblock") != "on")
+	newP, newA := atomic.LoadInt64(&globalProxyEnabled), atomic.LoadInt64(&globalAdblockEnabled)
+	recordAdminLog(adminUser, "settings", "global", fmt.Sprintf("proxy %d→%d, adblock %d→%d", oldP, newP, oldA, newA))
+	log.Printf("%s[ADMIN]%s global settings: proxy=%d adblock=%d", colorGreen, colorReset, newP, newA)
+	http.Redirect(w, r, "/admin?msg="+url.QueryEscape(fmt.Sprintf("บันทึก global: proxy=%s adblock=%s", flagTxt(int(newP)), flagTxt(int(newA)))), http.StatusFound)
+}
+
+func handleAdminUserFlag(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthRequired(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/admin", http.StatusFound)
+		return
+	}
+	user := strings.TrimSpace(r.FormValue("user"))
+	flag := r.FormValue("flag")
+	if user == "" {
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ไม่พบ user"), http.StatusFound)
+		return
+	}
+	next, _ := strconv.Atoi(strings.TrimSpace(r.FormValue("value")))
+	if next < -1 || next > 1 {
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("ค่าไม่ถูกต้อง"), http.StatusFound)
+		return
+	}
+	pe, ae := -1, -1
+	if v, ok := userSettings.Load(user); ok {
+		pe = v.(*userSetting).proxyEnabled
+		ae = v.(*userSetting).adblockEnabled
+	}
+	switch flag {
+	case "proxy_enabled":
+		pe = next
+	case "adblock_enabled":
+		ae = next
+	default:
+		http.Redirect(w, r, "/admin?msg="+url.QueryEscape("flag ไม่รู้จัก"), http.StatusFound)
+		return
+	}
+	saveUserSetting(user, pe, ae)
+	recordAdminLog(adminUser, "settings", user, fmt.Sprintf("%s=%s", flag, flagTxt(next)))
+	log.Printf("%s[ADMIN]%s set %s=%s for %q", colorGreen, colorReset, flag, flagTxt(next), user)
+	http.Redirect(w, r, "/admin?msg="+url.QueryEscape(fmt.Sprintf("ตั้งค่า '%s' %s", user, flagTxt(next))), http.StatusFound)
 }

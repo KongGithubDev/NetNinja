@@ -48,8 +48,15 @@ A forward proxy that bypasses Cisco Umbrella content filters (DNS-level blocking
 **Admin console (`/admin` with `ADMIN_USER` / `ADMIN_PASS`):**
 - `/admin` — all users: bytes up/down, connection count, first/last seen, live indicator, devices (client IP + UA), plus add/delete user, set quota (GB), suspend/unsuspend
 - `/admin/user?name=<user>` — drill-down: per-host traffic summary and the last 100 activities
-- `/admin/logs` — full connection audit trail (status flows: `ok`, `http`, `dial_fail`, `ad_block`, `suspended`, `quota`) with user/host/status filters and pagination
-- `/admin/audit` — every admin action (add/delete/quota/suspend) with timestamps
+- `/admin/logs` — full connection audit trail (status flows: `ok`, `http`, `dial_fail`, `ad_block`, `proxy_off`, `suspended`, `quota`) with user/host/status filters and pagination
+- `/admin/audit` — every admin action (add/delete/quota/suspend/settings) with timestamps
+
+**User settings (`/settings` — BASIC auth with your own proxy account, run `curl -u user:pass` or open in a browser):**
+
+Each account can decide to stop using the proxy (devices then connect to the internet **directly**, unsurprisingly through the PAC's `; DIRECT` fallback) and/or disable ad-blocking for themselves. Toggles apply immediately and persist in SQLite. Admins also get global switches + per-user flags at `/admin`.
+- Per-user: `/settings` — "สลับ → ปิด (ต่อตรง)" / "สลับ → ปิด ads block", plus "reset inherit" to go back to following the global switch
+- Global (all users): `/admin` → "global settings" → "ปิด proxy (ให้ทุกคนต่อตรง)" / "ปิด ads block (ปล่อยโฆษณาผ่าน)"
+- A refused proxy gives HTTP 403 + audit status `proxy_off` (account policy), so the device falls back to the PAC's `; DIRECT` route
 
 **Proxy environment variables:**
 
