@@ -183,6 +183,27 @@ CDN ทั่วไปไม่ได้เป็น generic TCP CONNECT proxy �
 | CONNECT rate limit 50 | Done | ✅ ป้องกัน abuse |
 | PAC DIRECT speedtest | Done | ✅ Speedtest ไม่ผ่าน proxy |
 | PAC DIRECT server IP | Done | ✅ Dashboard bypass proxy |
+| Conservative REAP (3.5 min) | Done | ⏳ กำลังทดสอบ — ส่ง FIN ก่อน CGNAT timeout |
+| Suppress favicon.ico spam | Done | ✅ ไม่ log favicon.ico อีก |
+| Suppress context canceled | Done | ✅ ไม่ log benign client disconnect |
+
+## Conservative REAP — วิธีทำงาน
+
+```
+เดิม (REAP disabled):
+iPad ←idle 5 min→ Proxy
+CGNAT → RST → iPad เห็น "proxy broken" → cache
+
+ใหม่ (Conservative REAP):
+iPad ←idle 3.5 min→ Proxy → ส่ง FIN (graceful close)
+iOS เห็น FIN → เปิด tunnel ใหม่ → ทำงานต่อ
+```
+
+**กลไก**:
+- ทุก tunnel มี goroutine เช็ค idle time ทุก 30 วินาที
+- ถ้า idle >= 210 วินาที (3.5 นาที) → ส่ง TCP FIN ทั้ง client + dest
+- FIN = graceful close (ไม่ใช่ RST) → iOS ควรรับได้ดีกว่า RST
+- ใช้ `sync.Once` ป้องกัน double-close panic
 
 ## สรุป
 
@@ -195,4 +216,8 @@ CDN ทั่วไปไม่ได้เป็น generic TCP CONNECT proxy �
   - ไม่ต้อง: ย้าย server, ลงแอพ, ตั้ง VPN
 
 ทางแก้สำรอง: Deploy บน Thai VPS (domestic traffic ไม่ผ่าน CGNAT โหด)
+
+ทางแก้ชั่วคราว: Conservative REAP (ส่ง FIN ก่อน CGNAT timeout)
+  - สถานะ: กำลังทดสอบ
+  - ข้อจำกัด: iOS อาจ cache "proxy broken" จาก FIN ด้วย
 ```

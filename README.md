@@ -75,6 +75,7 @@ Each account can decide to stop using the proxy (devices then connect to the int
 | PROXY_ADDR | request Host | Proxy address embedded in the PAC / welcome flows |
 | LOG_RETENTION_DAYS | 30 | How long `conn_logs` rows are kept (admin_logs kept 90 days, per-user totals forever) |
 | TUNNEL_IDLE_SECONDS | 180 | Reap established CONNECT tunnels that have had NO traffic (both directions) this long — clean FIN before mobile NATs/Azure SLB can silently drop them; active streams (video) are never touched |
+| CONNECT_LIMIT_PER_IP | 50 | Max concurrent CONNECT tunnels per client IP |
 | PROXY_DEBUG | (off) | Verbose per-tunnel idle-watchdog logging |
 | ADBLOCK_URL | (off) | Fetch an external blocklist (adblock / hosts / dnsmasq / plain-domain) on boot then refresh every ADBLOCK_REFRESH_HOURS — e.g. HaGeZi `https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/multi.txt` (~190k domains) |
 | ADBLOCK_PATH | (off) | Local blocklist file — loaded once at boot; takes precedence over ADBLOCK_URL |
@@ -323,6 +324,22 @@ net_server uses an in-memory listener pattern. The main TCP listener accepts all
 ### DNS Resolution
 
 Multi-layered approach: in-memory cache (with video CDN-aware TTL) -> standard DNS via Google/Cloudflare -> DNS over HTTPS fallback -> IPv6 support with automatic fallback. Detects and unwraps Cisco Umbrella SSE-wrapped domain names.
+
+### CGNAT Mitigation (Conservative REAP)
+
+Mobile networks (e.g. True Corp) use CGNAT with ~5 min idle timeout for international traffic. Conservative REAP closes idle tunnels with TCP FIN before CGNAT sends RST, preventing iOS from caching "proxy broken":
+
+```
+Idle tunnel > 3.5 min → Proxy sends TCP FIN → iOS sees graceful close → reconnects automatically
+Idle tunnel > 5 min   → CGNAT sends RST → iOS caches "proxy broken" → requires WiFi toggle
+```
+
+- Goroutine per tunnel checks idle time every 30s
+- Threshold: 210s (3.5 min) — well under CGNAT ~5 min timeout
+- Uses `sync.Once` to prevent double-close panic
+- Suppresses `context canceled` and `favicon.ico` log spam
+
+See `TROUBLESHOOTING.md` for full CGNAT analysis.
 
 ---
 
