@@ -2853,12 +2853,18 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Per-IP concurrent CONNECT limit (prevent speedtest floods)
+	connectLimit := 50
+	if v := os.Getenv("CONNECT_LIMIT_PER_IP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			connectLimit = n
+		}
+	}
 	if v, ok := userConns.Load(clientIP); ok {
 		cur := v.(*atomic.Int32)
-		if cur.Load() >= 20 {
+		if cur.Load() >= int32(connectLimit) {
 			atomic.AddInt64(&errCount, 1)
-			log.Printf("%s[RATE]%s %s CONNECT %s rejected (concurrent=%d limit=20)",
-				colorRed, colorReset, clientIP, host, cur.Load())
+			log.Printf("%s[RATE]%s %s CONNECT %s rejected (concurrent=%d limit=%d)",
+				colorRed, colorReset, clientIP, host, cur.Load(), connectLimit)
 			pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: host, status: "rate_limit", durMs: time.Since(tunnelStart).Milliseconds()})
 			hijack, ok := w.(http.Hijacker)
 			if !ok {
