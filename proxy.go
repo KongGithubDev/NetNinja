@@ -95,6 +95,23 @@ func updateLocalIPs() {
 			}
 		}
 	}
+	// Treat the proxy's own published hostname (PROXY_ADDR) as local too —
+	// otherwise clients that route their dashboard /ws WebSocket through the
+	// proxy send absolute-form "ws://proxy.example:443/ws" requests whose host
+	// never matches, forcing handleWSUpgrade to dial the proxy itself (self-loop).
+	if pa := os.Getenv("PROXY_ADDR"); pa != "" {
+		paHost := pa
+		if h, _, err := net.SplitHostPort(pa); err == nil {
+			paHost = h
+		}
+		if ip := net.ParseIP(paHost); ip != nil {
+			newIPs[ip.String()] = true
+		} else if ips, err := net.LookupIP(paHost); err == nil {
+			for _, ip := range ips {
+				newIPs[ip.String()] = true
+			}
+		}
+	}
 	localIPsMu.Lock()
 	localIPs = newIPs
 	localIPsMu.Unlock()
@@ -2901,9 +2918,18 @@ func isSelf(reqHost, headerHost string) bool {
 	if h, _, err := net.SplitHostPort(reqHost); err == nil {
 		hostOnly = h
 	}
-	// Case 1: Matches a local IP (loopback / interface addresses)
+	// Case 1: Matches a local IP (loopback / interface addresses / PROXY_ADDR)
 	if isLocalIP(hostOnly) {
 		return true
+	}
+	// Case 1b: Hostname resolves to one of our own IPs (e.g. the proxy's
+	// public hostname when accessed absolute-form through itself).
+	if ips, err := net.LookupIP(strings.Trim(hostOnly, "[]")); err == nil {
+		for _, ip := range ips {
+			if isLocalIP(ip.String()) {
+				return true
+			}
+		}
 	}
 	// Case 2: Matches this proxy's own published address (PROXY_ADDR host, BIND_ADDR, localhost)
 	if h, _, err := net.SplitHostPort(os.Getenv("PROXY_ADDR")); err == nil && strings.EqualFold(hostOnly, h) {
@@ -2926,6 +2952,15 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 	if h, p, err := net.SplitHostPort(host); err == nil {
 		hostname = h
 		port = p
+	}
+	// Refuse to dial the proxy itself (self-loop protection). This happens
+	// when a client routes the dashboard /ws WebSocket through the proxy and
+	// sends it absolute-form: the request host is this proxy's own hostname,
+	// so forwarding it would just loop back into handleWSUpgrade forever.
+	if isSelf(hostname, hostname) {
+		log.Printf("%s[WS-PROXY]%s Refused self-dial for %s from %s", colorYellow, colorReset, host, clientIP)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
 	}
 	destConn, err := hopDial(r.Context(), "tcp", hostname, net.JoinHostPort(hostname, port))
 	if err != nil {
