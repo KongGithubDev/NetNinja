@@ -42,8 +42,10 @@ var openedForIPs sync.Map // map[string]bool
 // Proxy Basic Auth — loaded from PROXY_USERS="user:pass,user2:pass2"
 var proxyUsers = map[string]string{}
 
+var proxyAuthEnabled = true
+
 func authRequired(w http.ResponseWriter, r *http.Request) bool {
-	if len(proxyUsers) == 0 {
+	if !proxyAuthEnabled || len(proxyUsers) == 0 {
 		return true
 	}
 	auth := r.Header.Get("Proxy-Authorization")
@@ -218,20 +220,25 @@ func hyperResolve(ctx context.Context, host string) (string, error) {
 	}()
 
 	var lastErr error
+	var bestIP string
 	for i := 0; i < 2; i++ {
 		r := <-ch
 		if r.err == nil && r.ip != "" {
-			// Cache result for 5 min
-			exp := time.Now().Add(5 * time.Minute)
-			dnsCache.Store(host, dnsEntry{ip: r.ip, expiry: exp})
-			go func() {
-				_, _ = db.Exec("INSERT OR REPLACE INTO dns_records (host, ip, expiry) VALUES (?, ?, ?)", host, r.ip, exp)
-			}()
-			return r.ip, nil
+			if bestIP == "" {
+				bestIP = r.ip
+			}
+		} else if r.err != nil {
+			lastErr = r.err
 		}
-		lastErr = r.err
 	}
-
+	if bestIP != "" {
+		exp := time.Now().Add(5 * time.Minute)
+		dnsCache.Store(host, dnsEntry{ip: bestIP, expiry: exp})
+		go func() {
+			_, _ = db.Exec("INSERT OR REPLACE INTO dns_records (host, ip, expiry) VALUES (?, ?, ?)", host, bestIP, exp)
+		}()
+		return bestIP, nil
+	}
 	return "", lastErr
 }
 
@@ -816,7 +823,9 @@ func startConnLogWriter() {
 	connLogWriterStarted = true
 	go func() {
 		buf := make([]connLogEntry, 0, 256)
-		ticker := time.NewTicker(2 * time.Second)
+		// Stagger start to avoid tick alignment with userHostsFlusher
+		time.Sleep(3 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -873,7 +882,7 @@ func pushConnLog(e connLogEntry) {
 // per-host usage (and thus quota accounting) survives restarts.
 func startUserHostsFlusher() {
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		stmts := make([]string, 0, 32)
 		args := make([]interface{}, 0, 128)
@@ -1087,6 +1096,43 @@ func startTunnelReaper() {
 			return true
 		})
 	}
+}
+
+// startMapSweeper periodically prunes stale entries from hostStats and
+// userTracker sync.Maps that otherwise grow without bound (memory leak).
+// Without this, after hours/days the proxy's heap grows and Range() calls
+// in the WS handler become sluggish — contributing to the "dies after N
+// minutes" symptom once memory pressure triggers heavy GC.
+func startMapSweeper() {
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			cutoff := now.Add(-30 * time.Minute)
+
+			// Prune hostStats: remove hosts not seen in 30 minutes
+			hostStats.Range(func(k, v interface{}) bool {
+				st := v.(*hostStat)
+				st.mu.Lock()
+				last := st.last
+				st.mu.Unlock()
+				if last.Before(cutoff) {
+					hostStats.Delete(k)
+				}
+				return true
+			})
+
+			// Prune userTracker: remove IPs not seen in 30 minutes
+			userTracker.Range(func(k, v interface{}) bool {
+				lastSeen := v.(time.Time)
+				if lastSeen.Before(cutoff) {
+					userTracker.Delete(k)
+				}
+				return true
+			})
+		}
+	}()
 }
 
 var buildTime = "manual_build" // Auto-injected via -ldflags during build
@@ -1354,34 +1400,35 @@ func startHopAutoSweeper() {
 func cfBlockedDirect(host string, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+
+	dial := func(address string) bool {
+		d := &net.Dialer{Timeout: 2 * time.Second}
+		c, err := d.DialContext(ctx, "tcp", address)
+		if err != nil {
+			return false
+		}
+		defer c.Close()
+		return probeHTTPStatus(c, host)
+	}
+
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil || len(addrs) == 0 {
-		d := &net.Dialer{Timeout: 2 * time.Second}
-		if c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, "443")); err == nil {
-			return probeHTTPStatus(c, host)
-		}
-		return false
+		return dial(net.JoinHostPort(host, "443"))
 	}
 	tried := 0
 	for _, a := range addrs {
 		if tried >= 3 {
 			break
 		}
-		d := &net.Dialer{Timeout: 2 * time.Second}
-		c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(a.IP.String(), "443"))
-		if err != nil {
-			continue
-		}
-		tried++
-		if probeHTTPStatus(c, host) {
+		if dial(net.JoinHostPort(a.IP.String(), "443")) {
 			return true
 		}
+		tried++
 	}
 	return false
 }
 
 func probeHTTPStatus(c net.Conn, host string) bool {
-	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(3500 * time.Millisecond))
 	tc := tls.Client(c, &tls.Config{ServerName: host, InsecureSkipVerify: true})
 	if tc.Handshake() != nil {
@@ -1540,6 +1587,7 @@ func initDB() {
 	_, _ = db.Exec("PRAGMA journal_mode=WAL")
 	_, _ = db.Exec("PRAGMA busy_timeout=5000")
 	_, _ = db.Exec("PRAGMA synchronous=NORMAL")
+	db.SetMaxOpenConns(1) // Serialize writers to avoid "database is locked"
 
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS domain_rules (
 		domain TEXT PRIMARY KEY,
@@ -1864,6 +1912,11 @@ startRetentionPruner()
 		fmt.Printf("Proxy auth enabled for %d user(s)\n", len(proxyUsers))
 	}
 
+	if v := os.Getenv("PROXY_AUTH_ENABLED"); v == "0" || v == "false" {
+		proxyAuthEnabled = false
+		fmt.Println("Proxy auth DISABLED (PROXY_AUTH_ENABLED=0)")
+	}
+
 	bindAddr := os.Getenv("BIND_ADDR")
 	if bindAddr == "" {
 		bindAddr = "0.0.0.0"
@@ -1871,6 +1924,7 @@ startRetentionPruner()
 
 	go startBwSampler()
 	go startTunnelReaper()
+	startMapSweeper()
 
 	proxy := &http.Server{
 		Handler:      http.HandlerFunc(handleRequest),
@@ -1987,6 +2041,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			trackUserDevice(u, clientIP, r.Header.Get("User-Agent"))
+		} else if !proxyAuthEnabled {
+			trackUserDevice(clientIP, clientIP, r.Header.Get("User-Agent"))
 		}
 		handleConnect(w, r)
 		return
@@ -2002,7 +2058,43 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		if path == "/proxy.pac" {
 			servePAC(w, r)
 			return
-		} else if path == "/block-check" {
+		} else if path == "/welcome" {
+			clientIP := getClientIP(r)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ยินดีต้อนรับสู่ NetNinja</title>
+<style>
+body{background:#0a0a0a;color:#ccc;font:13px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
+.w{max-width:400px;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,0.5)}
+h1{color:#fff;font-size:24px;margin:0 0 10px;font-weight:normal}
+h1 span{color:#0a0;margin-right:10px}
+p{color:#888;margin-bottom:25px}
+.ip{color:#7af;font-weight:bold;margin:10px 0;font-size:16px}
+.btn{display:inline-block;padding:12px 24px;background:#060;color:#fff;text-decoration:none;border-radius:4px;font-weight:bold;transition:0.3s;border:1px solid #0a0}
+.btn:hover{background:#080;transform:translateY(-2px);box-shadow:0 5px 15px rgba(0,170,0,0.3)}
+.footer{margin-top:40px;font-size:10px;color:#333;text-transform:uppercase;letter-spacing:1px}
+</style>
+</head>
+<body>
+<div class="w">
+    <h1><span>●</span> ยินดีต้อนรับ</h1>
+    <p>ระบบ NetNinja Proxy พร้อมใช้งานแล้วสำหรับการเชื่อมต่อของคุณ</p>
+    <div style="color:#444;font-size:10px;text-transform:uppercase;letter-spacing:2px;margin-bottom:5px">client_address_detected</div>
+    <div class="ip">%s</div>
+    <div style="margin-top:35px">
+        <a href="/" class="btn">เข้าสู่ Dashboard</a>
+    </div>
+    <div class="footer">powered_by // netninja_engine</div>
+</div>
+</body>
+</html>`, clientIP)))
+			return
+		}
+		if path == "/block-check" {
 			serveBlockCheck(w, r)
 			return
 		} else if path == "/ws" {
@@ -2043,41 +2135,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if path == "/settings" {
 			serveSettings(w, r)
-			return
-		} else if path == "/welcome" {
-			clientIP := getClientIP(r)
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write([]byte(fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ยินดีต้อนรับสู่ NetNinja</title>
-<style>
-body{background:#0a0a0a;color:#ccc;font:13px/1.6 'Courier New',monospace;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
-.w{max-width:400px;text-align:center;padding:40px;background:#111;border:1px solid #222;border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,0.5)}
-h1{color:#fff;font-size:24px;margin:0 0 10px;font-weight:normal}
-h1 span{color:#0a0;margin-right:10px}
-p{color:#888;margin-bottom:25px}
-.ip{color:#7af;font-weight:bold;margin:10px 0;font-size:16px}
-.btn{display:inline-block;padding:12px 24px;background:#060;color:#fff;text-decoration:none;border-radius:4px;font-weight:bold;transition:0.3s;border:1px solid #0a0}
-.btn:hover{background:#080;transform:translateY(-2px);box-shadow:0 5px 15px rgba(0,170,0,0.3)}
-.footer{margin-top:40px;font-size:10px;color:#333;text-transform:uppercase;letter-spacing:1px}
-</style>
-</head>
-<body>
-<div class="w">
-    <h1><span>●</span> ยินดีต้อนรับ</h1>
-    <p>ระบบ NetNinja Proxy พร้อมใช้งานแล้วสำหรับการเชื่อมต่อของคุณ</p>
-    <div style="color:#444;font-size:10px;text-transform:uppercase;letter-spacing:2px;margin-bottom:5px">client_address_detected</div>
-    <div class="ip">%s</div>
-    <div style="margin-top:35px">
-        <a href="/" class="btn">เข้าสู่ Dashboard</a>
-    </div>
-    <div class="footer">powered_by // netninja_engine</div>
-</div>
-</body>
-</html>`, clientIP)))
 			return
 		} else if path == "/logs" {
 			serveLogs(w, r)
@@ -2722,6 +2779,9 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 			hName = hName[:idx]
 		}
 		u := authedUser(r)
+		if u == "" {
+			u = clientIP
+		}
 		pushConnLog(connLogEntry{username: u, clientIP: clientIP, host: hName, status: "http", bytesDown: n, durMs: time.Since(start).Milliseconds()})
 		touchUserHost(u, hName, 0, n, 1)
 	}
@@ -2745,6 +2805,10 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	tunnelStart := time.Now()
 	tunnelUser := authedUser(r)
+	trackID := tunnelUser
+	if trackID == "" {
+		trackID = clientIP
+	}
 
 	log.Printf("%s[TLS]%s CONNECT %s ← %s",
 		colorCyan, colorReset,
@@ -2788,7 +2852,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if tunnelUser != "" && !proxyEnabledFor(tunnelUser) {
 		atomic.AddInt64(&errCount, 1)
 		log.Printf("%s[BLOCKED]%s %s (ip=%s) proxy disabled — refused CONNECT %s", colorYellow, colorReset, tunnelUser, clientIP, host)
-		pushConnLog(connLogEntry{username: tunnelUser, clientIP: clientIP, host: hostname, status: "proxy_off", durMs: time.Since(tunnelStart).Milliseconds()})
+		pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: hostname, status: "proxy_off", durMs: time.Since(tunnelStart).Milliseconds()})
 		http.Error(w, "Proxy Disabled for this account (connect directly)", http.StatusForbidden)
 		return
 	}
@@ -2797,7 +2861,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if adblockEnabledFor(tunnelUser) && isAdBlockedHost(hostname) {
 		atomic.AddInt64(&adBlocked, 1)
 		log.Printf("%s[AD-BLOCK]%s refused CONNECT %s ← %s", colorRed, colorReset, hostname, clientIP)
-		pushConnLog(connLogEntry{username: tunnelUser, clientIP: clientIP, host: hostname, status: "ad_block", durMs: time.Since(tunnelStart).Milliseconds()})
+		pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: hostname, status: "ad_block", durMs: time.Since(tunnelStart).Milliseconds()})
 		http.Error(w, "Forbidden (Ad-Blocked by NetNinja)", http.StatusForbidden)
 		return
 	}
@@ -2827,7 +2891,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		atomic.AddInt64(&errCount, 1)
 		log.Printf("%s[ERR]%s CONNECT %s failed: %s", colorRed, colorReset, host, err)
-		pushConnLog(connLogEntry{username: tunnelUser, clientIP: clientIP, host: hostname, status: "dial_fail", durMs: time.Since(tunnelStart).Milliseconds()})
+		pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: hostname, status: "dial_fail", durMs: time.Since(tunnelStart).Milliseconds()})
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
@@ -2875,7 +2939,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		clientIP, host,
 		colorGray, colorReset)
 
-	trackUserConn(tunnelUser)
+	trackUserConn(trackID)
 
 	clientAct := &activityConn{Conn: clientConn}
 	destAct := &activityConn{Conn: destConn}
@@ -2906,7 +2970,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 			hs.mu.Unlock()
 		}
 		if n > 0 {
-			trackUserBytes(tunnelUser, n, 0)
+			trackUserBytes(trackID, n, 0)
 		}
 		destAct.Close()
 		errc <- err
@@ -2925,7 +2989,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 			hs.mu.Unlock()
 		}
 		if n > 0 {
-			trackUserBytes(tunnelUser, 0, n)
+			trackUserBytes(trackID, 0, n)
 		}
 		clientAct.Close()
 		errc <- err
@@ -2961,7 +3025,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Audit log entry for this completed tunnel
 	pushConnLog(connLogEntry{
-		username:  tunnelUser,
+		username:  trackID,
 		clientIP:  clientIP,
 		host:      hostname,
 		status:    "ok",
@@ -2969,7 +3033,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		bytesDown: tDown,
 		durMs:     time.Since(tunnelStart).Milliseconds(),
 	})
-	touchUserHost(tunnelUser, hostname, tUp, tDown, 1)
+	touchUserHost(trackID, hostname, tUp, tDown, 1)
 }
 
 func bwSnapshot() []int64 {
