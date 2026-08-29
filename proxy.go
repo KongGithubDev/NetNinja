@@ -2774,6 +2774,21 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		trackUserDevice(clientIP, clientIP, r.Header.Get("User-Agent"))
 	}
 
+	// Fix: iOS sometimes sends requests with empty scheme (e.g. "GET / HTTP/1.1")
+	// Reconstruct from Host header
+	if r.URL.Scheme == "" || r.URL.Host == "" {
+		host := r.Host
+		if host == "" {
+			host = r.Header.Get("Host")
+		}
+		if host != "" && r.URL.Host == "" {
+			r.URL.Host = host
+		}
+		if r.URL.Scheme == "" {
+			r.URL.Scheme = "http"
+		}
+	}
+
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
 	if err != nil {
 		log.Printf("%s[ERR]%s Bad request from %s: %s", colorRed, colorReset, clientIP, err)
