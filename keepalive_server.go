@@ -39,8 +39,7 @@ body{font-family:-apple-system,system-ui,sans-serif;background:#0a0a0a;color:#e0
 .top.on{background:#0d3320;color:#6bffb8;border-bottom:1px solid #1a4a2e}
 .top.off{background:#331111;color:#ff6b6b;border-bottom:1px solid #4a1a1a}
 .top.wait{background:#332e11;color:#ffd76b;border-bottom:1px solid #4a421a}
-.top{animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
+.top{animation:none}
 .card{background:#1a1a2e;border-radius:16px;padding:20px;max-width:440px;margin:52px auto 16px;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
 h1{font-size:16px;margin-bottom:14px;color:#00d4ff}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
