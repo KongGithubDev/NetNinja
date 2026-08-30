@@ -557,7 +557,6 @@ func startAdBlockRefresher() {
 	}()
 }
 var userTracker sync.Map // map[string]time.Time (IP -> last seen)
-var userConns sync.Map  // map[string]*atomic.Int32 (IP -> concurrent CONNECT count)
 
 // Per-user usage stats (keyed by proxy auth username)
 type userStat struct {
@@ -1102,6 +1101,15 @@ func startMapSweeper() {
 				}
 				return true
 			})
+
+			// Prune dnsCache: remove expired entries to prevent memory leak
+			dnsCache.Range(func(k, v interface{}) bool {
+				entry := v.(dnsEntry)
+				if time.Now().After(entry.expiry) {
+					dnsCache.Delete(k)
+				}
+				return true
+			})
 		}
 	}()
 }
@@ -1130,8 +1138,10 @@ var customDialer = &net.Dialer{
 
 // setTCPKeepAliveFD sets TCP keepalive via syscall on a hijacked connection's
 // raw fd. Go's net.TCPConn.SetKeepAlive works on normal connections but may not
-// persist after HTTP Hijack(). This sets TCP_KEEPIDLE, TCP_KEEPINTVL, and
-// TCP_KEEPCNT directly on the socket fd via syscall.
+// persist after HTTP Hijack(). This sets SO_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPINTVL,
+// and TCP_KEEPCNT directly on the socket fd via syscall.
+// CRITICAL: SO_KEEPALIVE must be set FIRST, otherwise kernel ignores the other options.
+// Uses Go's built-in keepalive on Windows (no TCP_KEEPIDLE syscall constant).
 func setTCPKeepAliveFD(conn net.Conn, seconds int) {
 	tc, ok := conn.(*net.TCPConn)
 	if !ok {
@@ -1139,13 +1149,14 @@ func setTCPKeepAliveFD(conn net.Conn, seconds int) {
 	}
 	raw, err := tc.SyscallConn()
 	if err != nil {
+		setKeepAliveFallback(tc, seconds)
 		return
 	}
 	raw.Control(func(fd uintptr) {
-		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPIDLE, seconds)
-		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPINTVL, seconds)
-		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_KEEPCNT, 3)
+		setSocketKeepAlive(int(fd), seconds)
 	})
+	// On Windows, setSocketKeepAlive is a no-op; use Go's built-in as well
+	setKeepAliveFallback(tc, seconds)
 }
 
 // ---------------------------------------------------------------------------
@@ -2830,51 +2841,12 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		trackID = clientIP
 	}
 
-	// Per-IP concurrent CONNECT limit (prevent speedtest floods)
-	connectLimit := 50
-	if v := os.Getenv("CONNECT_LIMIT_PER_IP"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			connectLimit = n
-		}
-	}
-	if v, ok := userConns.Load(clientIP); ok {
-		cur := v.(*atomic.Int32)
-		if cur.Load() >= int32(connectLimit) {
-			atomic.AddInt64(&errCount, 1)
-			log.Printf("%s[RATE]%s %s CONNECT %s rejected (concurrent=%d limit=%d)",
-				colorRed, colorReset, clientIP, host, cur.Load(), connectLimit)
-			pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: host, status: "rate_limit", durMs: time.Since(tunnelStart).Milliseconds()})
-			hijack, ok := w.(http.Hijacker)
-			if !ok {
-				return
-			}
-			conn, _, err := hijack.Hijack()
-			if err != nil {
-				return
-			}
-			conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-			conn.Close()
-			return
-		}
-	}
-
 	log.Printf("%s[TLS]%s CONNECT %s ← %s ua=%s",
 		colorCyan, colorReset,
 		host, clientIP, r.Header.Get("User-Agent"))
 
 	atomic.AddInt64(&activeConns, 1)
 	defer atomic.AddInt64(&activeConns, -1)
-
-	// Track per-IP concurrent connections
-	var ipConnCount *atomic.Int32
-	if v, ok := userConns.Load(clientIP); ok {
-		ipConnCount = v.(*atomic.Int32)
-	} else {
-		ipConnCount = &atomic.Int32{}
-		userConns.Store(clientIP, ipConnCount)
-	}
-	ipConnCount.Add(1)
-	defer ipConnCount.Add(-1)
 
 	// extract hostname and port for cached DNS
 	hostname := host
@@ -3040,6 +3012,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	destAct := &activityConn{Conn: destConn}
 
 	errc := make(chan error, 2)
+	done := make(chan struct{})
 	var wg sync.WaitGroup
 	var tUp, tDown int64
 
@@ -3086,14 +3059,46 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		errc <- err
 	}()
 
-	// Conservative REAP: DISABLED — iOS caches "proxy broken" from both
-	// FIN and RST. No server-side close helps; only IPv6 or Thai VPS works.
+	// Graceful FIN close at 3.5 min: Close connections with FIN before CGNAT
+	// kills them at ~4-5 min. iOS handles FIN (graceful close) differently
+	// from RST (CGNAT reset). FIN = "normal close" → iOS reconnects
+	// automatically. RST = "proxy broken" → iOS caches failure.
+	go func() {
+		const idleTimeout = 210 * time.Second // 3.5 min — before CGNAT ~4-5 min
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				lastClient := clientAct.Last()
+				lastDest := destAct.Last()
+				last := lastClient
+				if destDest := lastDest; destDest.After(last) {
+					last = destDest
+				}
+				if !last.IsZero() && time.Since(last) > idleTimeout {
+					log.Printf("%s[REAP]%s %s ↔ %s idle %v > %v, closing with FIN",
+						colorYellow, colorReset, clientIP, host,
+						time.Since(last).Round(time.Second), idleTimeout)
+					// Close client first (sends FIN to iPad) — iOS sees
+					// graceful close, not RST. Then close dest.
+					clientConn.Close()
+					time.Sleep(100 * time.Millisecond)
+					destConn.Close()
+					return
+				}
+			}
+		}
+	}()
 
 	// Bandwidth history is maintained by the global sampler started once at
 	// boot (startBwSampler) — NOT per tunnel — so the realtime chart always has
 	// the last 60s of aggregate traffic regardless of active tunnels.
 
 	wg.Wait()
+	close(done)
 	activeTunnels.Delete(hostname)
 
 	// Log WHY the tunnel closed — tells us if the server killed it (deadline/
@@ -3226,11 +3231,13 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 	}
 	defer destConn.Close()
 
-	// Overkill: Tuning destination socket for WS
+	// Tuning destination socket for WS: keepalive to survive CGNAT/NAT
 	if tc, ok := destConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
-		tc.SetReadBuffer(16 * 1024 * 1024)
-		tc.SetWriteBuffer(16 * 1024 * 1024)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(10 * time.Second)
+		tc.SetReadBuffer(256 * 1024)
+		tc.SetWriteBuffer(256 * 1024)
 	}
 
 	// 2. Hijack the client connection
@@ -3250,12 +3257,18 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 	// and would kill the WS pipe at ~60-120s. Clear them before forwarding.
 	clientConn.SetDeadline(time.Time{})
 
-	// Overkill: Tuning client socket for WS
+	// Tuning client socket for WS: keepalive to survive CGNAT/NAT
 	if tc, ok := clientConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
-		tc.SetReadBuffer(16 * 1024 * 1024)
-		tc.SetWriteBuffer(16 * 1024 * 1024)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(10 * time.Second)
+		tc.SetReadBuffer(256 * 1024)
+		tc.SetWriteBuffer(256 * 1024)
 	}
+
+	// Azure LB / CGNAT idle timeout bypass: syscall-level keepalive on hijacked fds
+	setTCPKeepAliveFD(clientConn, 10)
+	setTCPKeepAliveFD(destConn, 10)
 
 	// 3. Forward the original GET request with upgrade headers
 	// Ensure Host header is correct for the destination
@@ -3271,18 +3284,51 @@ func handleWSUpgrade(w http.ResponseWriter, r *http.Request, host, clientIP stri
 	req.WriteString("\r\n")
 	destConn.Write([]byte(req.String()))
 
-	// 4. Pipe binary data (Native Zero-Copy)
+	// 4. Pipe binary data with activity tracking + idle reap
+	clientAct := &activityConn{Conn: clientConn}
+	destAct := &activityConn{Conn: destConn}
+
+	wsDone := make(chan struct{})
 	errChan := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(destConn, clientConn)
+		_, err := io.Copy(destAct, clientAct)
 		errChan <- err
 	}()
 	go func() {
-		_, err := io.Copy(clientConn, destConn)
+		_, err := io.Copy(clientAct, destAct)
 		errChan <- err
 	}()
 
+	// Idle timeout reap: close WS connections idle >4 min (beat CGNAT 5-min)
+	go func() {
+		const wsIdleTimeout = 4 * time.Minute
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-wsDone:
+				return
+			case <-ticker.C:
+				lastClient := clientAct.Last()
+				lastDest := destAct.Last()
+				last := lastClient
+				if lastDest.After(last) {
+					last = lastDest
+				}
+				if !last.IsZero() && time.Since(last) > wsIdleTimeout {
+					log.Printf("%s[WS-REAP]%s %s ↔ %s:%s idle %v > %v, closing",
+						colorYellow, colorReset, clientIP, hostname, port,
+						time.Since(last).Round(time.Second), wsIdleTimeout)
+					clientConn.Close()
+					destConn.Close()
+					return
+				}
+			}
+		}
+	}()
+
 	<-errChan
+	close(wsDone)
 	log.Printf("%s[WS-PROXY]%s Tunnel closed for %s:%s ← %s", colorGray, colorReset, hostname, port, clientIP)
 }
 
