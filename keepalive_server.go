@@ -35,16 +35,12 @@ const keepaliveHTML = `<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh;padding:0}
-.top{position:fixed;top:0;left:0;right:0;z-index:999;height:36px;background:#0d0d1a;border-bottom:1px solid #1a1a2e;display:flex;align-items:center;justify-content:center;gap:10px;font-size:12px}
-.dot{width:6px;height:6px;border-radius:50%;background:#333;transition:all 0.3s}
-.dot.on{background:#6bffb8;box-shadow:0 0 8px #6bffb8}
-.dot.off{background:#ff6b6b;box-shadow:0 0 8px #ff6b6b}
-.dot.wait{background:#ffd76b;box-shadow:0 0 8px #ffd76b}
-.dot{animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
-.flow{display:flex;align-items:center;gap:6px;color:#444;font-weight:500}
-.flow .a{color:#6bffb8}
-.arrow{color:#222;font-size:10px}
+.top{position:fixed;top:0;left:0;right:0;z-index:999;height:36px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;transition:background 0.3s}
+.top.on{background:#0d3320;color:#6bffb8;border-bottom:1px solid #1a4a2e}
+.top.off{background:#331111;color:#ff6b6b;border-bottom:1px solid #4a1a1a}
+.top.wait{background:#332e11;color:#ffd76b;border-bottom:1px solid #4a421a}
+.top{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
 .card{background:#1a1a2e;border-radius:16px;padding:20px;max-width:440px;margin:52px auto 16px;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
 h1{font-size:16px;margin-bottom:14px;color:#00d4ff}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
@@ -66,16 +62,7 @@ button{padding:10px;border:none;border-radius:8px;font-size:13px;font-weight:600
 </style>
 </head>
 <body>
-<div class="top">
-  <div class="dot" id="dot"></div>
-  <div class="flow">
-    <span id="nC">iPad</span>
-    <span class="arrow">&#x2192;</span>
-    <span id="nP">Proxy</span>
-    <span class="arrow">&#x2192;</span>
-    <span id="nS">Server</span>
-  </div>
-</div>
+<div class="top off" id="top">Stopped</div>
 <div class="card">
 <h1>&#x1F977; NetNinja</h1>
 <div class="grid">
@@ -106,27 +93,26 @@ if(!SA)document.getElementById('hint').style.display='block';
 
 function fmt(b){return b<1024?b.toFixed(1)+' B':b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(2)+' MB'}
 function fmtT(s){var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),s2=s%60;return(h>0?h+'h ':'')+(m>0?m+'m ':'')+s2+'s'}
-function setDot(c){document.getElementById('dot').className='dot '+c}
-function setNode(id,c){document.getElementById(id).className=c?'a':''}
+function setTop(c,t){var el=document.getElementById('top');el.className='top '+c;el.textContent=t}
 function toggle(){R?stop():start()}
 function start(){
   if(R)return;ST=Date.now();LBT=Date.now();
   UT=setInterval(ui,1000);R=true;
   document.getElementById('btn').textContent='Stop';
   document.getElementById('btn').style.background='#ff6b6b';
-  setDot('on');setNode('nC',1);setNode('nP',1);setNode('nS',1);
+  setTop('on','Active');
   ping();PT=setInterval(ping,5000);
 }
 function ping(){
   PS=Date.now();
-  setDot('wait');setNode('nC',1);setNode('nP',0);setNode('nS',0);
+  setTop('wait','Pinging...');
   var sz=Math.floor(Math.random()*200)+50;
   fetch('/ping',{method:'POST',body:new ArrayBuffer(sz)}).then(function(r){
     var l=Date.now()-PS;LA.push(l);if(LA.length>60)LA.shift();
     UB+=sz;DB+=200;C++;ui();draw();
-    setDot('on');setNode('nC',1);setNode('nP',1);setNode('nS',1);
+    setTop('on','Active');
   }).catch(function(){
-    setDot('off');setNode('nC',0);setNode('nP',0);setNode('nS',0);
+    setTop('off','Connection Lost');
     LA.push(9999);if(LA.length>60)LA.shift();
   });
 }
@@ -135,7 +121,7 @@ function stop(){
   ST=0;C=0;LA=[];UB=0;DB=0;
   document.getElementById('btn').textContent='Start';
   document.getElementById('btn').style.background='#00d4ff';
-  setDot('');setNode('nC',0);setNode('nP',0);setNode('nS',0);
+  setTop('off','Stopped');
   document.title='NetNinja';
   document.getElementById('lat').textContent='-';
   document.getElementById('up').textContent='-';
