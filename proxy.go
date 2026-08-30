@@ -1024,6 +1024,67 @@ func (c *activityConn) Write(p []byte) (int, error) {
 	}
 }
 
+// windowProbeConn periodically pauses reads to force the client's TCP stack
+// to send WINDOW PROBES — real data segments (1-byte retransmissions) with
+// normal sequence numbers. Unlike keepalive ACKs (seq=-1) which CGNAT
+// ignores, window probes look like genuine data and refresh NAT mappings.
+//
+// Flow when paused:
+//  1. proxy stops reading → TCP receive buffer fills → window → 0
+//  2. client TCP stack sees window=0 → starts probe timer (RTO ~200ms)
+//  3. probe timer fires → retransmits last byte (1 byte data, normal seq)
+//  4. CGNAT sees data segment → keeps mapping alive
+type windowProbeConn struct {
+	net.Conn
+	paused int32 // atomic: 1 = paused
+	done   chan struct{}
+}
+
+func newWindowProbeConn(conn net.Conn, interval, pauseFor time.Duration) *windowProbeConn {
+	wpc := &windowProbeConn{
+		Conn: conn,
+		done: make(chan struct{}),
+	}
+	go wpc.loop(interval, pauseFor)
+	return wpc
+}
+
+func (wpc *windowProbeConn) loop(interval, pauseFor time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-wpc.done:
+			return
+		case <-ticker.C:
+			atomic.StoreInt32(&wpc.paused, 1)
+			time.AfterFunc(pauseFor, func() {
+				atomic.StoreInt32(&wpc.paused, 0)
+			})
+		}
+	}
+}
+
+func (wpc *windowProbeConn) Read(p []byte) (int, error) {
+	for atomic.LoadInt32(&wpc.paused) == 1 {
+		select {
+		case <-wpc.done:
+			return 0, io.ErrClosedPipe
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return wpc.Conn.Read(p)
+}
+
+func (wpc *windowProbeConn) Close() error {
+	select {
+	case <-wpc.done:
+	default:
+		close(wpc.done)
+	}
+	return wpc.Conn.Close()
+}
+
 func (h *hostStat) addConn(n int64) {
 	h.mu.Lock()
 	h.count++
@@ -2845,6 +2906,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		colorCyan, colorReset,
 		host, clientIP, r.Header.Get("User-Agent"))
 
+	if strings.Contains(host, "proxy.netninja.kongwatcharapong.in.th") {
+		log.Printf("%s[KEEPALIVE]%s %s ← %s",
+			colorGreen, colorReset, host, clientIP)
+	}
+
 	atomic.AddInt64(&activeConns, 1)
 	defer atomic.AddInt64(&activeConns, -1)
 
@@ -3008,7 +3074,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	trackUserConn(trackID)
 
-	clientAct := &activityConn{Conn: clientConn}
+	// Window-probe wrapper: periodically pause reads for 5 s every 90 s.
+	// During the pause, if the client sends data, TCP buffer fills → window
+	// shrinks to 0 → client TCP stack sends WINDOW PROBES (1-byte data
+	// segments with normal seq numbers). CGNAT sees real data and keeps the
+	// mapping alive.  Unlike keepalive ACKs (seq=-1) which TOT CGNAT
+	// ignores, window probes cannot be distinguished from normal data.
+	wpConn := newWindowProbeConn(clientConn, 90*time.Second, 5*time.Second)
+	clientAct := &activityConn{Conn: wpConn}
 	destAct := &activityConn{Conn: destConn}
 
 	errc := make(chan error, 2)
