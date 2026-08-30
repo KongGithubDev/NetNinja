@@ -35,22 +35,20 @@ const keepaliveHTML = `<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh;padding:0}
-.bar{position:fixed;top:0;left:0;right:0;z-index:999;height:36px;display:flex;align-items:center;justify-content:center;gap:8px;font-size:12px;font-weight:500;transition:background 0.3s}
-.bar.on{background:#111;border-bottom:1px solid #222}
-.bar.off{background:#1a1111;border-bottom:1px solid #331111}
-.bar.wait{background:#1a1a11;border-bottom:1px solid #333311}
-.dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
-.bar.on .dot{background:#6bffb8;box-shadow:0 0 6px #6bffb8}
-.bar.off .dot{background:#ff6b6b;box-shadow:0 0 6px #ff6b6b}
-.bar.wait .dot{background:#ffd76b;box-shadow:0 0 6px #ffd76b}
-.dot{animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
-.flow{display:flex;align-items:center;gap:4px;color:#555}
-.flow .node{color:#444}
-.flow .active{color:#6bffb8}
-.flow .arrow{color:#333}
-.card{background:#1a1a2e;border-radius:16px;padding:20px;max-width:440px;margin:52px auto 16px;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
-h1{font-size:16px;margin-bottom:14px;color:#00d4ff;display:flex;align-items:center;gap:8px}
+.top{position:fixed;top:0;left:0;right:0;z-index:999;height:40px;background:#0d0d1a;border-bottom:1px solid #1a1a2e;display:flex;align-items:center;justify-content:center}
+.flow{display:flex;align-items:center;gap:0;width:280px;height:28px;position:relative}
+.node{font-size:10px;font-weight:600;color:#333;z-index:2;position:relative;width:50px;text-align:center;transition:color 0.3s}
+.node.g{color:#6bffb8;text-shadow:0 0 8px rgba(107,255,184,0.5)}
+.node.y{color:#ffd76b;text-shadow:0 0 8px rgba(255,215,107,0.5)}
+.pipe{position:absolute;top:50%;left:50px;right:50px;height:2px;background:#1a1a2e;transform:translateY(-50%);z-index:1}
+.beam{position:absolute;top:50%;left:50px;right:50px;height:2px;transform:translateY(-50%);z-index:3;overflow:hidden;opacity:0;transition:opacity 0.3s}
+.beam.on{opacity:1}
+.beam::after{content:'';position:absolute;top:-1px;left:-30px;width:30px;height:4px;border-radius:2px;background:linear-gradient(90deg,transparent,#00d4ff,#6bffb8,transparent);animation:flow 1.5s linear infinite;box-shadow:0 0 10px #00d4ff}
+@keyframes flow{from{left:-30px}to{left:100%}}
+.beam.ret::after{animation:flowRet 1.5s linear infinite;background:linear-gradient(90deg,transparent,#6bffb8,#00d4ff,transparent)}
+@keyframes flowRet{from{left:100%}to{left:-30px}}
+.card{background:#1a1a2e;border-radius:16px;padding:20px;max-width:440px;margin:56px auto 16px;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
+h1{font-size:16px;margin-bottom:14px;color:#00d4ff}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
 .stat{background:#0d0d1a;border-radius:8px;padding:10px 12px}
 .stat .l{font-size:9px;color:#555;text-transform:uppercase;letter-spacing:0.5px}
@@ -69,14 +67,17 @@ button{padding:10px;border:none;border-radius:8px;font-size:13px;font-weight:600
 </style>
 </head>
 <body>
-<div id="bar" class="bar off">
-  <div class="dot"></div>
+<div class="top">
   <div class="flow">
-    <span class="node" id="fClient">Client</span>
-    <span class="arrow">&#x2192;</span>
-    <span class="node" id="fProxy">Proxy</span>
-    <span class="arrow">&#x2192;</span>
-    <span class="node" id="fServer">Server</span>
+    <div class="node" id="nC">iPad</div>
+    <div class="pipe"></div>
+    <div class="beam" id="beamFwd"></div>
+    <div class="beam ret" id="beamRet"></div>
+    <div class="node" id="nP">Proxy</div>
+    <div class="pipe" style="left:140px;right:0"></div>
+    <div class="beam" id="beamFwd2" style="left:140px;right:0"></div>
+    <div class="beam ret" id="beamRet2" style="left:140px;right:0"></div>
+    <div class="node" id="nS">Server</div>
   </div>
 </div>
 <div class="card">
@@ -87,7 +88,7 @@ button{padding:10px;border:none;border-radius:8px;font-size:13px;font-weight:600
 </div>
 <div class="grid">
   <div class="stat"><div class="l">Data</div><div class="v y" id="bytes">0 B</div><div class="s" id="bytesRate">- /min</div></div>
-  <div class="stat"><div class="l">Pings</div><div class="v" id="pings">0</div><div class="s">successful</div></div>
+  <div class="stat"><div class="l">Maintained</div><div class="v" id="pings">0</div><div class="s">CGNAT mappings</div></div>
 </div>
 <canvas id="chart"></canvas>
 <div class="btns">
@@ -103,43 +104,58 @@ button{padding:10px;border:none;border-radius:8px;font-size:13px;font-weight:600
 var R=false,C=0,ST=0,PT=null,UT=null;
 var LA=[],BT=0,LBT=0;
 var cv=document.getElementById('chart'),cx=cv.getContext('2d');
-var PS=0;
+var PS=0,beamT=null;
 var SA=window.navigator.standalone||window.matchMedia('(display-mode:standalone)').matches;
 if(!SA)document.getElementById('hint').style.display='block';
 
 function fmt(b){return b<1024?b.toFixed(1)+' B':b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(2)+' MB'}
 function fmtT(s){var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),s2=s%60;return(h>0?h+'h ':'')+(m>0?m+'m ':'')+s2+'s'}
-function setBar(c,d,t){
-  var b=document.getElementById('bar');b.className='bar '+c;
-  document.getElementById('fClient').className=d[0]?'node active':'node';
-  document.getElementById('fProxy').className=d[1]?'node active':'node';
-  document.getElementById('fServer').className=d[2]?'node active':'node';
-}
 function toggle(){R?stop():start()}
 function start(){
   if(R)return;ST=Date.now();LBT=Date.now();
   UT=setInterval(ui,1000);R=true;
   document.getElementById('btn').textContent='Stop';
-  document.getElementById('btn').className='b1';
   document.getElementById('btn').style.background='#ff6b6b';
+  document.getElementById('beamFwd').classList.add('on');
+  document.getElementById('beamRet').classList.add('on');
+  document.getElementById('beamFwd2').classList.add('on');
+  document.getElementById('beamRet2').classList.add('on');
+  document.getElementById('nC').className='node g';
+  document.getElementById('nP').className='node g';
+  document.getElementById('nS').className='node g';
   ping();PT=setInterval(ping,5000);
 }
 function ping(){
-  PS=Date.now();var sz=Math.floor(Math.random()*200)+50;
+  PS=Date.now();
+  document.getElementById('nC').className='node y';
+  document.getElementById('nP').className='node';
+  document.getElementById('nS').className='node';
+  var sz=Math.floor(Math.random()*200)+50;
   fetch('/ping',{method:'POST',body:new ArrayBuffer(sz)}).then(function(r){
     var l=Date.now()-PS;LA.push(l);if(LA.length>60)LA.shift();
     BT+=sz+200;C++;ui();draw();
+    document.getElementById('nC').className='node g';
+    document.getElementById('nP').className='node g';
+    document.getElementById('nS').className='node g';
   }).catch(function(){
-    setBar('wait',[1,0,0]);LA.push(9999);if(LA.length>60)LA.shift();
+    document.getElementById('nC').className='node';
+    document.getElementById('nP').className='node';
+    document.getElementById('nS').className='node';
+    LA.push(9999);if(LA.length>60)LA.shift();
   });
 }
 function stop(){
   R=false;clearInterval(PT);clearInterval(UT);
   ST=0;C=0;LA=[];BT=0;
   document.getElementById('btn').textContent='Start';
-  document.getElementById('btn').className='b1';
   document.getElementById('btn').style.background='#00d4ff';
-  setBar('off',[0,0,0]);
+  document.getElementById('beamFwd').classList.remove('on');
+  document.getElementById('beamRet').classList.remove('on');
+  document.getElementById('beamFwd2').classList.remove('on');
+  document.getElementById('beamRet2').classList.remove('on');
+  document.getElementById('nC').className='node';
+  document.getElementById('nP').className='node';
+  document.getElementById('nS').className='node';
   document.title='NetNinja';
   document.getElementById('lat').textContent='-';
   document.getElementById('up').textContent='-';
@@ -152,7 +168,6 @@ function ui(){
   document.getElementById('up').textContent=t;
   document.getElementById('upSince').textContent=new Date(ST).toLocaleTimeString();
   document.title='\u2022 '+t;
-  setBar('on',[1,1,1]);
   document.getElementById('pings').textContent=C;
   if(LA.length>0){
     var l=LA[LA.length-1],a=LA.reduce(function(x,y){return x+y},0)/LA.length;
