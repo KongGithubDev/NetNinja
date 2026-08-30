@@ -104,13 +104,15 @@ function start(){
 }
 function ping(){
   PS=Date.now();
-  setTop('wait','Pinging...');
+  var pingTimeout=setTimeout(function(){setTop('wait','Pinging...')},800);
   var sz=Math.floor(Math.random()*200)+50;
   fetch('/ping',{method:'POST',body:new ArrayBuffer(sz)}).then(function(r){
+    clearTimeout(pingTimeout);
     var l=Date.now()-PS;LA.push(l);if(LA.length>60)LA.shift();
     UB+=sz;DB+=200;C++;ui();draw();
     setTop('on','Active');
   }).catch(function(){
+    clearTimeout(pingTimeout);
     setTop('off','Connection Lost');
     LA.push(9999);if(LA.length>60)LA.shift();
   });
