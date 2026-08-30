@@ -95,9 +95,18 @@ Without ADBLOCK_URL/PATH the proxy uses a small built-in list. Aggressive base a
 ### DNS Resolver Chain
 
 1. In-memory cache with video CDN-aware TTL (30s for googlevideo.com, youtube.com, etc.)
-2. Standard DNS via Google/Cloudflare resolvers (8.8.8.8, 1.1.1.1)
-3. DNS over HTTPS (Cloudflare + Google) as fallback
-4. IPv6 (AAAA record) support with automatic IPv4 preference
+2. System resolver (systemd-resolved → Cloudflare DoT port 853) — Azure blocks outbound UDP 53, so Google/Cloudflare UDP DNS won't work. systemd-resolved is configured with Cloudflare DNS over TLS (1.1.1.1, 1.0.0.1) instead
+3. IPv6 (AAAA record) support with automatic IPv4 preference
+4. Each DNS lookup is non-blocking — goroutines run independently, slow lookups don't delay others
+
+### CGNAT Mitigation
+
+Thai ISPs (TOT, True Corp, etc.) aggressively drop idle international TCP connections (~5 min). This causes iOS to cache "proxy broken" and stop routing traffic. Mitigations:
+
+- **PROXY_ADDR** should use IP address (not domain) to avoid DNS probe failures
+- **systemd-resolved DoT** ensures fast DNS (1-18ms) so iOS proxy validation probe succeeds
+- **No server-side REAP** — iOS caches "proxy broken" from both FIN and RST, so closing idle connections makes it worse
+- **Best solution**: Thai VPS (domestic traffic bypasses CGNAT) or IPv6 (no NAT)
 
 ### QUIC/HTTP3 UDP NAT Relay
 
@@ -327,19 +336,11 @@ Multi-layered approach: in-memory cache (with video CDN-aware TTL) -> standard D
 
 ### CGNAT Mitigation (Conservative REAP)
 
-Mobile networks (e.g. True Corp) use CGNAT with ~5 min idle timeout for international traffic. Conservative REAP closes idle tunnels with TCP FIN before CGNAT sends RST, preventing iOS from caching "proxy broken":
+> **DISABLED** — iOS caches "proxy broken" from both FIN and RST. No server-side close helps.
 
-```
-Idle tunnel > 3.5 min → Proxy sends TCP FIN → iOS sees graceful close → reconnects automatically
-Idle tunnel > 5 min   → CGNAT sends RST → iOS caches "proxy broken" → requires WiFi toggle
-```
+Mobile networks (e.g. TOT, True Corp) use CGNAT with ~5 min idle timeout for international traffic. Previous attempt to close idle tunnels with TCP FIN before CGNAT timeout was abandoned because iOS treats FIN the same as RST — both trigger "proxy broken" cache.
 
-- Goroutine per tunnel checks idle time every 30s
-- Threshold: 210s (3.5 min) — well under CGNAT ~5 min timeout
-- Uses `sync.Once` to prevent double-close panic
-- Suppresses `context canceled` and `favicon.ico` log spam
-
-See `TROUBLESHOOTING.md` for full CGNAT analysis.
+See `TROUBLESHOOTING.md` for full CGNAT analysis and solutions (Thai VPS, IPv6, WireGuard).
 
 ---
 
