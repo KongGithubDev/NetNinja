@@ -43,9 +43,16 @@ button.stop{background:#ff6b6b;color:#fff}
 .bar{height:4px;border-radius:2px;background:#1a1a2e;margin-bottom:12px;overflow:hidden}
 .bar-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,#00d4ff,#6bffb8);transition:width 0.3s}
 .info{font-size:11px;color:#555;text-align:center;margin-top:8px}
+.notif{position:fixed;top:0;left:0;right:0;padding:10px 16px;text-align:center;font-size:13px;font-weight:600;z-index:999;transform:translateY(-100%);transition:transform 0.3s}
+.notif.show{transform:translateY(0)}
+.notif.ok{background:#1b5e20;color:#6bffb8;border-bottom:1px solid #6bffb833}
+.notif.err{background:#4a1b1b;color:#ff6b6b;border-bottom:1px solid #ff6b6b33}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
 </style>
 </head>
 <body>
+<div id="notif" class="notif"></div>
 <div class="card">
 <h1>&#x1F977; NetNinja Keepalive</h1>
 <div id="status" class="status off">Stopped</div>
@@ -66,8 +73,8 @@ button.stop{background:#ff6b6b;color:#fff}
 <source src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=" type="audio/wav">
 </audio>
 <script>
-var running=false,count=0,startTs=0,pingTimer=null,upTimer=null;
-var latencies=[],bytesTotal=0,lastBytes=0,lastByteTs=0;
+var running=false,count=0,startTs=0,pingTimer=null,upTimer=null,notifTimer=null;
+var latencies=[],bytesTotal=0,lastByteTs=0;
 var audio=document.getElementById('bgAudio');
 var canvas=document.getElementById('chart');
 var ctx=canvas.getContext('2d');
@@ -86,18 +93,34 @@ function updateStatus(c,t){
   var s=document.getElementById('status');
   s.className='status '+c;s.textContent=t;
 }
+function showNotif(msg,type){
+  var n=document.getElementById('notif');
+  n.textContent=msg;n.className='notif '+type+' show';
+  setTimeout(function(){n.classList.remove('show')},4000);
+}
+function sendBrowserNotif(title,body){
+  if(Notification.permission==='granted'){
+    new Notification(title,{body:body,tag:'keepalive',renotify:true});
+  }
+}
 function toggle(){running?stop():start()}
 function start(){
   if(running)return;
   audio.play().catch(function(){});
+  if(Notification.permission==='default'){
+    Notification.requestPermission();
+  }
   updateStatus('wait','Connecting...');
   startTs=Date.now();lastByteTs=Date.now();
   upTimer=setInterval(updateUI,1000);
   running=true;
   document.getElementById('btn').textContent='Stop Keepalive';
   document.getElementById('btn').className='stop';
+  document.title='\u2022 NetNinja Keepalive';
   doPing();
   pingTimer=setInterval(doPing,5000);
+  notifTimer=setInterval(sendPeriodicNotif,60000);
+  showNotif('Keepalive started','ok');
 }
 function doPing(){
   pingStart=Date.now();
@@ -113,21 +136,35 @@ function doPing(){
     drawChart();
   }).catch(function(){
     updateStatus('wait','Retrying...');
+    showNotif('Ping failed - retrying...','err');
     latencies.push(9999);
     if(latencies.length>60)latencies.shift();
   });
 }
+function sendPeriodicNotif(){
+  if(!running||!startTs)return;
+  var sec=Math.floor((Date.now()-startTs)/1000);
+  var msg='Active \u2022 Uptime: '+fmtTime(sec);
+  if(latencies.length>0){
+    var last=latencies[latencies.length-1];
+    msg+=' \u2022 '+last+'ms';
+  }
+  document.title='\u2022 '+fmtTime(sec)+' \u2022 NetNinja';
+  sendBrowserNotif('NetNinja Keepalive',msg);
+}
 function stop(){
-  running=false;clearInterval(pingTimer);clearInterval(upTimer);
+  running=false;clearInterval(pingTimer);clearInterval(upTimer);clearInterval(notifTimer);
   startTs=0;count=0;latencies=[];bytesTotal=0;
   document.getElementById('btn').textContent='Start Keepalive';
   document.getElementById('btn').className='play';
   updateStatus('off','Stopped');
+  document.title='NetNinja Keepalive';
   document.getElementById('lat').textContent='-';
   document.getElementById('up').textContent='-';
   document.getElementById('bytes').textContent='0 B';
   document.getElementById('bar').style.width='0%';
   ctx.clearRect(0,0,canvas.width,canvas.height);
+  showNotif('Keepalive stopped','err');
 }
 function updateUI(){
   if(!startTs)return;
@@ -135,6 +172,7 @@ function updateUI(){
   var sec=Math.floor((now-startTs)/1000);
   document.getElementById('up').textContent=fmtTime(sec);
   document.getElementById('upSince').textContent=new Date(startTs).toLocaleTimeString();
+  document.title='\u2022 '+fmtTime(sec)+' \u2022 NetNinja';
   if(latencies.length>0){
     var last=latencies[latencies.length-1];
     var avg=latencies.reduce(function(a,b){return a+b},0)/latencies.length;
