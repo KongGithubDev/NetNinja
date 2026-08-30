@@ -51,10 +51,12 @@ button.stop{background:#ff6b6b;color:#fff}
 <div id="status" class="status off">Stopped</div>
 <div class="bar"><div class="bar-fill" id="bar" style="width:0%"></div></div>
 <div class="grid">
-  <div class="stat-box"><div class="label">Heartbeats</div><div class="value" id="hb">0</div><div class="sub" id="hbRate">- /min</div></div>
   <div class="stat-box"><div class="label">Latency</div><div class="value green" id="lat">-</div><div class="sub" id="latAvg">avg - ms</div></div>
   <div class="stat-box"><div class="label">Uptime</div><div class="value" id="up">-</div><div class="sub" id="upSince">-</div></div>
+</div>
+<div class="grid">
   <div class="stat-box"><div class="label">Data Sent</div><div class="value yellow" id="bytes">0 B</div><div class="sub" id="bytesRate">- B/min</div></div>
+  <div class="stat-box"><div class="label">Latency Chart</div><div class="sub" style="margin-top:6px">last 60 pings</div></div>
 </div>
 <canvas id="chart"></canvas>
 <button id="btn" class="play" onclick="toggle()">Start Keepalive</button>
@@ -121,7 +123,6 @@ function stop(){
   document.getElementById('btn').textContent='Start Keepalive';
   document.getElementById('btn').className='play';
   updateStatus('off','Stopped');
-  document.getElementById('hb').textContent='0';
   document.getElementById('lat').textContent='-';
   document.getElementById('up').textContent='-';
   document.getElementById('bytes').textContent='0 B';
@@ -134,9 +135,6 @@ function updateUI(){
   var sec=Math.floor((now-startTs)/1000);
   document.getElementById('up').textContent=fmtTime(sec);
   document.getElementById('upSince').textContent=new Date(startTs).toLocaleTimeString();
-  document.getElementById('hb').textContent=count;
-  var mins=(now-startTs)/60000;
-  document.getElementById('hbRate').textContent=mins>0.1?(count/mins).toFixed(1)+' /min':'- /min';
   if(latencies.length>0){
     var last=latencies[latencies.length-1];
     var avg=latencies.reduce(function(a,b){return a+b},0)/latencies.length;
