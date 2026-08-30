@@ -1108,22 +1108,11 @@ func startMapSweeper() {
 
 var buildTime = "manual_build" // Auto-injected via -ldflags during build
 
-// Custom DNS resolver using Google & Cloudflare DNS
+// Custom DNS resolver — uses system resolver (systemd-resolved → Cloudflare DoT)
+// Azure blocks outbound UDP 53, so Google/Cloudflare UDP DNS won't work.
+// systemd-resolved is configured with Cloudflare DoT (port 853) instead.
 var customResolver = &net.Resolver{
-	PreferGo: true,
-	Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		servers := []string{"8.8.8.8:53", "1.1.1.1:53", "8.8.4.4:53", "1.0.0.1:53"}
-		var lastErr error
-		for _, server := range servers {
-			conn, err := net.DialTimeout("udp", server, 2*time.Second)
-			if err == nil {
-				return conn, nil
-			}
-			lastErr = err
-		}
-		log.Printf("%s[DNS]%s All DNS servers failed!", colorRed, colorReset)
-		return nil, lastErr
-	},
+	PreferGo: false, // use system resolver (CGO/netgo)
 }
 
 // Custom dialer — Native performance with aggressive keep-alive
