@@ -2,6 +2,8 @@
 
 High-performance Go forward proxy with CGNAT keepalive for mobile devices.
 
+![Preview](preview.png)
+
 ## Features
 
 - HTTP/HTTPS forward proxy with CONNECT tunneling
@@ -19,8 +21,8 @@ iPad (Wi-Fi proxy:5988) ──→ Azure VM (proxy:5988) ──→ Internet
                                     │
                                     ├── Caddy (HTTPS:443) ──→ keepalive server (:8080)
                                     │     ↑
-                                    │     └── https://proxy.netninja.kongwatcharapong.in.th
-                                    │         (SSE/ping keeps CGNAT mapping alive)
+                                    │     └── https://<YOUR_DOMAIN>
+                                    │         (periodic fetch keeps CGNAT mapping alive)
                                     │
                                     └── Forward proxy (:5988)
                                           └── CONNECT tunnels to external sites
@@ -50,11 +52,11 @@ $env:GOOS="linux"; $env:GOARCH="amd64"; go build -o netninja-keepalive-linux kee
 
 ```bash
 # Copy binaries
-scp -i azure-sg.key netninja-proxy-linux konguser@85.211.183.237:/tmp/proxy_linux
-scp -i azure-sg.key netninja-keepalive-linux konguser@85.211.183.237:/tmp/keepalive_server
+scp -i azure-sg.key netninja-proxy-linux <USER>@<SERVER_IP>:/tmp/proxy_linux
+scp -i azure-sg.key netninja-keepalive-linux <USER>@<SERVER_IP>:/tmp/keepalive_server
 
 # Deploy
-ssh -i azure-sg.key konguser@85.211.183.237 "
+ssh -i azure-sg.key <USER>@<SERVER_IP> "
   sudo systemctl stop netninja-proxy
   sudo cp /tmp/proxy_linux /opt/netninja/proxy_linux
   sudo chmod +x /opt/netninja/proxy_linux
@@ -70,8 +72,8 @@ ssh -i azure-sg.key konguser@85.211.183.237 "
 ## iPad Configuration
 
 1. Wi-Fi settings → HTTP Proxy → Manual
-2. Server: `85.211.183.237`, Port: `5988`
-3. Open Safari → `https://proxy.netninja.kongwatcharapong.in.th`
+2. Server: `<YOUR_SERVER_IP>`, Port: `5988`
+3. Open Safari → `https://<YOUR_DOMAIN>`
 4. Tap **Start Keepalive** → keeps CGNAT mapping alive
 
 ## CGNAT Keepalive
