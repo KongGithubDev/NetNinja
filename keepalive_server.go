@@ -149,7 +149,7 @@ function updateUI(){
   document.getElementById('bytesRate').textContent=bmins>0.05?fmt(bytesTotal/bmins)+'/min':'-';
   var pingSec=sec%5;
   document.getElementById('bar').style.width=(pingSec/5*100)+'%';
-  updateStatus('on','Active \u2022 #'+count);
+  updateStatus('on','Active');
 }
 function drawChart(){
   var w=canvas.width=canvas.offsetWidth*2;
