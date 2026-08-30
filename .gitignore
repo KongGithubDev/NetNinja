@@ -23,6 +23,10 @@ privkey.pem
 dist/
 proxy_linux*
 netninja-proxy-linux
+netninja-keepalive-linux
+
+# Test scripts
+test_*.ps1
 
 # Runtime data
 proxy_cache.db
