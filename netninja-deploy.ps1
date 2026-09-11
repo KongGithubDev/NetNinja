@@ -13,11 +13,14 @@
 # machine — it is read as a SecureString and piped straight into ssh):
 #
 #   powershell -ExecutionPolicy Bypass -File .\netninja-deploy.ps1 -ThaiEgress
+#   powershell -ExecutionPolicy Bypass -File .\netninja-deploy.ps1 -ThaiPool
 #
 # What it does:
 #   1. scp the freshly built binary (dist\proxy_linux by default) to /tmp on the VM
 #   2. run /tmp/netninja-deploy.sh there with root privileges
 #      (backup → install → restart → optional Thai egress rotate → verify)
+#   2b. when netninja-th-pool.sh sits next to this script it is uploaded too, and
+#      -ThaiPool installs/enables the systemd service that supervises the tunnels
 #   3. print /geo-check so you can confirm geo traffic exits from Thailand
 param(
     [string]$Server = $env:NETNINJA_SERVER,
@@ -26,6 +29,7 @@ param(
     [string]$Binary = "$PSScriptRoot\dist\proxy_linux",
     [string]$ThaiNodes = '',
     [switch]$ThaiEgress,
+    [switch]$ThaiPool,
     [switch]$SkipUpload
 )
 
@@ -73,9 +77,25 @@ if (Test-Path $domainsFile) {
     if ($LASTEXITCODE -ne 0) { throw "scp of geo-domains.txt failed" }
 }
 
+# The pool supervisor (optional): it keeps the tunnels listed in the pool file
+# alive by itself. Its real config (/etc/netninja/th-pool.conf) stays on the
+# server — only the script and the example config are uploaded here.
+$supervisor = "$PSScriptRoot\netninja-th-pool.sh"
+if (Test-Path $supervisor) {
+    Write-Host "== uploading Thai pool supervisor ($supervisor) ==" -ForegroundColor Cyan
+    scp @sshOpts -- $supervisor "${target}:/tmp/netninja-th-pool.sh"
+    if ($LASTEXITCODE -ne 0) { throw "scp of netninja-th-pool.sh failed" }
+    $supervisorConf = "$PSScriptRoot\netninja-th-pool.conf.example"
+    if (Test-Path $supervisorConf) {
+        scp @sshOpts -- $supervisorConf "${target}:/tmp/netninja-th-pool.conf.example"
+        if ($LASTEXITCODE -ne 0) { throw "scp of netninja-th-pool.conf.example failed" }
+    }
+}
+
 $remoteCmd = 'bash /tmp/netninja-deploy.sh'
 if ($ThaiEgress) { $remoteCmd += ' --th-egress' }
 if ($ThaiNodes)  { $remoteCmd += " --th-nodes '$ThaiNodes'" }
+if ($ThaiPool)   { $remoteCmd += ' --th-pool' }
 
 Write-Host "== remote root password for $target (only used for this command) ==" -ForegroundColor Yellow
 $secure = Read-Host -AsSecureString -Prompt "password"

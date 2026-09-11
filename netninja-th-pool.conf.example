@@ -1,0 +1,110 @@
+# netninja-th-pool.conf.example
+#
+#   sudo install -D -m 0644 netninja-th-pool.conf.example /etc/netninja/th-pool.conf
+#   sudoedit /etc/netninja/th-pool.conf
+#
+# Copy it, then keep only the pattern that matches how your tunnels are built.
+# A "slot" is just: the SOCKS5 endpoint to publish, plus (optionally) a command
+# that rebuilds that tunnel when it dies or starts exiting another country.
+
+# ---------------------------------------------------------------------------
+# the pool file the proxy reads (GEO_SOCKS5_POOL_FILE) — hot reloaded ~20s
+# ---------------------------------------------------------------------------
+POOL_FILE=/opt/netninja/geo-nodes.txt
+STATE_DIR=/var/lib/netninja-th-pool
+LOG_FILE=/var/log/netninja-th-pool.log
+
+# how often to check in --daemon mode, and how long a probe may take
+CHECK_INTERVAL=60
+CHECK_TIMEOUT=12
+
+# the country every published node must exit from (proven via ip-api through
+# the tunnel itself, so a node can never be published on trust)
+EXPECT_COUNTRY=TH
+PROBE_URL="http://ip-api.com/json/?fields=query,country,countryCode,city,isp"
+
+# replace budget: never rotate more often than this, per slot storm protection
+REPLACE_COOLDOWN=180
+MAX_REPLACES_PER_HOUR=6
+
+# ---------------------------------------------------------------------------
+# Pattern A — the tunnels already exist and only need supervising
+#   (e.g. a startup script, another service, or manual `openvpn --daemon`)
+#   Nothing here creates tunnels; the script only verifies + publishes them.
+# ---------------------------------------------------------------------------
+# No real address lives in this file: fill in the SOCKS5 endpoints your own
+# tunnels listen on (loopback or the tunnel's private address, e.g.
+# 172.30.x.y:1080 when each tunnel brings up its own SOCKS5 listener).
+#
+# SLOTS=3
+# SLOT_1_SOCKS=<node1-host:port>
+# SLOT_2_SOCKS=<node2-host:port>
+# SLOT_3_SOCKS=<node3-host:port>
+
+# ---------------------------------------------------------------------------
+# Pattern B — one VPN client instance per slot, replaceable by command
+#
+#   SLOT_<n>_REPLACE must rebuild slot <n>'s tunnel AND its SOCKS5 listener and
+#   exit 0. Write a thin wrapper around whatever you already use, e.g.
+#
+#     /usr/local/sbin/th-slot-up.sh 2
+#
+#   which for VPNGate/OpenVPN looks roughly like:
+#     systemctl stop  "netninja-th@$1"
+#     # pick a TH node, rewrite /etc/openvpn/th$1.conf
+#     systemctl start "netninja-th@$1"
+#     # then restart the SOCKS5 listener bound to that tunnel's address
+#
+#   Your existing /opt/vpngate/vpngate-rotate.sh can be that wrapper for a
+#   single slot: SLOT_1_REPLACE="/opt/vpngate/vpngate-rotate.sh --force"
+# ---------------------------------------------------------------------------
+# SLOTS=2
+# SLOT_1_SOCKS=<node1-host:port>
+# SLOT_1_REPLACE="/usr/local/sbin/th-slot-up.sh 1"
+# SLOT_2_SOCKS=<node2-host:port>
+# SLOT_2_REPLACE="/usr/local/sbin/th-slot-up.sh 2"
+
+# ---------------------------------------------------------------------------
+# Pattern C — discover whatever listeners are up right now (nothing managed)
+#   Every discovered endpoint is still country-verified before it is published.
+# ---------------------------------------------------------------------------
+# DISCOVER_CMD="ss -ltn | awk '{print \$4}' | grep -E ':108[0-9]$'"
+
+# ---------------------------------------------------------------------------
+# Run it:
+#
+#   sudo ./netninja-th-pool.sh --status           # what does the pool look like now?
+#   sudo ./netninja-th-pool.sh --dry-run --once   # check everything, change nothing
+#   sudo ./netninja-th-pool.sh --once             # check, replace what is broken, publish
+#
+# systemd service (keeps checking) — /etc/systemd/system/netninja-th-pool.service
+#
+#   [Unit]
+#   Description=NetNinja Thai egress pool supervisor
+#   After=network-online.target
+#
+#   [Service]
+#   Type=simple
+#   ExecStart=/opt/netninja/netninja-th-pool.sh --daemon
+#   Restart=always
+#   RestartSec=15
+#
+#   [Install]
+#   WantedBy=multi-user.target
+#
+# ...or a timer instead of a long-running service (--once exits 3 when nothing is
+# healthy, which monitoring can alert on):
+#
+#   /etc/systemd/system/netninja-th-pool.service
+#     [Service]
+#     Type=oneshot
+#     ExecStart=/opt/netninja/netninja-th-pool.sh --once
+#
+#   /etc/systemd/system/netninja-th-pool.timer
+#     [Timer]
+#     OnBootSec=60
+#     OnUnitActiveSec=60
+#
+#     [Install]
+#     WantedBy=timers.target
+# ---------------------------------------------------------------------------

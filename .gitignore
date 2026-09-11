@@ -35,6 +35,10 @@ TROUBLESHOOTING.md
 geo-nodes.txt
 geo-domains.txt
 
+# Thai pool supervisor config — holds the real tunnel endpoints/commands
+th-pool.conf
+netninja-th-pool.conf
+
 # Local deploy settings — the real server host/user lives here, never in a
 # tracked script (the repository is public)
 netninja.local.ps1

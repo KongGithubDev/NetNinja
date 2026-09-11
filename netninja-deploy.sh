@@ -5,6 +5,7 @@
 #   bash netninja-deploy.sh --th-egress            # ...and rotate the VPNGate egress to a Thai node
 #   bash netninja-deploy.sh --th-nodes "a:1080,b:1080"
 #                                                  # ...and (re)write the Thai egress pool file
+#   bash netninja-deploy.sh --th-pool               # ...and enable the pool supervisor service
 #
 # The new binary is expected at /tmp/proxy_linux_new (scp it first), or set
 # NEW_BIN=/path/to/binary. The previous binary is kept as proxy_linux.bak-<timestamp>
@@ -19,11 +20,13 @@ DEST=/opt/netninja/proxy_linux
 NEW=${NEW_BIN:-/tmp/proxy_linux_new}
 TH_EGRESS=0
 TH_NODES=""
+TH_POOL=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --th-egress) TH_EGRESS=1 ;;
     --th-nodes)  shift; TH_NODES="${1:-}" ;;
+    --th-pool)   TH_POOL=1 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
   shift || true
@@ -89,6 +92,58 @@ if [ -f /tmp/geo-domains.txt ]; then
   echo -n "domains: "
   grep -cvE '^\s*(#|$)' /opt/netninja/geo-domains.txt || true
   echo "(edit this file directly — it reloads in ~20s; or set GEO_DOMAINS_URL for a shared list)"
+fi
+
+# The pool *supervisor* is optional: install it when it was scp'd along with the
+# binary. It keeps the tunnels under /opt/netninja/geo-nodes.txt alive on its
+# own, so the pool stops depending on someone appending host:port by hand.
+if [ -f /tmp/netninja-th-pool.sh ]; then
+  echo
+  echo "== Thai pool supervisor (netninja-th-pool.sh) =="
+  install -d -m 0755 /opt/netninja
+  install -d -m 0755 /etc/netninja
+  install -m 0755 /tmp/netninja-th-pool.sh /opt/netninja/netninja-th-pool.sh
+  [ -f /tmp/netninja-th-pool.conf.example ] && \
+    install -m 0644 /tmp/netninja-th-pool.conf.example /etc/netninja/th-pool.conf.example
+  if [ -f /etc/netninja/th-pool.conf ]; then
+    SLOTS=$(grep -cE '^[[:space:]]*SLOT_[0-9]+_SOCKS=' /etc/netninja/th-pool.conf || true)
+    echo "config: /etc/netninja/th-pool.conf (${SLOTS:-0} slot(s) defined)"
+  else
+    echo "no /etc/netninja/th-pool.conf yet — cp /etc/netninja/th-pool.conf.example /etc/netninja/th-pool.conf and edit it"
+  fi
+fi
+
+if [ "$TH_POOL" = "1" ]; then
+  echo
+  echo "== enable netninja-th-pool.service =="
+  if [ ! -x /opt/netninja/netninja-th-pool.sh ]; then
+    echo "!! /opt/netninja/netninja-th-pool.sh missing — scp netninja-th-pool.sh to /tmp first (service not enabled)"
+  elif [ ! -f /etc/netninja/th-pool.conf ]; then
+    echo "!! --th-pool needs /etc/netninja/th-pool.conf first (start from the .example) — service not enabled"
+  else
+    cat > /etc/systemd/system/netninja-th-pool.service <<'UNIT'
+[Unit]
+Description=NetNinja Thai egress pool supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/netninja/netninja-th-pool.sh --daemon
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable --now netninja-th-pool
+    sleep 2
+    echo -n "netninja-th-pool: "
+    systemctl is-active netninja-th-pool || true
+    echo "(log: /var/log/netninja-th-pool.log — หรือ journalctl -u netninja-th-pool)"
+    /opt/netninja/netninja-th-pool.sh --status || true
+  fi
 fi
 
 if [ "$TH_EGRESS" = "1" ]; then
