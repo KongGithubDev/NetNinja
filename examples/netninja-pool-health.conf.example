@@ -1,0 +1,57 @@
+# netninja-pool-health.conf.example
+#
+#   sudo install -D -m 0600 netninja-pool-health.conf.example /etc/netninja/pool-health.conf
+#   sudoedit /etc/netninja/pool-health.conf
+#
+# 0600 on purpose: ALERT_CMD can carry a secret (a ntfy topic, a webhook URL, a
+# bot token), and a channel anyone can post to is a channel anyone can read.
+#
+# Every value uses "${NAME:=default}", so an environment variable still wins —
+# which is how to try something out by hand:
+#     MIN_NODES=99 sudo -E ./netninja-pool-health.sh
+
+# ---------------------------------------------------------------------------
+# what counts as healthy
+# ---------------------------------------------------------------------------
+# Alert when fewer than this many egress nodes verify as EXPECT_COUNTRY. Two
+# means "one working Thai exit plus a spare"; raise it if you run more nodes.
+: "${MIN_NODES:=2}"
+: "${EXPECT_COUNTRY:=TH}"
+
+# The pool state comes from the proxy on loopback, so no credential is needed.
+: "${PROXY_URL:=http://127.0.0.1:5988/geo-check}"
+
+# ---------------------------------------------------------------------------
+# how loudly
+# ---------------------------------------------------------------------------
+# The journal and LOG_FILE always get every alert; this is only how often it
+# repeats while the pool stays thin (60 = once an hour after the first).
+: "${ALERT_REPEAT_MIN:=60}"
+
+# Consecutive bad checks before the first alert. Right after a proxy restart the
+# egress countries read "unverified" for ~20s, and a blip is not a lost spare.
+: "${ALERT_AFTER:=2}"
+
+# ---------------------------------------------------------------------------
+# where else to shout — empty means journal + log file only
+# ---------------------------------------------------------------------------
+# ALERT_CMD runs through `sh -c` with ALERT_SUBJECT / ALERT_BODY (and
+# POOL_HEALTH_VERIFIED / POOL_HEALTH_NODES) in the environment, and the body on
+# stdin. Single quotes keep the $variables for the alert, not for this file.
+#
+# ntfy.sh — no account. The topic is the only secret: pick something long and
+# random, then subscribe to https://ntfy.sh/<topic> in the app or the browser.
+# : "${ALERT_CMD:=curl -fsS -m 10 -o /dev/null -w \"ntfy:%{http_code}\n\" -H \"Title: \$ALERT_SUBJECT\" -H \"Priority: high\" -d \"\$ALERT_BODY\" https://ntfy.sh/<long-random-topic>}"
+#
+# Telegram:
+# : "${ALERT_CMD:=curl -fsS -m 10 -d \"chat_id=<id>&text=\$ALERT_SUBJECT: \$ALERT_BODY\" \"https://api.telegram.org/bot<token>/sendMessage\"}"
+#
+# Slack or Discord webhook:
+# : "${ALERT_CMD:=curl -fsS -m 10 -H \"Content-Type: application/json\" -d \"{\\\"text\\\":\\\"\$ALERT_SUBJECT: \$ALERT_BODY\\\"}\" \"<webhook-url>\"}"
+: "${ALERT_CMD:=}"
+
+# ---------------------------------------------------------------------------
+# state
+# ---------------------------------------------------------------------------
+: "${STATE_DIR:=/var/lib/netninja-pool-health}"
+: "${LOG_FILE:=/var/log/netninja-pool-health.log}"

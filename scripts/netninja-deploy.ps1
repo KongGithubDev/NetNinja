@@ -27,6 +27,8 @@
 #      examples/netninja-th-pool.conf.example), and -ThaiPool installs and
 #      enables the systemd service that supervises the tunnels (writing a
 #      discovery config when /etc/netninja/th-pool.conf does not exist yet)
+#   2c. and scripts/netninja-pool-health.sh, the timer that alerts when the Thai
+#      pool drops below MIN_NODES verified nodes
 #   3. print /geo-check so you can confirm geo traffic exits from Thailand
 #
 # Secrets and per-deployment data (azure-sg.key, netninja.local.ps1,
@@ -118,6 +120,20 @@ if (Test-Path $supervisor) {
     if (Test-Path $supervisorConf) {
         scp @sshOpts -- $supervisorConf "${target}:/tmp/netninja-th-pool.conf.example"
         if ($LASTEXITCODE -ne 0) { throw "scp of netninja-th-pool.conf.example failed" }
+    }
+}
+
+# The pool health check (optional): alerts when the Thai egress pool loses its
+# spare, instead of leaving that to be noticed on the dashboard later.
+$health = Join-Path $Repo 'scripts\netninja-pool-health.sh'
+if (Test-Path $health) {
+    Write-Host "== uploading Thai pool health check ($health) ==" -ForegroundColor Cyan
+    scp @sshOpts -- $health "${target}:/tmp/netninja-pool-health.sh"
+    if ($LASTEXITCODE -ne 0) { throw "scp of netninja-pool-health.sh failed" }
+    $healthConf = Join-Path $Repo 'examples\netninja-pool-health.conf.example'
+    if (Test-Path $healthConf) {
+        scp @sshOpts -- $healthConf "${target}:/tmp/netninja-pool-health.conf.example"
+        if ($LASTEXITCODE -ne 0) { throw "scp of netninja-pool-health.conf.example failed" }
     }
 }
 

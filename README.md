@@ -196,6 +196,28 @@ published, which is the zero-config path), and then runs one pass immediately so
 
 It can be tested offline, with no real tunnel: `make selftest` (stub probe + stub replace commands).
 
+#### Health check: `scripts/netninja-pool-health.sh`
+
+A pool is only as good as its spare: with two verified nodes one can die and traffic keeps leaving Thai; with
+one there is nothing behind it. The check asks the proxy's own `/geo-check` how many nodes are `CURRENT` or
+`ok` **and** really exit `EXPECT_COUNTRY` — a node that is configured but dead is not a spare and never
+counts — and alerts when that drops below `MIN_NODES` (default 2).
+
+```bash
+sudo ./scripts/netninja-pool-health.sh --status   # what it sees right now, no alert
+sudo ./scripts/netninja-pool-health.sh            # check + alert (exit 1 when thin)
+MIN_NODES=99 sudo -E ./scripts/netninja-pool-health.sh   # prove the alert path works
+```
+
+The journal and `/var/log/netninja-pool-health.log` always receive the alert; `ALERT_CMD` in
+`/etc/netninja/pool-health.conf` (0600, because it can hold a webhook URL or a bot token) sends it off the box,
+with ready-made ntfy / Telegram / webhook lines in `examples/netninja-pool-health.conf.example`. Only
+`ALERT_AFTER` consecutive bad checks are allowed to page anyone — right after a proxy restart the egress country
+reads `unverified` for ~20s, and a blip is not a lost spare — then it repeats at most every `ALERT_REPEAT_MIN`
+minutes while the pool stays thin, and once when it recovers. The deploy script installs it as
+`/opt/netninja/netninja-pool-health.sh` behind `netninja-pool-health.timer` (every 2 minutes), and a thin pool
+leaves `netninja-pool-health.service` **failed**, so `systemctl --failed` shows it too.
+
 ### 2. Geo session — Thai ads as well
 
 One web page pulls in dozens of third-party domains (ad slots, captcha, analytics) and no list covers

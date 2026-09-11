@@ -179,6 +179,47 @@ UNIT
   fi
 fi
 
+# The pool health check is optional as well: it turns 'the pool lost its spare'
+# into an alert instead of something noticed on the dashboard an hour later.
+if [ -f /tmp/netninja-pool-health.sh ]; then
+  echo
+  echo '== Thai pool health check =='
+  install -m 0755 /tmp/netninja-pool-health.sh /opt/netninja/netninja-pool-health.sh
+  [ -f /tmp/netninja-pool-health.conf.example ] && \
+    install -m 0644 /tmp/netninja-pool-health.conf.example /etc/netninja/pool-health.conf.example
+  cat > /etc/systemd/system/netninja-pool-health.service <<'UNIT'
+[Unit]
+Description=NetNinja Thai egress pool health check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/netninja/netninja-pool-health.sh
+UNIT
+  cat > /etc/systemd/system/netninja-pool-health.timer <<'UNIT'
+[Unit]
+Description=Check the NetNinja Thai egress pool every few minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now netninja-pool-health.timer
+  echo -n 'netninja-pool-health.timer: '
+  systemctl is-active netninja-pool-health.timer || true
+  if [ ! -f /etc/netninja/pool-health.conf ]; then
+    echo '(no /etc/netninja/pool-health.conf yet - until it exists an alert only'
+    echo ' reaches the journal and /var/log/netninja-pool-health.log: copy the'
+    echo ' .example and set ALERT_CMD to get the alert off the box)'
+  fi
+  /opt/netninja/netninja-pool-health.sh --status || true
+fi
+
 # ---------------------------------------------------------------------------
 # binaries — install and restart, rolling each service back on failure
 # ---------------------------------------------------------------------------
