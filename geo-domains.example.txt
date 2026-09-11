@@ -1,0 +1,39 @@
+# NetNinja — geo domain list (DATA, not code).
+#
+# Hosts in this file egress from Thailand through the egress pool, so the
+# destination sees a Thai visitor. Nothing here is compiled into the proxy:
+# point GEO_DOMAINS_FILE at a copy of this file (or GEO_DOMAINS_URL at a list
+# you host) and edit it whenever you like — the proxy hot reloads it within
+# ~20 seconds, no rebuild and no restart.
+#
+# Format: one host per line. `#` starts a comment. Subdomains match
+# automatically (listing `example.com` also covers `www.example.com`),
+# and adblock/hosts-file decorations are accepted (`||example.com^`,
+# `*.example.com`, `example.com:8080`, `example.com/path`).
+#
+# These entries are the list this deployment already used, moved out of the
+# source code so it can be maintained as data. Trim or extend it freely —
+# a shorter list is not a regression, an unfounded entry is.
+# Random video chat sites match peers by the IP they see, so they are the
+# reason this list exists.
+
+ome.tv
+ometv.com
+ometv.net
+ome-tv.to
+ometv.app
+omegle.com
+omegle.tv
+chatroulette.com
+chat-roulette.com
+chatter-roulette.com
+camsurf.com
+chatrandom.com
+chathub.com
+chatspin.com
+bazoocam.com
+camloo.com
+coomeet.com
+talkwithstranger.com
+shagle.com
+y99.in

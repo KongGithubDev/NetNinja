@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -1500,19 +1501,24 @@ func probeHTTPStatus(c net.Conn, host string) bool {
 		strings.Contains(s, "Just a moment")
 }
 
-// dialHop opens a connection through the SOCKS5 server (no-auth).
+// dialHop opens a connection through the shared HOP_SOCKS5 server (no-auth).
 func dialHop(ctx context.Context, address string) (net.Conn, error) {
+	return dialSocks5(ctx, hopSocks5, address)
+}
+
+// dialSocks5 opens a connection to address through the given SOCKS5 server.
+func dialSocks5(ctx context.Context, server string, address string) (net.Conn, error) {
 	d := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-	c, err := d.DialContext(ctx, "tcp", hopSocks5)
+	c, err := d.DialContext(ctx, "tcp", server)
 	if err != nil {
-		return nil, fmt.Errorf("hop dial %s: %w", hopSocks5, err)
+		return nil, fmt.Errorf("hop dial %s: %w", server, err)
 	}
 	// Bound the whole SOCKS handshake so a dead/unresponsive hop fails fast
 	// and we can fall back to direct instead of hanging the tunnel for ages.
 	_ = c.SetDeadline(time.Now().Add(8 * time.Second))
 	fail := func(e error) (net.Conn, error) {
 		c.Close()
-		return nil, fmt.Errorf("socks5 %s: %w", hopSocks5, e)
+		return nil, fmt.Errorf("socks5 %s: %w", server, e)
 	}
 	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		return fail(err)
@@ -1593,12 +1599,48 @@ func readSocksReply(c net.Conn) error {
 // SOCKS5 hop and everything else via the normal custom dialer. Unknown hosts are
 // auto-classified: if Cloudflare 403s them from this IP they get hopped too. If
 // the hop is unreachable it degrades to direct instead of failing.
+//
+// Geo domains (GEO_DOMAINS, e.g. ome.tv) always go through the hop: random video
+// chat matches peers by the IP it sees, so OmeTV only finds Thai partners when
+// the hop itself exits in Thailand.
 func hopDial(ctx context.Context, network, hostname, address string) (net.Conn, error) {
+	// Geo-sensitive traffic — the listed site itself, and while the client is in
+	// a geo session the ad slots and other third parties it loads — leaves from
+	// the Thai pool, so the destination sees a Thai visitor.
+	if viaThai, why := geoEgressFor(ctx, hostname, address); viaThai {
+		if why == "geo" {
+			// Mark the whole session Thai, so the ad slots and the other third
+			// parties this page loads follow the same egress.
+			noteGeoSession(geoKeyFromCtx(ctx))
+		}
+		c, err := dialGeoThai(ctx, address, hostname+" ("+why+")")
+		if err == nil {
+			if why == "geo" {
+				logGeoOnce(hostname, true)
+			} else {
+				logGeoEgressOnce(hostname, why)
+			}
+			return c, nil
+		}
+		// A country-sensitive site must never silently fall back to this server's
+		// country: with GEO_STRICT=1 the dial fails and the client retries instead
+		// of matching peers in the wrong country. Ad/asset hosts that merely
+		// follow a session may degrade to direct, so the page keeps working when
+		// the tunnel is down.
+		if why == "geo" && geoPoolStrict && geoPoolOn && geoPoolSize() > 0 {
+			return nil, fmt.Errorf("no %s egress for %s: %w", geoExpectCountry(), hostname, err)
+		}
+		log.Printf("%s[GEO][warn]%s %s: %v — direct fallback (this server's country)", colorYellow, colorReset, hostname, err)
+		if why == "geo" {
+			logGeoOnce(hostname, false)
+		}
+		return customDialer.DialContext(ctx, network, address)
+	}
 	useHop := inHopDomains(hostname)
 	if !useHop {
 		useHop = autoClassify(hostname)
 	}
-	if useHop {
+	if useHop && hopSocks5 != "" {
 		c, err := dialHop(ctx, address)
 		if err == nil {
 			return c, nil
@@ -1909,6 +1951,14 @@ func main() {
 	defer db.Close()
 loadAppSettings()
 loadHopConfig()
+	initGeoDomains()
+	initGeoSession()
+	startGeoPool()
+	initBandwidthControl()
+	initGeoGuard()
+	startGeoGuard()
+	startGeoDomainRefresher()
+	startGeoSessionSweeper()
 	startHopAutoSweeper()
 	loadAdminCreds()
 	startConnLogWriter()
@@ -1985,10 +2035,14 @@ startRetentionPruner()
 	startMapSweeper()
 
 	proxy := &http.Server{
-		Handler:      http.HandlerFunc(handleRequest),
+		Handler:      guardHandler(handleRequest),
 		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  90 * time.Second,
+		// Slowloris guard: a client that opens a socket and dribbles headers
+		// must not be able to hold a connection (and a goroutine) forever.
+		ReadHeaderTimeout: 20 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	fmt.Println()
@@ -2081,6 +2135,14 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	userTracker.Store(trackingIP, time.Now())
 
+	// Every dial downstream (the SOCKS5 egress choice included) needs to know
+	// which client this is, so a geo session can follow the whole session.
+	geoKey := "ip:" + trackingIP
+	if u := authedUser(r); u != "" {
+		geoKey = "u:" + u
+	}
+	r = r.WithContext(ctxWithGeoKey(r.Context(), geoKey))
+
 	// Shorter DNS TTL for video streaming domains — force refresh for optimal CDN node
 	if isVideoDomain(r.URL.Hostname()) {
 		dnsCache.Delete(strings.ToLower(r.URL.Hostname()))
@@ -2113,7 +2175,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	isForSelf := (host == "" || isSelf(host, r.Host))
 
 	if isForSelf {
-		if path == "/proxy.pac" {
+		if path == "/proxy.pac" || path == "/wpad.dat" {
 			servePAC(w, r)
 			return
 		} else if path == "/welcome" {
@@ -2152,7 +2214,10 @@ p{color:#888;margin-bottom:25px}
 </html>`, clientIP)))
 			return
 		}
-		if path == "/block-check" {
+		if path == "/geo-check" {
+			serveGeoCheck(w, r)
+			return
+		} else if path == "/block-check" {
 			serveBlockCheck(w, r)
 			return
 		} else if path == "/ws" {
@@ -2641,21 +2706,8 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
 		proxyIP = h
 	}
 
-	direct := []string{
-		"googlevideo.com", "apple.com", "icloud.com",
-		"apple-cloudkit.com", "mzstatic.com", "itunes.com",
-		"ookla.com", "speedtest.net", "ooklaserver.net",
-	}
-	if extra := os.Getenv("PAC_DIRECT_DOMAINS"); extra != "" {
-		for _, d := range strings.Split(extra, ",") {
-			d = strings.TrimSpace(d)
-			if strings.Trim(d, `"` + `'`) != "" {
-				direct = append(direct, strings.Trim(d, `"` + `'`))
-			}
-		}
-	}
 	var directCond []string
-	for _, d := range direct {
+	for _, d := range pacDirectDomains() {
 		directCond = append(directCond, `dnsDomainIs(host, "`+d+`")`)
 	}
 	directList := strings.Join(directCond, " || ")
@@ -2678,11 +2730,18 @@ func servePAC(w http.ResponseWriter, r *http.Request) {
 }
 `, proxyIP, proxyHost, directList, proxyHost)
 
+	// iPadOS fetches this file itself (there is no proxy yet) and is picky about
+	// the type: without application/x-ns-proxy-autoconfig Auto mode fails
+	// silently, and a cached copy keeps stale rules alive after PROXY_ADDR moves.
+	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	w.Write([]byte(pac))
 
 	clientIP := getClientIP(r)
-	log.Printf("%s[PAC]%s Served to %s ua=%s",
-		colorCyan, colorReset, clientIP, r.Header.Get("User-Agent"))
+	log.Printf("%s[PAC]%s served %s to %s ua=%s",
+		colorCyan, colorReset, r.URL.Path, clientIP, r.Header.Get("User-Agent"))
 }
 
 func serveLogs(w http.ResponseWriter, r *http.Request) {
@@ -2760,8 +2819,9 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ad-block: refuse explicit ad/tracking hosts on plain HTTP too
-	if u := authedUser(r); adblockEnabledFor(u) && isAdBlockedHost(unwrappedHost) {
+	// Ad-block: refuse explicit ad/tracking hosts on plain HTTP too, unless the
+	// Thai egress is carrying them (see the CONNECT path).
+	if u := authedUser(r); adblockEnabledFor(u) && isAdBlockedHost(unwrappedHost) && !geoHandlesAd(r.Context(), unwrappedHost) {
 		atomic.AddInt64(&adBlocked, 1)
 		log.Printf("%s[AD-BLOCK]%s refused HTTP %s ← %s", colorRed, colorReset, unwrappedHost, clientIP)
 		http.Error(w, "Forbidden (Ad-Blocked by NetNinja)", http.StatusForbidden)
@@ -2914,6 +2974,18 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&activeConns, 1)
 	defer atomic.AddInt64(&activeConns, -1)
 
+	// Per-IP connection cap: one runaway device must not be able to exhaust the
+	// proxy's sockets and goroutines.
+	releaseSlot := acquireConnSlot(clientIP)
+	if releaseSlot == nil {
+		atomic.AddInt64(&errCount, 1)
+		log.Printf("%s[LIMIT]%s %s hit MAX_CONNS_PER_IP=%d — refusing %s", colorYellow, colorReset, clientIP, maxConnsPerIP(), host)
+		pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: host, status: "conn_limit", durMs: 0})
+		http.Error(w, "Too Many Connections", http.StatusServiceUnavailable)
+		return
+	}
+	defer releaseSlot()
+
 	// extract hostname and port for cached DNS
 	hostname := host
 	port := "443"
@@ -2922,8 +2994,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		port = host[idx+1:]
 	}
 
-	// Track active tunnel (host-based)
-	activeTunnels.Store(hostname, time.Now())
+	// Track the tunnel with a unique key. Keying by hostname alone meant two
+	// concurrent tunnels to the same host clobbered each other and the first one
+	// to close deleted the entry for both (the dashboard listed dead tunnels).
+	tunnelKey := fmt.Sprintf("%s#%d", hostname, atomic.AddInt64(&tunnelSeq, 1))
+	activeTunnels.Store(tunnelKey, time.Now())
 
 	// Track host stats
 	var hs *hostStat
@@ -2964,8 +3039,9 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ad-block: refuse tunnels to ad/tracking networks before dialing
-	if adblockEnabledFor(tunnelUser) && isAdBlockedHost(hostname) {
+	// Ad-block: refuse tunnels to ad/tracking networks before dialing — unless the
+	// Thai egress is carrying them, which is what makes the ad slot local.
+	if adblockEnabledFor(tunnelUser) && isAdBlockedHost(hostname) && !geoHandlesAd(r.Context(), hostname) {
 		atomic.AddInt64(&adBlocked, 1)
 		log.Printf("%s[AD-BLOCK]%s refused CONNECT %s ← %s", colorRed, colorReset, hostname, clientIP)
 		pushConnLog(connLogEntry{username: trackID, clientIP: clientIP, host: hostname, status: "ad_block", durMs: time.Since(tunnelStart).Milliseconds()})
@@ -3041,9 +3117,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	// Track active tunnel start time
-	activeTunnels.Store(hostname, time.Now())
-
 	// God-Mode: Pure native performance + KeepAlive + large buffers
 	if tc, ok := clientConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
@@ -3084,6 +3157,15 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	clientAct := &activityConn{Conn: wpConn}
 	destAct := &activityConn{Conn: destConn}
 
+	// Bandwidth management: meter the client side of the tunnel (Read = upload,
+	// Write = download) against the global and per-user buckets.
+	upLim, downLim := bwForUser(trackID)
+	clientPipe := &limitedConn{
+		Conn: clientAct,
+		up:   compactLimiters(bwGlobalUp, upLim),
+		down: compactLimiters(bwGlobalDown, downLim),
+	}
+
 	errc := make(chan error, 2)
 	done := make(chan struct{})
 	var wg sync.WaitGroup
@@ -3093,9 +3175,18 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				atomic.AddInt64(&errCount, 1)
+				log.Printf("%s[PANIC]%s tunnel %s ↔ %s: %v", colorRed, colorReset, clientIP, host, r)
+				destAct.Close()
+				clientAct.Close()
+				errc <- fmt.Errorf("panic: %v", r)
+			}
+		}()
 		buf := copyBufPool.Get().(*[]byte)
 		defer copyBufPool.Put(buf)
-		n, err := io.CopyBuffer(destAct, clientAct, *buf)
+		n, err := io.CopyBuffer(destAct, clientPipe, *buf)
 		atomic.AddInt64(&totalBytesUp, n)
 		tUp += n
 		if hs != nil {
@@ -3114,9 +3205,18 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				atomic.AddInt64(&errCount, 1)
+				log.Printf("%s[PANIC]%s tunnel %s ↔ %s: %v", colorRed, colorReset, clientIP, host, r)
+				destAct.Close()
+				clientAct.Close()
+				errc <- fmt.Errorf("panic: %v", r)
+			}
+		}()
 		buf := copyBufPool.Get().(*[]byte)
 		defer copyBufPool.Put(buf)
-		n, err := io.CopyBuffer(clientAct, destAct, *buf)
+		n, err := io.CopyBuffer(clientPipe, destAct, *buf)
 		atomic.AddInt64(&totalBytesDown, n)
 		tDown += n
 		if hs != nil {
@@ -3172,7 +3272,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 	close(done)
-	activeTunnels.Delete(hostname)
+	activeTunnels.Delete(tunnelKey)
 
 	// Log WHY the tunnel closed — tells us if the server killed it (deadline/
 	// read/write error) or a peer vanished (EOF/RST). Crucial for the recurring
@@ -3499,10 +3599,18 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 
 			// Active tunnels (host that have open connections right now)
 			var tunnels []string
+			seenTunnels := map[string]bool{}
 			activeTunnels.Range(func(k, v interface{}) bool {
-				tunnels = append(tunnels, k.(string))
+				h := k.(string)
+				if i := strings.IndexByte(h, '#'); i >= 0 {
+					h = h[:i]
+				}
+				seenTunnels[h] = true
 				return true
 			})
+			for h := range seenTunnels {
+				tunnels = append(tunnels, h)
+			}
 			sort.Strings(tunnels)
 
 			// Bandwidth history snapshot
@@ -5041,4 +5149,1758 @@ func handleAdminUserFlag(w http.ResponseWriter, r *http.Request) {
 	recordAdminLog(adminUser, "settings", user, fmt.Sprintf("%s=%s", flag, flagTxt(next)))
 	log.Printf("%s[ADMIN]%s set %s=%s for %q", colorGreen, colorReset, flag, flagTxt(next), user)
 	http.Redirect(w, r, "/admin?msg="+url.QueryEscape(fmt.Sprintf("ตั้งค่า '%s' %s", user, flagTxt(next))), http.StatusFound)
+}
+
+// ===========================================================================
+// Bandwidth management — token-bucket pacing (global + per user)
+//
+//   BW_GLOBAL_MBPS=0   aggregate ceiling for the whole proxy (0 = unlimited)
+//   BW_USER_MBPS=0     per-user ceiling, keyed by auth user (or client IP in
+//                      no-auth mode) (0 = unlimited)
+//   BW_BURST_KB=256    burst allowance per bucket
+//
+// Bytes are metered on the client side of each tunnel: Read == upload
+// (client → target), Write == download (target → client). Over-budget traffic
+// sleeps just long enough to stay on pace — no drops, no bufferbloat.
+// ===========================================================================
+
+const bwChunk = 32 * 1024
+
+type bwLimiter struct {
+	mu     sync.Mutex
+	rate   float64 // bytes per second, <= 0 = unlimited
+	burst  float64
+	tokens float64
+	last   time.Time
+}
+
+func newBwLimiter(bytesPerSec int64, burstBytes int64) *bwLimiter {
+	if bytesPerSec <= 0 {
+		return nil
+	}
+	if burstBytes < 16*1024 {
+		burstBytes = 16 * 1024
+	}
+	return &bwLimiter{rate: float64(bytesPerSec), burst: float64(burstBytes), tokens: float64(burstBytes), last: time.Now()}
+}
+
+// take reserves n bytes and returns how long the caller must wait to stay on pace.
+func (l *bwLimiter) take(n int) time.Duration {
+	if l == nil || l.rate <= 0 || n <= 0 {
+		return 0
+	}
+	l.mu.Lock()
+	now := time.Now()
+	l.tokens += now.Sub(l.last).Seconds() * l.rate
+	l.last = now
+	if l.tokens > l.burst {
+		l.tokens = l.burst
+	}
+	l.tokens -= float64(n)
+	var wait time.Duration
+	if l.tokens < 0 {
+		wait = time.Duration(-l.tokens / l.rate * float64(time.Second))
+		l.tokens = 0
+	}
+	l.mu.Unlock()
+	return wait
+}
+
+func compactLimiters(ls ...*bwLimiter) []*bwLimiter {
+	out := make([]*bwLimiter, 0, len(ls))
+	for _, l := range ls {
+		if l != nil {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func takeAll(ls []*bwLimiter, n int) time.Duration {
+	var wait time.Duration
+	for _, l := range ls {
+		if d := l.take(n); d > wait {
+			wait = d
+		}
+	}
+	return wait
+}
+
+// limitedConn meters both directions of a tunnel: Read is upload (client →
+// target), Write is download (target → client).
+type limitedConn struct {
+	net.Conn
+	up   []*bwLimiter
+	down []*bwLimiter
+}
+
+func (c *limitedConn) Read(p []byte) (int, error) {
+	if len(p) > bwChunk {
+		p = p[:bwChunk]
+	}
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		if d := takeAll(c.up, n); d > 0 {
+			time.Sleep(d)
+		}
+	}
+	return n, err
+}
+
+func (c *limitedConn) Write(p []byte) (int, error) {
+	written := 0
+	for written < len(p) {
+		end := written + bwChunk
+		if end > len(p) {
+			end = len(p)
+		}
+		if d := takeAll(c.down, end-written); d > 0 {
+			time.Sleep(d)
+		}
+		n, err := c.Conn.Write(p[written:end])
+		written += n
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, nil
+}
+
+var (
+	bwGlobalUp     *bwLimiter
+	bwGlobalDown   *bwLimiter
+	bwUserUp       int64 // bytes/sec per user (0 = off)
+	bwUserDown     int64
+	bwBurstBytes   int64 = 256 * 1024
+	userBwLimiters sync.Map // user -> *userBwLimit
+)
+
+type userBwLimit struct {
+	up   *bwLimiter
+	down *bwLimiter
+}
+
+func mbpsToBytes(key string) int64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		return 0
+	}
+	return int64(f * 1_000_000 / 8)
+}
+
+func humanBps(n int64) string {
+	if n <= 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%.2f Mbps", float64(n)*8/1_000_000)
+}
+
+func initBandwidthControl() {
+	if v := strings.TrimSpace(os.Getenv("BW_BURST_KB")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 16 {
+			bwBurstBytes = n * 1024
+		}
+	}
+	global := mbpsToBytes("BW_GLOBAL_MBPS")
+	bwUserUp = mbpsToBytes("BW_USER_MBPS")
+	bwUserDown = bwUserUp
+	bwGlobalUp = newBwLimiter(global, bwBurstBytes)
+	bwGlobalDown = newBwLimiter(global, bwBurstBytes)
+	if global > 0 || bwUserUp > 0 {
+		log.Printf("%s[BW]%s global=%s per-user=%s burst=%dKB",
+			colorGreen, colorReset, humanBps(global), humanBps(bwUserUp), bwBurstBytes/1024)
+	}
+}
+
+// bwForUser lazily creates a user's buckets so a new user always starts with a
+// full burst instead of inheriting another account's debt.
+func bwForUser(user string) (up, down *bwLimiter) {
+	if user == "" || (bwUserUp <= 0 && bwUserDown <= 0) {
+		return nil, nil
+	}
+	v, _ := userBwLimiters.LoadOrStore(user, &userBwLimit{
+		up:   newBwLimiter(bwUserUp, bwBurstBytes),
+		down: newBwLimiter(bwUserDown, bwBurstBytes),
+	})
+	b := v.(*userBwLimit)
+	return b.up, b.down
+}
+
+// ===========================================================================
+// Per-client-IP connection cap + panic isolation
+//
+//   MAX_CONNS_PER_IP=0   concurrent tunnels allowed per client IP (0 = off)
+// ===========================================================================
+
+var connsPerIP sync.Map // ip -> *int64
+var tunnelSeq int64
+
+func maxConnsPerIP() int64 {
+	if v := strings.TrimSpace(os.Getenv("MAX_CONNS_PER_IP")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// acquireConnSlot reserves a tunnel slot for ip; it returns a release func, or
+// nil when the caller is already at the cap.
+func acquireConnSlot(ip string) func() {
+	limit := maxConnsPerIP()
+	if limit <= 0 || ip == "" {
+		return func() {}
+	}
+	v, _ := connsPerIP.LoadOrStore(ip, new(int64))
+	p := v.(*int64)
+	if atomic.AddInt64(p, 1) > limit {
+		atomic.AddInt64(p, -1)
+		return nil
+	}
+	return func() { atomic.AddInt64(p, -1) }
+}
+
+// recoverTo turns a panic into a log line instead of a dead proxy process.
+func recoverTo(where string) {
+	if r := recover(); r != nil {
+		atomic.AddInt64(&errCount, 1)
+		log.Printf("%s[PANIC]%s %s: %v\n%s", colorRed, colorReset, where, r, debug.Stack())
+	}
+}
+
+// guardHandler wraps every request so one malformed request can't take the
+// whole proxy down — an unrecovered panic in a handler kills the process.
+func guardHandler(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer recoverTo("handler " + r.URL.Path)
+		next(w, r)
+	}
+}
+
+// ===========================================================================
+// Geo routing — make geo-sensitive sites see a Thai IP
+//
+// A forward proxy always shows the destination the *proxy's* IP, so a server in
+// Malaysia looks Malaysian to OmeTV and only matches Malaysian peers. Hosts on
+// the geo list are dialled through the Thai egress pool instead, so the
+// destination sees a Thai address. DNS is still resolved here, so Cisco
+// Umbrella on the client never sees the query.
+//
+// The list is *data*, never code: nothing is compiled in. The proxy merges
+// whatever the operator points it at, so adding or dropping a site never needs
+// a rebuild and the proxy never guesses which sites are country-sensitive.
+//
+//   GEO_DOMAINS=...        comma/newline separated domains (env)
+//   GEO_DOMAINS_FILE=...   one domain per line, '#' comments (default
+//                          /opt/netninja/geo-domains.txt, hot reloaded)
+//   GEO_DOMAINS_URL=...    list fetched at boot + refreshed, cached to disk
+//   GEO_REFRESH_HOURS=24   refresh interval for the URL
+//   GEO_EXPECT_COUNTRY=TH  country a geo egress must exit from
+//   GEO_DOMAINS_DISABLE=1  turn geo routing off
+// ===========================================================================
+
+// geoDomainSet is an immutable list swapped in atomically. A lookup walks the
+// host's own labels (a.b.ome.tv → b.ome.tv → ome.tv) and hits the set, so a
+// 100k-entry list costs the same handful of map probes as a 3-entry one.
+type geoDomainSet struct {
+	list []string
+	set  map[string]struct{}
+}
+
+var (
+	geoDomains      atomic.Pointer[geoDomainSet]
+	geoDomainsMu    sync.Mutex // serialises refreshes, guards the fields below
+	geoDomainsFile  string
+	geoDomainsCache string
+	geoDomainsURL   string
+	geoDomainsSrc   string
+	geoDomainsAt    time.Time
+	geoDomainsLast  []string
+	geoRefreshEvery = 24 * time.Hour
+	geoReloadEvery  = 20 * time.Second
+	geoDomainsOff   bool
+	geoFileMod      time.Time
+)
+
+// normalizeGeoDomain turns whatever shape an operator's list happens to use
+// into a bare domain: `||ads.example^`, `*.example.com`, `example.com:8080`
+// and `example.com/path` all become `example.com`. Single-label entries are
+// rejected — `tv` as a suffix would match half the internet.
+func normalizeGeoDomain(d string) string {
+	d = strings.ToLower(strings.TrimSpace(d))
+	d = strings.TrimPrefix(d, "||")
+	d = strings.TrimPrefix(d, "*.")
+	d = strings.TrimSuffix(d, "^")
+	d = strings.Trim(d, ".")
+	if i := strings.IndexAny(d, "/:?@ "); i >= 0 {
+		d = d[:i]
+	}
+	d = strings.Trim(d, ".")
+	if d == "" || !strings.Contains(d, ".") {
+		return ""
+	}
+	return d
+}
+
+// parseGeoDomainList reads one domain per line and also accepts comma/space
+// separated entries, so a hosts-format or adblock-format file works as-is.
+func parseGeoDomainList(r io.Reader) []string {
+	var out []string
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := sc.Text()
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		for _, part := range strings.FieldsFunc(line, func(c rune) bool {
+			return c == ',' || c == ' ' || c == '\t' || c == ';' || c == '|'
+		}) {
+			if d := normalizeGeoDomain(part); d != "" {
+				out = append(out, d)
+			}
+		}
+	}
+	return out
+}
+
+func buildGeoDomainSet(list []string) *geoDomainSet {
+	set := make(map[string]struct{}, len(list))
+	uniq := make([]string, 0, len(list))
+	for _, d := range list {
+		d = normalizeGeoDomain(d)
+		if d == "" {
+			continue
+		}
+		if _, ok := set[d]; ok {
+			continue
+		}
+		set[d] = struct{}{}
+		uniq = append(uniq, d)
+	}
+	sort.Strings(uniq)
+	return &geoDomainSet{list: uniq, set: set}
+}
+
+func geoDomainCount() int {
+	if ds := geoDomains.Load(); ds != nil {
+		return len(ds.list)
+	}
+	return 0
+}
+
+func geoDomainList() []string {
+	if ds := geoDomains.Load(); ds != nil {
+		return ds.list
+	}
+	return nil
+}
+
+func loadGeoDomainsFile(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return parseGeoDomainList(f), nil
+}
+
+func loadGeoDomainsURL(u, cachePath string) ([]string, error) {
+	client := &http.Client{Timeout: 45 * time.Second}
+	resp, err := client.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s → HTTP %d", u, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	if cachePath != "" {
+		if werr := os.WriteFile(cachePath, body, 0o644); werr != nil {
+			log.Printf("%s[GEO]%s cannot cache the list to %s: %v", colorYellow, colorReset, cachePath, werr)
+		}
+	}
+	return parseGeoDomainList(bytes.NewReader(body)), nil
+}
+
+// refreshGeoDomains merges every configured source. A source that fails keeps
+// its previous contribution, so a network hiccup can never silently switch geo
+// routing off in the middle of the day.
+func refreshGeoDomains(reason string) {
+	geoDomainsMu.Lock()
+	defer geoDomainsMu.Unlock()
+
+	var merged, sources []string
+
+	if envList := parseGeoDomainList(strings.NewReader(os.Getenv("GEO_DOMAINS"))); len(envList) > 0 {
+		merged = append(merged, envList...)
+		sources = append(sources, fmt.Sprintf("env=%d", len(envList)))
+	}
+
+	if geoDomainsFile != "" {
+		list, err := loadGeoDomainsFile(geoDomainsFile)
+		switch {
+		case err == nil:
+			merged = append(merged, list...)
+			sources = append(sources, fmt.Sprintf("file=%d", len(list)))
+			if st, serr := os.Stat(geoDomainsFile); serr == nil {
+				geoFileMod = st.ModTime()
+			}
+		case !os.IsNotExist(err):
+			log.Printf("%s[GEO]%s cannot read %s: %v", colorYellow, colorReset, geoDomainsFile, err)
+		}
+	}
+
+	if geoDomainsURL != "" {
+		list, err := loadGeoDomainsURL(geoDomainsURL, geoDomainsCache)
+		if err != nil {
+			log.Printf("%s[GEO]%s list fetch failed (%s): %v — keeping the cached copy", colorYellow, colorReset, reason, err)
+			if cached, cerr := loadGeoDomainsFile(geoDomainsCache); cerr == nil {
+				list = cached
+				sources = append(sources, fmt.Sprintf("cache=%d", len(cached)))
+			}
+		} else {
+			sources = append(sources, fmt.Sprintf("url=%d", len(list)))
+		}
+		merged = append(merged, list...)
+	}
+
+	if len(merged) == 0 && len(geoDomainsLast) > 0 {
+		merged = geoDomainsLast
+		sources = append(sources, "previous")
+	}
+
+	if len(merged) == 0 {
+		geoDomains.Store(&geoDomainSet{set: map[string]struct{}{}})
+		log.Printf("%s[GEO]%s no domain list configured — geo routing idle (set GEO_DOMAINS, GEO_DOMAINS_FILE or GEO_DOMAINS_URL)", colorYellow, colorReset)
+		return
+	}
+
+	ds := buildGeoDomainSet(merged)
+	geoDomains.Store(ds)
+	geoDomainsLast = ds.list
+	geoDomainsAt = time.Now()
+	geoDomainsSrc = strings.Join(sources, ",")
+
+	if reason == "" {
+		log.Printf("%s[GEO]%s %d domain(s) from %s — egress expected in %s",
+			colorGreen, colorReset, len(ds.list), geoDomainsSrc, geoExpectCountry())
+	} else {
+		log.Printf("%s[GEO]%s %d domain(s) from %s (%s) — egress expected in %s",
+			colorGreen, colorReset, len(ds.list), geoDomainsSrc, reason, geoExpectCountry())
+	}
+}
+
+func geoDomainsStatus() string {
+	geoDomainsMu.Lock()
+	defer geoDomainsMu.Unlock()
+	if len(geoDomainsLast) == 0 {
+		return "idle (no list configured)"
+	}
+	return fmt.Sprintf("%d domains from %s, refreshed %s ago (every %v)",
+		len(geoDomainsLast), geoDomainsSrc, time.Since(geoDomainsAt).Round(time.Second), geoRefreshEvery)
+}
+
+// geoHopSocks5 is an optional dedicated egress for geo domains, so a Thai
+// tunnel can exist next to the shared (e.g. Japan) HOP_SOCKS5 without
+// disturbing how bilibili and friends are routed.
+var geoHopSocks5 string
+
+// geoSocks5 reports the egress geo traffic uses right now: the pool's current
+// node while the pool is up, otherwise the single GEO_SOCKS5 override, otherwise
+// the shared HOP_SOCKS5 (legacy behaviour).
+func geoSocks5() string {
+	if a := geoPoolCurrentAddr(); a != "" {
+		return a
+	}
+	if geoHopSocks5 != "" {
+		return geoHopSocks5
+	}
+	return hopSocks5
+}
+
+func geoExpectCountry() string {
+	if v := strings.TrimSpace(os.Getenv("GEO_EXPECT_COUNTRY")); v != "" {
+		return strings.ToUpper(v)
+	}
+	return "TH"
+}
+
+func initGeoDomains() {
+	if v := strings.TrimSpace(os.Getenv("GEO_DOMAINS_DISABLE")); v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "off") {
+		geoDomainsOff = true
+		log.Printf("%s[GEO]%s disabled by GEO_DOMAINS_DISABLE", colorYellow, colorReset)
+		return
+	}
+	geoDomains.Store(&geoDomainSet{set: map[string]struct{}{}})
+
+	geoDomainsFile = strings.TrimSpace(os.Getenv("GEO_DOMAINS_FILE"))
+	if geoDomainsFile == "" {
+		geoDomainsFile = "/opt/netninja/geo-domains.txt"
+	}
+	geoDomainsCache = strings.TrimSpace(os.Getenv("GEO_DOMAINS_CACHE"))
+	if geoDomainsCache == "" {
+		geoDomainsCache = geoDomainsFile + ".cache"
+	}
+	geoDomainsURL = strings.TrimSpace(os.Getenv("GEO_DOMAINS_URL"))
+	if h := strings.TrimSpace(os.Getenv("GEO_REFRESH_HOURS")); h != "" {
+		if n, err := strconv.Atoi(h); err == nil && n > 0 {
+			geoRefreshEvery = time.Duration(n) * time.Hour
+		}
+	}
+	geoHopSocks5 = strings.TrimSpace(os.Getenv("GEO_SOCKS5"))
+	refreshGeoDomains("")
+}
+
+// startGeoDomainRefresher keeps a remote list fresh and picks up edits to a
+// local list, so the domain set never needs a rebuild or a restart.
+func startGeoDomainRefresher() {
+	if geoDomainsOff {
+		return
+	}
+	if geoDomainsURL != "" {
+		go func() {
+			for {
+				time.Sleep(geoRefreshEvery)
+				refreshGeoDomains("scheduled refresh")
+			}
+		}()
+	}
+	if geoDomainsFile != "" {
+		go func() {
+			for {
+				time.Sleep(geoReloadEvery)
+				st, err := os.Stat(geoDomainsFile)
+				if err != nil {
+					continue
+				}
+				geoDomainsMu.Lock()
+				changed := !st.ModTime().Equal(geoFileMod)
+				geoDomainsMu.Unlock()
+				if changed {
+					log.Printf("%s[GEO]%s %s changed on disk — reloading the domain list", colorCyan, colorReset, geoDomainsFile)
+					refreshGeoDomains("file changed")
+				}
+			}
+		}()
+	}
+}
+
+func inGeoDomains(host string) bool {
+	if geoDomainsOff {
+		return false
+	}
+	ds := geoDomains.Load()
+	if ds == nil || len(ds.set) == 0 {
+		return false
+	}
+	h := normalizeAdHost(host)
+	for h != "" {
+		if _, ok := ds.set[h]; ok {
+			return true
+		}
+		i := strings.IndexByte(h, '.')
+		if i < 0 {
+			return false
+		}
+		h = h[i+1:]
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Thai egress pool
+//
+// Geo-sensitive traffic has to leave from Thailand, but one tunnel dies or gets
+// slow without warning — and a VPN client that rotates on failure will happily
+// pick a node in another country, which silently changes who the site matches.
+// The pool keeps several Thai egresses (one SOCKS5 listener each, provisioned on
+// this server) and:
+//
+//   * probes each node every GEO_POOL_PROBE (TCP connect RTT)
+//   * verifies the country each node really exits from, and refuses to use a
+//     node that exits elsewhere
+//   * sticks to the fastest healthy Thai node, rotating the moment the current
+//     one dies or stays slower than GEO_POOL_MAX_RTT
+//   * fails over inside a single dial, so a dead node costs one round trip
+//   * asks GEO_ROTATE_CMD to rebuild tunnels when no Thai node is healthy
+//
+//   GEO_SOCKS5_POOL=...       host:port entries, comma separated
+//   GEO_SOCKS5=...            single entry (still honoured, joins the pool)
+//   GEO_SOCKS5_POOL_FILE=...  one entry per line, hot reloaded
+//                             (default /opt/netninja/geo-nodes.txt)
+//   GEO_POOL_PROBE=20s        liveness/latency probe interval
+//   GEO_POOL_TIMEOUT=1500ms   TCP probe timeout
+//   GEO_POOL_MAX_RTT=1500ms   slower than this counts as slow
+//   GEO_POOL_SLOW_STRIKES=3   consecutive slow dials before rotating away
+//   GEO_POOL_FAIL_STRIKES=2   consecutive failures before marking a node down
+//   GEO_POOL_GEOCHECK=5m      how often each node's country is verified
+//   GEO_POOL_ATTEMPTS=3       nodes tried inside one dial
+//   GEO_POOL_PENALTY=45s      how long a failed node is left out
+//   GEO_STRICT=1              fail rather than leak this server's country
+// ---------------------------------------------------------------------------
+
+type geoNode struct {
+	addr string
+
+	mu        sync.Mutex
+	up        bool
+	country   string
+	countryAt time.Time
+	ewma      time.Duration
+	fails     int
+	slows     int
+	lastErr   string
+	downUntil time.Time
+	probes    int64
+}
+
+func newGeoNode(addr string) *geoNode {
+	return &geoNode{addr: addr, up: true}
+}
+
+// healthyLocked is the one place that decides whether a node may carry geo
+// traffic right now: it has to be up, out of its failure penalty, and — once a
+// country has been verified — actually exit in the expected country.
+func (n *geoNode) healthyLocked(want string) bool {
+	if !n.up || time.Now().Before(n.downUntil) {
+		return false
+	}
+	if want != "" && n.country != "" && !strings.EqualFold(n.country, want) {
+		return false
+	}
+	if geoPoolMaxRTT > 0 && n.ewma > geoPoolMaxRTT && n.slows >= geoPoolSlowHits {
+		return false
+	}
+	return true
+}
+
+func (n *geoNode) healthy(want string) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.healthyLocked(want)
+}
+
+func (n *geoNode) score() time.Duration {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.ewma > 0 {
+		return n.ewma
+	}
+	return time.Hour // never dialled yet: usable, but only if nothing better exists
+}
+
+func (n *geoNode) snapshot() (up bool, country string, ewma time.Duration, fails, slows int, lerr string, probes int64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.up, n.country, n.ewma, n.fails, n.slows, n.lastErr, n.probes
+}
+
+var (
+	geoPoolMu         sync.RWMutex
+	geoPool           []*geoNode
+	geoPoolCur        *geoNode
+	geoPoolFile       string
+	geoPoolFileMod    time.Time
+	geoPoolProbeEvery = 20 * time.Second
+	geoPoolTimeout    = 1500 * time.Millisecond
+	geoPoolMaxRTT     = 1500 * time.Millisecond
+	geoPoolSlowHits   = 3
+	geoPoolFailHits   = 2
+	geoPoolGeoEvery   = 5 * time.Minute
+	geoPoolAttempts   = 3
+	geoPoolPenalty    = 45 * time.Second
+	geoPoolStrict     = true
+	geoPoolOn         bool
+	geoPoolRotations  int64
+)
+
+func geoPoolSize() int {
+	geoPoolMu.RLock()
+	defer geoPoolMu.RUnlock()
+	return len(geoPool)
+}
+
+func geoPoolSnapshot() []*geoNode {
+	geoPoolMu.RLock()
+	defer geoPoolMu.RUnlock()
+	out := make([]*geoNode, len(geoPool))
+	copy(out, geoPool)
+	return out
+}
+
+func geoPoolCurrentAddr() string {
+	geoPoolMu.RLock()
+	defer geoPoolMu.RUnlock()
+	if geoPoolCur != nil {
+		return geoPoolCur.addr
+	}
+	return ""
+}
+
+func containsGeoNode(nodes []*geoNode, n *geoNode) bool {
+	for _, x := range nodes {
+		if x == n {
+			return true
+		}
+	}
+	return false
+}
+
+// parseGeoNodeAddrs reads the candidate egresses from env and from the pool
+// file, so a server script can bring a tunnel up and have it join the pool.
+func parseGeoNodeAddrs() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		s = strings.TrimSpace(strings.Trim(s, "\"'"))
+		if s == "" || seen[s] || !strings.Contains(s, ":") {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, s := range strings.Split(os.Getenv("GEO_SOCKS5_POOL"), ",") {
+		add(s)
+	}
+	for _, s := range strings.Split(os.Getenv("GEO_SOCKS5"), ",") {
+		add(s)
+	}
+	if raw, err := os.ReadFile(geoPoolFile); err == nil {
+		sc := bufio.NewScanner(bytes.NewReader(raw))
+		for sc.Scan() {
+			line := sc.Text()
+			if i := strings.IndexByte(line, '#'); i >= 0 {
+				line = line[:i]
+			}
+			for _, f := range strings.FieldsFunc(line, func(c rune) bool { return c == ',' || c == ' ' || c == '\t' }) {
+				add(f)
+			}
+		}
+		if st, serr := os.Stat(geoPoolFile); serr == nil {
+			geoPoolFileMod = st.ModTime()
+		}
+	}
+	return out
+}
+
+// syncGeoPool merges the configured endpoints into the live pool, keeping the
+// existing node objects (and their health history) for endpoints that stay.
+func syncGeoPool(addrs []string, reason string) {
+	geoPoolMu.Lock()
+	defer geoPoolMu.Unlock()
+	have := make(map[string]*geoNode, len(geoPool))
+	for _, n := range geoPool {
+		have[n.addr] = n
+	}
+	next := make([]*geoNode, 0, len(addrs))
+	for _, a := range addrs {
+		if n, ok := have[a]; ok {
+			next = append(next, n)
+			delete(have, a)
+			continue
+		}
+		next = append(next, newGeoNode(a))
+		log.Printf("%s[GEO][pool]%s added node %s (%s)", colorGreen, colorReset, a, reason)
+	}
+	for a := range have {
+		log.Printf("%s[GEO][pool]%s removed node %s (%s)", colorYellow, colorReset, a, reason)
+	}
+	geoPool = next
+	if geoPoolCur != nil && !containsGeoNode(next, geoPoolCur) {
+		geoPoolCur = nil
+	}
+}
+
+// pickGeoNode returns the node to use: the sticky current one while it stays
+// healthy, otherwise the fastest healthy Thai node. exclude lets one dial walk
+// past the nodes it already failed on.
+func pickGeoNode(exclude map[string]bool) *geoNode {
+	want := geoExpectCountry()
+	geoPoolMu.RLock()
+	nodes, cur := geoPool, geoPoolCur
+	geoPoolMu.RUnlock()
+
+	if cur != nil && !exclude[cur.addr] && cur.healthy(want) {
+		return cur
+	}
+	var best *geoNode
+	var bestScore time.Duration
+	for _, n := range nodes {
+		if exclude[n.addr] || !n.healthy(want) {
+			continue
+		}
+		if s := n.score(); best == nil || s < bestScore {
+			best, bestScore = n, s
+		}
+	}
+	if best != nil {
+		setGeoPoolCurrent(best, "fastest healthy Thai node")
+	}
+	return best
+}
+
+func setGeoPoolCurrent(n *geoNode, reason string) {
+	geoPoolMu.Lock()
+	prev := geoPoolCur
+	geoPoolCur = n
+	geoPoolMu.Unlock()
+	if prev == n || n == nil {
+		return
+	}
+	atomic.AddInt64(&geoPoolRotations, 1)
+	up, cc, ewma, _, slows, lerr, _ := n.snapshot()
+	from := "-"
+	if prev != nil {
+		from = prev.addr
+	}
+	log.Printf("%s[GEO][pool]%s now egressing via %s (was %s) — %s | country=%s rtt=%v up=%v slow=%d %s",
+		colorGreen, colorReset, n.addr, from, reason, geoCountryOrDash(cc), ewma.Round(time.Millisecond), up, slows, lerr)
+}
+
+func geoCountryOrDash(s string) string {
+	if s == "" {
+		return "unverified"
+	}
+	return s
+}
+
+// geoPoolDropCurrent steps the sticky pointer off a node so the next dial
+// re-elects the fastest healthy Thai node.
+func geoPoolDropCurrent(n *geoNode, reason string) {
+	geoPoolMu.Lock()
+	if geoPoolCur == n {
+		geoPoolCur = nil
+		log.Printf("%s[GEO][pool]%s leaving %s (%s)", colorYellow, colorReset, n.addr, reason)
+	}
+	geoPoolMu.Unlock()
+}
+
+// geoMarkResult feeds a real dial outcome back into the pool's health state, so
+// the rotation decision is driven by the traffic the user actually generated.
+func geoMarkResult(n *geoNode, err error, rtt time.Duration) {
+	if n == nil {
+		return
+	}
+	now := time.Now()
+
+	n.mu.Lock()
+	n.probes++
+	if err != nil {
+		n.fails++
+		n.slows = 0
+		n.lastErr = err.Error()
+		down := n.up && n.fails >= geoPoolFailHits
+		if down {
+			n.up = false
+			n.downUntil = now.Add(geoPoolPenalty)
+		}
+		errText := n.lastErr
+		n.mu.Unlock()
+		if down {
+			log.Printf("%s[GEO][pool]%s %s marked down for %v after %d failure(s): %s",
+				colorYellow, colorReset, n.addr, geoPoolPenalty, geoPoolFailHits, errText)
+			geoPoolDropCurrent(n, "node failed")
+		}
+		return
+	}
+	if !n.up {
+		log.Printf("%s[GEO][pool]%s %s is answering again", colorGreen, colorReset, n.addr)
+	}
+	n.up = true
+	n.fails = 0
+	n.lastErr = ""
+	n.downUntil = time.Time{}
+	if n.ewma == 0 {
+		n.ewma = rtt
+	} else {
+		n.ewma = (n.ewma*7 + rtt*3) / 10
+	}
+	if geoPoolMaxRTT > 0 && rtt > geoPoolMaxRTT {
+		n.slows++
+	} else {
+		n.slows = 0
+	}
+	slows := n.slows
+	slowNow := slows >= geoPoolSlowHits
+	n.mu.Unlock()
+
+	if slowNow {
+		log.Printf("%s[GEO][pool]%s %s stayed slower than %v for %d dial(s) — rotating away",
+			colorYellow, colorReset, n.addr, geoPoolMaxRTT, slows)
+		geoPoolDropCurrent(n, "node too slow")
+	}
+}
+
+func geoProbeNode(n *geoNode) {
+	d := &net.Dialer{Timeout: geoPoolTimeout}
+	start := time.Now()
+	c, err := d.Dial("tcp", n.addr)
+	rtt := time.Since(start)
+	if err == nil {
+		c.Close()
+	}
+	geoMarkResult(n, err, rtt)
+}
+
+// geoVerifyNode proves the node's SOCKS5 listener works *and* which country it
+// really exits from, which is the one thing a plain TCP probe cannot tell.
+func geoVerifyNode(n *geoNode) {
+	info, cc := geoLookup(func(ctx context.Context) (net.Conn, error) {
+		return dialSocks5(ctx, n.addr, "ip-api.com:80")
+	})
+	n.mu.Lock()
+	n.countryAt = time.Now()
+	prev := n.country
+	if cc != "" {
+		n.country = cc
+	}
+	n.mu.Unlock()
+
+	if cc == "" {
+		log.Printf("%s[GEO][pool][warn]%s %s country check failed: %s", colorYellow, colorReset, n.addr, info)
+		geoMarkResult(n, fmt.Errorf("country check: %s", info), 0)
+		return
+	}
+	if prev != cc {
+		log.Printf("%s[GEO][pool]%s %s exits %s — %s", colorGreen, colorReset, n.addr, cc, info)
+	}
+	if !strings.EqualFold(cc, geoExpectCountry()) {
+		log.Printf("%s[GEO][pool][warn]%s %s exits %s but %s is required — node left unused",
+			colorYellow, colorReset, n.addr, cc, geoExpectCountry())
+		geoPoolDropCurrent(n, "wrong country")
+	}
+}
+
+func geoPoolHousekeeping() {
+	want := geoExpectCountry()
+	healthy := 0
+	for _, n := range geoPoolSnapshot() {
+		if n.healthy(want) {
+			healthy++
+		}
+	}
+	if healthy > 0 {
+		pickGeoNode(nil)
+		return
+	}
+	geoGuardRotate(time.Now(), fmt.Sprintf("no healthy %s egress in the pool (%d node(s) configured)", want, geoPoolSize()))
+}
+
+func geoPoolLoop() {
+	ticker := time.NewTicker(geoPoolProbeEvery)
+	defer ticker.Stop()
+	nextCountry := time.Now().Add(20 * time.Second)
+	for range ticker.C {
+		// Nodes appear and disappear on the server while we run: pick them up.
+		if addrs := parseGeoNodeAddrs(); len(addrs) > 0 {
+			syncGeoPool(addrs, "poll")
+		}
+		for _, n := range geoPoolSnapshot() {
+			geoProbeNode(n)
+		}
+		if time.Now().After(nextCountry) {
+			for _, n := range geoPoolSnapshot() {
+				geoVerifyNode(n)
+			}
+			nextCountry = time.Now().Add(geoPoolGeoEvery)
+		}
+		geoPoolHousekeeping()
+	}
+}
+
+func geoPoolDurationEnv(key string, def time.Duration) time.Duration {
+	return geoGuardEnvDur(key, def)
+}
+
+func geoPoolIntEnv(key string, def int) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key))); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+func startGeoPool() {
+	geoPoolFile = strings.TrimSpace(os.Getenv("GEO_SOCKS5_POOL_FILE"))
+	if geoPoolFile == "" {
+		geoPoolFile = "/opt/netninja/geo-nodes.txt"
+	}
+	geoPoolProbeEvery = geoPoolDurationEnv("GEO_POOL_PROBE", geoPoolProbeEvery)
+	geoPoolTimeout = geoPoolDurationEnv("GEO_POOL_TIMEOUT", geoPoolTimeout)
+	geoPoolMaxRTT = geoPoolDurationEnv("GEO_POOL_MAX_RTT", geoPoolMaxRTT)
+	geoPoolGeoEvery = geoPoolDurationEnv("GEO_POOL_GEOCHECK", geoPoolGeoEvery)
+	geoPoolPenalty = geoPoolDurationEnv("GEO_POOL_PENALTY", geoPoolPenalty)
+	geoPoolSlowHits = geoPoolIntEnv("GEO_POOL_SLOW_STRIKES", geoPoolSlowHits)
+	geoPoolFailHits = geoPoolIntEnv("GEO_POOL_FAIL_STRIKES", geoPoolFailHits)
+	geoPoolAttempts = geoPoolIntEnv("GEO_POOL_ATTEMPTS", geoPoolAttempts)
+	if v := strings.TrimSpace(os.Getenv("GEO_STRICT")); v != "" {
+		geoPoolStrict = !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "off"))
+	}
+
+	addrs := parseGeoNodeAddrs()
+	if len(addrs) == 0 {
+		log.Printf("%s[GEO]%s no egress pool configured (GEO_SOCKS5_POOL / GEO_SOCKS5 / %s) — geo traffic falls back to HOP_SOCKS5 when set",
+			colorYellow, colorReset, geoPoolFile)
+		go logGeoEgressCountry()
+		return
+	}
+	syncGeoPool(addrs, "startup")
+	geoPoolOn = true
+	log.Printf("%s[GEO][pool]%s %d Thai egress node(s): %s — probe %v, max rtt %v, attempts %d, strict=%v",
+		colorGreen, colorReset, len(addrs), strings.Join(addrs, ","), geoPoolProbeEvery, geoPoolMaxRTT, geoPoolAttempts, geoPoolStrict)
+	go geoPoolLoop()
+	go logGeoEgressCountry()
+}
+
+// dialGeoThai dials address through the Thai pool, failing over node by node so
+// a node that died a second ago costs this dial one round trip, not a timeout.
+func dialGeoThai(ctx context.Context, address, why string) (net.Conn, error) {
+	// No pool configured: keep the previous single-egress behaviour.
+	if !geoPoolOn {
+		server := geoSocks5()
+		if server == "" {
+			return nil, fmt.Errorf("no geo egress configured for %s", why)
+		}
+		return dialSocks5(ctx, server, address)
+	}
+	exclude := make(map[string]bool, geoPoolAttempts)
+	var lastErr error
+	for i := 0; i < geoPoolAttempts; i++ {
+		n := pickGeoNode(exclude)
+		if n == nil {
+			break
+		}
+		exclude[n.addr] = true
+		start := time.Now()
+		c, err := dialSocks5(ctx, n.addr, address)
+		rtt := time.Since(start)
+		geoMarkResult(n, err, rtt)
+		if err == nil {
+			if geoPoolMaxRTT > 0 && rtt > geoPoolMaxRTT {
+				log.Printf("%s[GEO][pool]%s %s via %s took %v (slow)", colorYellow, colorReset, why, n.addr, rtt.Round(time.Millisecond))
+			}
+			return c, nil
+		}
+		lastErr = err
+		log.Printf("%s[GEO][pool]%s %s via %s failed (%v) — trying the next Thai node", colorYellow, colorReset, why, n.addr, err)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no healthy %s egress available (%d node(s) configured)", geoExpectCountry(), geoPoolSize())
+	}
+	return nil, lastErr
+}
+
+func geoPoolStatusLines() []string {
+	want := geoExpectCountry()
+	cur := geoPoolCurrentAddr()
+	var out []string
+	for _, n := range geoPoolSnapshot() {
+		up, cc, ewma, fails, slows, lerr, probes := n.snapshot()
+		state := "ok"
+		switch {
+		case cur == n.addr:
+			state = "CURRENT"
+		case !n.healthy(want):
+			state = "unusable"
+		}
+		line := fmt.Sprintf("  %-22s %-9s country=%-10s rtt=%-9v fails=%d slow=%d probes=%d",
+			n.addr, state, geoCountryOrDash(cc), ewma.Round(time.Millisecond), fails, slows, probes)
+		if lerr != "" {
+			line += "  last_err=" + lerr
+		}
+		if !up {
+			line += "  (down)"
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+var geoLogOnce sync.Map
+
+// ---------------------------------------------------------------------------
+// Geo sessions — keep a whole browsing session Thai, not just one domain
+//
+// A geo-sensitive page pulls in dozens of third-party hosts (ad slots, captcha,
+// analytics) that no fixed list can enumerate — and the ad slot is exactly where
+// the country shows, because ad networks geo-target by the IP they see. So once
+// a client touches a geo domain, that client is marked and, for GEO_SESSION_TTL,
+// everything it loads that is not excluded follows the same Thai egress. Which
+// hosts are ads comes from the real blocklist the proxy already refreshes
+// (ADBLOCK_URL / ADBLOCK_PATH) — never from a hardcoded list.
+//
+//   GEO_SESSION=all|ads|off   what follows the session (default all)
+//   GEO_SESSION_TTL=15m       how long a client stays marked
+//   GEO_ADS_EGRESS=0|1        route ad hosts Thai for every client, session or
+//                             not (default 0 = only inside a geo session)
+//   GEO_SESSION_EXCLUDE=...   extra hosts kept on the direct path (speed)
+// ---------------------------------------------------------------------------
+
+type geoCtxKey struct{}
+
+var (
+	geoSessionMu   sync.Mutex
+	geoSessionMap  = map[string]time.Time{}
+	geoSessionTTL  = 15 * time.Minute
+	geoSessionMode = "all"
+	geoAdsGlobal   bool
+	geoSessionExcl []string
+	geoSessionLive int64 // atomic: marked sessions right now, for a cheap fast path
+)
+
+func initGeoSession() {
+	if v := strings.TrimSpace(os.Getenv("GEO_SESSION")); v != "" {
+		geoSessionMode = strings.ToLower(v)
+	}
+	switch geoSessionMode {
+	case "off", "ads", "all":
+	default:
+		log.Printf("%s[GEO]%s GEO_SESSION=%q is not off|ads|all — using all", colorYellow, colorReset, geoSessionMode)
+		geoSessionMode = "all"
+	}
+	geoSessionTTL = geoGuardEnvDur("GEO_SESSION_TTL", geoSessionTTL)
+	if v := strings.TrimSpace(os.Getenv("GEO_ADS_EGRESS")); v != "" {
+		geoAdsGlobal = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "on")
+	}
+	for _, d := range strings.Split(os.Getenv("GEO_SESSION_EXCLUDE"), ",") {
+		if d = normalizeGeoDomain(d); d != "" {
+			geoSessionExcl = append(geoSessionExcl, d)
+		}
+	}
+	if geoSessionMode == "off" {
+		log.Printf("%s[GEO]%s sessions disabled (GEO_SESSION=off) — only the listed domains egress Thai", colorYellow, colorReset)
+		return
+	}
+	log.Printf("%s[GEO]%s geo session mode=%s ttl=%v ads_global=%v exclude=%d host(s) — a client that opens a geo site keeps egressing %s for %v",
+		colorGreen, colorReset, geoSessionMode, geoSessionTTL, geoAdsGlobal, len(geoSessionExcl), geoExpectCountry(), geoSessionTTL)
+}
+
+func ctxWithGeoKey(ctx context.Context, key string) context.Context {
+	if key == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, geoCtxKey{}, key)
+}
+
+func geoKeyFromCtx(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if k, ok := ctx.Value(geoCtxKey{}).(string); ok {
+		return k
+	}
+	return ""
+}
+
+func noteGeoSession(key string) {
+	if key == "" || geoDomainsOff || geoSessionTTL <= 0 || geoSessionMode == "off" {
+		return
+	}
+	geoSessionMu.Lock()
+	if _, ok := geoSessionMap[key]; !ok {
+		atomic.AddInt64(&geoSessionLive, 1)
+	}
+	geoSessionMap[key] = time.Now()
+	geoSessionMu.Unlock()
+}
+
+func geoSessionFresh(key string) bool {
+	if key == "" || geoSessionTTL <= 0 || atomic.LoadInt64(&geoSessionLive) == 0 {
+		return false
+	}
+	geoSessionMu.Lock()
+	t, ok := geoSessionMap[key]
+	geoSessionMu.Unlock()
+	return ok && time.Since(t) < geoSessionTTL
+}
+
+func startGeoSessionSweeper() {
+	go func() {
+		for {
+			time.Sleep(time.Minute)
+			cut := time.Now().Add(-geoSessionTTL)
+			geoSessionMu.Lock()
+			for k, t := range geoSessionMap {
+				if t.Before(cut) {
+					delete(geoSessionMap, k)
+				}
+			}
+			atomic.StoreInt64(&geoSessionLive, int64(len(geoSessionMap)))
+			geoSessionMu.Unlock()
+		}
+	}()
+}
+
+// geoDirectIP reports whether an already-resolved address is this server
+// itself, so keepalive and dashboard traffic is never pushed through the VPN.
+func geoDirectIP(ip string) bool {
+	ip = strings.Trim(ip, "[]")
+	if ip == "" {
+		return false
+	}
+	if isLocalIP(ip) {
+		return true
+	}
+	if pa := strings.TrimSpace(os.Getenv("PROXY_ADDR")); pa != "" {
+		h := pa
+		if hh, _, err := net.SplitHostPort(pa); err == nil {
+			h = hh
+		}
+		if strings.EqualFold(h, ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// pacDirectDomains is the single source of truth for "go direct" on both sides:
+// the PAC file hands these straight to the client, and the session router keeps
+// them direct if they arrive anyway (manual-proxy mode). Built once, because the
+// dial path asks on every connection.
+func pacDirectDomains() []string {
+	pacDirectOnce.Do(func() {
+		direct := []string{
+			"googlevideo.com", "apple.com", "icloud.com",
+			"apple-cloudkit.com", "mzstatic.com", "itunes.com",
+			"ookla.com", "speedtest.net", "ooklaserver.net",
+		}
+		for _, d := range strings.Split(os.Getenv("PAC_DIRECT_DOMAINS"), ",") {
+			if d = normalizeGeoDomain(d); d != "" {
+				direct = append(direct, d)
+			}
+		}
+		pacDirectList = direct
+	})
+	return pacDirectList
+}
+
+var (
+	pacDirectOnce sync.Once
+	pacDirectList []string
+)
+
+// geoTargetExcluded keeps the hosts whose speed matters more than their country
+// on the direct path: this server itself, video/CDN traffic, and the same set the
+// PAC file already sends DIRECT.
+func geoTargetExcluded(host, address string) bool {
+	if ip, _, err := net.SplitHostPort(address); err == nil && geoDirectIP(ip) {
+		return true
+	}
+	h := normalizeAdHost(host)
+	if h == "" {
+		return false
+	}
+	if h == "localhost" || strings.HasSuffix(h, ".local") {
+		return true
+	}
+	if isVideoDomain(h) {
+		return true
+	}
+	for _, d := range pacDirectDomains() {
+		if h == d || strings.HasSuffix(h, "."+d) {
+			return true
+		}
+	}
+	for _, d := range geoSessionExcl {
+		if h == d || strings.HasSuffix(h, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
+// geoEgressFor decides, for one host, whether it has to leave from Thailand and
+// why ("geo", "ad", "session"). It runs on the dial path, so it stays cheap:
+// one atomic pointer load, and the ad-list check only for clients that are
+// actually inside a geo session.
+func geoEgressFor(ctx context.Context, host, address string) (bool, string) {
+	if inGeoDomains(host) {
+		return true, "geo"
+	}
+	if geoTargetExcluded(host, address) {
+		return false, ""
+	}
+	key := geoKeyFromCtx(ctx)
+	inSession := geoSessionMode != "off" && geoSessionFresh(key)
+	if (geoAdsGlobal || inSession) && isAdBlockedHost(host) {
+		return true, "ad"
+	}
+	if inSession && geoSessionMode == "all" {
+		return true, "session"
+	}
+	return false, ""
+}
+
+// geoHandlesAd reports whether an ad/tracking host is carried by the Thai egress
+// instead of being refused, so the block sites can let it through.
+func geoHandlesAd(ctx context.Context, host string) bool {
+	via, _ := geoEgressFor(ctx, host, "")
+	return via
+}
+
+var geoEgressLogged sync.Map
+
+func logGeoEgressOnce(host, why string) {
+	key := why + "|" + host
+	if _, loaded := geoEgressLogged.LoadOrStore(key, true); loaded {
+		return
+	}
+	switch why {
+	case "ad":
+		log.Printf("%s[GEO][ads]%s %s leaves via the Thai pool — its ad slot sees a Thai visitor", colorGreen, colorReset, host)
+	default:
+		log.Printf("%s[GEO][session]%s %s follows the Thai egress while the session is open", colorGreen, colorReset, host)
+	}
+}
+
+func logGeoOnce(host string, viaHop bool) {
+	if _, loaded := geoLogOnce.LoadOrStore(host, true); loaded {
+		return
+	}
+	if viaHop {
+		log.Printf("%s[GEO]%s %s egresses through the hop (destination sees the hop's IP)", colorGreen, colorReset, host)
+	} else {
+		log.Printf("%s[GEO][warn]%s %s has no working hop — destination sees this server's country", colorYellow, colorReset, host)
+	}
+}
+
+// geoLookupCountry asks ip-api.com (plain HTTP, no key) which country a dialer
+// egresses from. This is what proves the hop really is in Thailand.
+func geoLookupCountry(dial func(ctx context.Context) (net.Conn, error)) string {
+	info, _ := geoLookup(dial)
+	return info
+}
+
+// geoLookup returns both the human readable egress info and the country code
+// ("TH", "JP", …). cc is empty when the lookup failed.
+func geoLookup(dial func(ctx context.Context) (net.Conn, error)) (info string, cc string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := dial(ctx)
+	if err != nil {
+		return "error: " + err.Error(), ""
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(8 * time.Second))
+	req := "GET /json/?fields=query,country,countryCode,city,isp HTTP/1.0\r\nHost: ip-api.com\r\nUser-Agent: netninja-geo\r\nConnection: close\r\n\r\n"
+	if _, err := c.Write([]byte(req)); err != nil {
+		return "error: " + err.Error(), ""
+	}
+	body, _ := io.ReadAll(io.LimitReader(c, 8192))
+	s := string(body)
+	if i := strings.Index(s, "\r\n\r\n"); i >= 0 {
+		s = s[i+4:]
+	} else if i := strings.Index(s, "\n\n"); i >= 0 {
+		s = s[i+2:]
+	}
+	s = strings.TrimSpace(s)
+	var out struct {
+		Query       string `json:"query"`
+		Country     string `json:"country"`
+		CountryCode string `json:"countryCode"`
+		City        string `json:"city"`
+		ISP         string `json:"isp"`
+	}
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return "unparsable: " + s, ""
+	}
+	return fmt.Sprintf("%s (%s, %s, %s)", out.Query, out.CountryCode, out.City, out.ISP), strings.ToUpper(out.CountryCode)
+}
+
+func logGeoEgressCountry() {
+	direct := geoLookupCountry(func(ctx context.Context) (net.Conn, error) {
+		return customDialer.DialContext(ctx, "tcp", "ip-api.com:80")
+	})
+	server := geoSocks5()
+	via := "(no geo egress configured)"
+	if server != "" {
+		via = geoLookupCountry(func(ctx context.Context) (net.Conn, error) {
+			return dialSocks5(ctx, server, "ip-api.com:80")
+		})
+	}
+	want := geoExpectCountry()
+	status := "OK"
+	switch {
+	case server == "":
+		status = "NO EGRESS — set GEO_SOCKS5_POOL (or GEO_SOCKS5)"
+	case strings.HasPrefix(via, "error"):
+		status = "EGRESS UNREACHABLE — geo dials fail instead of exiting the wrong country"
+	case !strings.Contains(via, "("+want+","):
+		status = "WRONG COUNTRY — the pool will stop using this node"
+	}
+	log.Printf("%s[GEO]%s egress check — direct: %s | geo(%s): %s (expect %s → %s)", colorGreen, colorReset, direct, server, via, want, status)
+}
+
+// serveGeoCheck renders the geo routing state plus the real egress IP/country
+// for both paths — the quickest way to prove what OmeTV will see.
+func serveGeoCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	fmt.Fprintf(w, "netninja geo-check (build %s)\n\n", buildTime)
+	fmt.Fprintf(w, "expect country : %s\n", geoExpectCountry())
+	fmt.Fprintf(w, "strict         : %v (fail instead of exiting this server's country)\n", geoPoolStrict)
+	fmt.Fprintf(w, "domain list    : %s\n", geoDomainsStatus())
+	fmt.Fprintf(w, "session mode   : %s (ttl %v, ads egress for every client: %v, %d marked now)\n",
+		geoSessionMode, geoSessionTTL, geoAdsGlobal, atomic.LoadInt64(&geoSessionLive))
+	fmt.Fprintf(w, "hop socks5     : %q (non-geo hop domains)\n", hopSocks5)
+	fmt.Fprintf(w, "hop domains    : %d configured, %d auto-detected\n", len(hopDomains), len(hopAuto))
+	fmt.Fprintf(w, "geo domains(%d): %s\n\n", geoDomainCount(), strings.Join(geoDomainList(), ", "))
+
+	if nodes := geoPoolStatusLines(); len(nodes) > 0 {
+		fmt.Fprintf(w, "egress pool (%d node(s), current %s):\n%s\n\n", len(nodes), geoPoolCurrentAddr(), strings.Join(nodes, "\n"))
+	} else {
+		fmt.Fprintf(w, "egress pool    : none configured (set GEO_SOCKS5_POOL)\n\n")
+	}
+
+	fmt.Fprintf(w, "direct egress  : %s\n", geoLookupCountry(func(ctx context.Context) (net.Conn, error) {
+		return customDialer.DialContext(ctx, "tcp", "ip-api.com:80")
+	}))
+	if server := geoSocks5(); server == "" {
+		fmt.Fprintf(w, "geo egress     : n/a (GEO_SOCKS5_POOL / GEO_SOCKS5 / HOP_SOCKS5 not set)\n")
+	} else {
+		fmt.Fprintf(w, "geo egress     : %s via %s\n", geoLookupCountry(func(ctx context.Context) (net.Conn, error) {
+			return dialSocks5(ctx, server, "ip-api.com:80")
+		}), server)
+	}
+	fmt.Fprintf(w, "\nguard          : %s\n", geoGuardStatus())
+	fmt.Fprintf(w, "\nGeo-listed domains — and everything a geo session loads — egress Thai; the rest goes direct.\n")
+}
+
+// ===========================================================================
+// Geo country guard
+//
+// A shared hop can silently start exiting in another country (VPNGate rotates
+// to whatever node is alive when the Thai one dies). That stays invisible until
+// OmeTV starts matching the wrong peers again, so the guard re-checks the hop's
+// country every GEO_GUARD_INTERVAL and rotates the egress when it drifts.
+//
+//   GEO_GUARD=0                turn the guard off (default: on)
+//   GEO_ROTATE_CMD=...         rotate command, default:
+//                              /bin/bash /opt/vpngate/vpngate-rotate.sh --force
+//   GEO_GUARD_INTERVAL=5m      how often the hop's country is checked
+//   GEO_GUARD_FIRST_DELAY=45s  wait before the first check (let boot settle)
+//   GEO_GUARD_COOLDOWN=3m      minimum gap between rotations
+//   GEO_GUARD_MAX_PER_HOUR=6   back off 30m after this many rotations
+// ===========================================================================
+
+var (
+	geoGuardOn        bool
+	geoRotateCmd      []string
+	geoGuardInterval  = 5 * time.Minute
+	geoGuardFirstWait = 45 * time.Second
+	geoGuardCooldown  = 3 * time.Minute
+	geoGuardMaxPerHr  = 6
+
+	geoGuardMu        sync.Mutex
+	geoGuardBusy      int32
+	geoGuardLastCheck time.Time
+	geoGuardLastCC    string
+	geoGuardBadStreak int
+	geoGuardRotations []time.Time
+	geoGuardBackoff   time.Time
+)
+
+func geoGuardEnvDur(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return def
+}
+
+func initGeoGuard() {
+	if geoDomainsOff || geoDomainCount() == 0 {
+		return
+	}
+	if !geoPoolOn && geoSocks5() == "" {
+		log.Printf("%s[GEO][guard]%s no egress configured — guard idle until GEO_SOCKS5_POOL/GEO_SOCKS5 is set", colorYellow, colorReset)
+		return
+	}
+	if v := strings.TrimSpace(os.Getenv("GEO_GUARD")); v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "off") {
+		log.Printf("%s[GEO][guard]%s disabled by GEO_GUARD=%s", colorYellow, colorReset, v)
+		return
+	}
+	geoGuardInterval = geoGuardEnvDur("GEO_GUARD_INTERVAL", geoGuardInterval)
+	geoGuardFirstWait = geoGuardEnvDur("GEO_GUARD_FIRST_DELAY", geoGuardFirstWait)
+	geoGuardCooldown = geoGuardEnvDur("GEO_GUARD_COOLDOWN", geoGuardCooldown)
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("GEO_GUARD_MAX_PER_HOUR"))); err == nil && n > 0 {
+		geoGuardMaxPerHr = n
+	}
+
+	// The rotate command is optional now: the pool rotates between live Thai
+	// nodes by itself, and only needs the server script to *rebuild* tunnels
+	// when no Thai node is left at all.
+	cmdStr := strings.TrimSpace(os.Getenv("GEO_ROTATE_CMD"))
+	if cmdStr == "" && geoPoolOn {
+		cmdStr = "/bin/bash /opt/vpngate/vpngate-rotate.sh --force"
+	}
+	fields := strings.Fields(cmdStr)
+	if len(fields) > 0 {
+		if _, err := exec.LookPath(fields[0]); err != nil {
+			log.Printf("%s[GEO][guard]%s rotate command %q not found — the pool will still rotate between live nodes", colorYellow, colorReset, fields[0])
+			fields = nil
+		}
+	}
+	for i, f := range fields {
+		if i > 0 && strings.HasPrefix(f, "/") && strings.HasSuffix(f, ".sh") {
+			if _, err := os.Stat(f); err != nil {
+				log.Printf("%s[GEO][guard]%s rotate script %s not found — tunnel rebuild disabled", colorYellow, colorReset, f)
+				fields = nil
+				break
+			}
+		}
+	}
+	geoRotateCmd = fields
+	geoGuardOn = true
+	if len(geoRotateCmd) > 0 {
+		log.Printf("%s[GEO][guard]%s checking the egress every %v — rebuilds tunnels with %q when no %s node is healthy",
+			colorGreen, colorReset, geoGuardInterval, strings.Join(geoRotateCmd, " "), geoExpectCountry())
+	} else {
+		log.Printf("%s[GEO][guard]%s checking the egress every %v — rotation stays inside the pool",
+			colorGreen, colorReset, geoGuardInterval)
+	}
+}
+
+func startGeoGuard() {
+	if !geoGuardOn {
+		return
+	}
+	go func() {
+		time.Sleep(geoGuardFirstWait)
+		for {
+			geoGuardOnce()
+			time.Sleep(geoGuardInterval)
+		}
+	}()
+}
+
+func geoGuardStatus() string {
+	if !geoGuardOn {
+		return "off"
+	}
+	geoGuardMu.Lock()
+	defer geoGuardMu.Unlock()
+	state := "enabled"
+	if !geoGuardLastCheck.IsZero() {
+		state = fmt.Sprintf("last check %s → %s", geoGuardLastCheck.Format("15:04:05"), geoGuardLastCC)
+	}
+	extra := ""
+	if geoGuardBackoff.After(time.Now()) {
+		extra = fmt.Sprintf(", backoff until %s", geoGuardBackoff.Format("15:04"))
+	}
+	return fmt.Sprintf("%s every %v, rotations(1h)=%d%s", state, geoGuardInterval, len(geoGuardRotations), extra)
+}
+
+func geoGuardHopCountry() (string, string) {
+	return geoLookup(func(ctx context.Context) (net.Conn, error) {
+		return dialSocks5(ctx, geoSocks5(), "ip-api.com:80")
+	})
+}
+
+// geoNodeCountry reads the verified country of a pool node (empty when it has
+// not been verified yet).
+func geoNodeCountry(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	for _, n := range geoPoolSnapshot() {
+		if n.addr == addr {
+			n.mu.Lock()
+			defer n.mu.Unlock()
+			return n.country
+		}
+	}
+	return ""
+}
+
+func geoGuardOnce() {
+	if !geoGuardOn || !atomic.CompareAndSwapInt32(&geoGuardBusy, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&geoGuardBusy, 0)
+
+	want := geoExpectCountry()
+	now := time.Now()
+
+	// Pool mode: the pool already rotates between live Thai nodes, so the guard
+	// only has to act when *no* node is healthy (and then ask the server to
+	// rebuild tunnels).
+	if geoPoolOn {
+		healthy := 0
+		for _, n := range geoPoolSnapshot() {
+			if n.healthy(want) {
+				healthy++
+			}
+		}
+		cc := geoNodeCountry(geoPoolCurrentAddr())
+
+		geoGuardMu.Lock()
+		geoGuardLastCheck = now
+		if cc != "" {
+			geoGuardLastCC = cc
+		}
+		geoGuardMu.Unlock()
+
+		if healthy > 0 {
+			geoGuardMu.Lock()
+			recovered := geoGuardBadStreak > 0
+			geoGuardBadStreak = 0
+			geoGuardMu.Unlock()
+			if recovered {
+				log.Printf("%s[GEO][guard]%s %d healthy %s node(s) again — current %s exits %s",
+					colorGreen, colorReset, healthy, want, geoPoolCurrentAddr(), geoCountryOrDash(cc))
+			}
+			return
+		}
+
+		geoGuardMu.Lock()
+		geoGuardBadStreak++
+		streak := geoGuardBadStreak
+		geoGuardMu.Unlock()
+		log.Printf("%s[GEO][guard]%s no healthy %s node in the pool (%d configured) streak=%d",
+			colorYellow, colorReset, want, geoPoolSize(), streak)
+		if streak < 2 {
+			return
+		}
+		geoGuardRotate(now, fmt.Sprintf("no healthy %s egress in the pool (%d node(s))", want, geoPoolSize()))
+		return
+	}
+
+	info, cc := geoGuardHopCountry()
+	geoGuardMu.Lock()
+	geoGuardLastCheck = now
+	geoGuardLastCC = cc
+	geoGuardMu.Unlock()
+
+	if cc == want {
+		geoGuardMu.Lock()
+		recovered := geoGuardBadStreak > 0
+		geoGuardBadStreak = 0
+		geoGuardMu.Unlock()
+		if recovered {
+			log.Printf("%s[GEO][guard]%s egress is %s again — %s", colorGreen, colorReset, want, info)
+		}
+		return
+	}
+
+	geoGuardMu.Lock()
+	geoGuardBadStreak++
+	streak := geoGuardBadStreak
+	geoGuardMu.Unlock()
+
+	if cc == "" {
+		// Hop unreachable: vpngate-watch already repairs a dead tunnel, so only
+		// step in when it stays broken.
+		log.Printf("%s[GEO][guard]%s hop not reachable (%s) streak=%d", colorYellow, colorReset, info, streak)
+		if streak < 3 {
+			return
+		}
+		geoGuardRotate(now, fmt.Sprintf("hop still unreachable (%s)", info))
+		return
+	}
+	geoGuardRotate(now, fmt.Sprintf("WRONG COUNTRY: hop exits %s but %s is required", info, want))
+}
+
+func geoGuardRotate(now time.Time, reason string) {
+	geoGuardMu.Lock()
+	if now.Before(geoGuardBackoff) {
+		until := geoGuardBackoff
+		geoGuardMu.Unlock()
+		log.Printf("%s[GEO][guard]%s %s — rotation in cooldown until %s", colorYellow, colorReset, reason, until.Format("15:04:05"))
+		return
+	}
+	cut := now.Add(-time.Hour)
+	keep := geoGuardRotations[:0]
+	for _, t := range geoGuardRotations {
+		if t.After(cut) {
+			keep = append(keep, t)
+		}
+	}
+	geoGuardRotations = keep
+	if len(geoGuardRotations) >= geoGuardMaxPerHr {
+		geoGuardBackoff = now.Add(30 * time.Minute)
+		n := len(geoGuardRotations)
+		geoGuardMu.Unlock()
+		log.Printf("%s[GEO][guard]%s rotated %d time(s) in the last hour already — cooling down 30m (no usable %s node?)",
+			colorRed, colorReset, n, geoExpectCountry())
+		recordAdminLog("geo-guard", "rotate-cooldown", geoSocks5(), fmt.Sprintf("%d rotations in the last hour", n))
+		return
+	}
+	geoGuardRotations = append(geoGuardRotations, now)
+	geoGuardBackoff = now.Add(geoGuardCooldown)
+	geoGuardMu.Unlock()
+
+	if len(geoRotateCmd) == 0 {
+		log.Printf("%s[GEO][guard]%s %s — no rotate command configured, waiting for the pool to recover", colorYellow, colorReset, reason)
+		recordAdminLog("geo-guard", "rotate-skipped", geoSocks5(), reason)
+		return
+	}
+
+	log.Printf("%s[GEO][guard]%s %s — rotating egress", colorYellow, colorReset, reason)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, geoRotateCmd[0], geoRotateCmd[1:]...)
+	cmd.Env = append(os.Environ(), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	out, err := cmd.CombinedOutput()
+	tail := geoLastLines(string(out), 6)
+	if err != nil {
+		log.Printf("%s[GEO][guard]%s rotate failed: %v\n%s", colorRed, colorReset, err, tail)
+		recordAdminLog("geo-guard", "rotate-fail", geoSocks5(), fmt.Sprintf("%v | %s", err, tail))
+		return
+	}
+	log.Printf("%s[GEO][guard]%s rotate finished\n%s", colorGreen, colorReset, tail)
+	recordAdminLog("geo-guard", "rotate", geoSocks5(), tail)
+
+	// Give the tunnel a moment, then confirm the country actually changed.
+	time.Sleep(10 * time.Second)
+	if geoPoolOn {
+		for _, n := range geoPoolSnapshot() {
+			geoVerifyNode(n)
+		}
+		if best := pickGeoNode(nil); best != nil {
+			geoGuardMu.Lock()
+			geoGuardBadStreak = 0
+			geoGuardLastCheck = time.Now()
+			geoGuardMu.Unlock()
+			log.Printf("%s[GEO][guard]%s recovered — egress is now %s", colorGreen, colorReset, best.addr)
+			return
+		}
+		log.Printf("%s[GEO][guard]%s still no healthy %s node after rotating — next attempt after cooldown",
+			colorYellow, colorReset, geoExpectCountry())
+		return
+	}
+	info, cc := geoGuardHopCountry()
+	if cc == geoExpectCountry() {
+		geoGuardMu.Lock()
+		geoGuardBadStreak = 0
+		geoGuardLastCheck = time.Now()
+		geoGuardLastCC = cc
+		geoGuardMu.Unlock()
+		log.Printf("%s[GEO][guard]%s recovered — egress is now %s", colorGreen, colorReset, info)
+		return
+	}
+	log.Printf("%s[GEO][guard]%s still not %s after rotating (%s) — next attempt after cooldown",
+		colorYellow, colorReset, geoExpectCountry(), info)
+}
+
+func geoLastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }

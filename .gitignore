@@ -31,6 +31,10 @@ test_*.ps1
 # Local-only docs (kept on disk, never published)
 TROUBLESHOOTING.md
 
+# Per-deployment server data (uploaded by the deploy scripts, not shared)
+geo-nodes.txt
+geo-domains.txt
+
 # Runtime data
 proxy_cache.db
 proxy_cache.db-shm
