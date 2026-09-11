@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -1961,6 +1962,7 @@ loadHopConfig()
 	startGeoSessionSweeper()
 	startHopAutoSweeper()
 	loadAdminCreds()
+	initDiagAccess()
 	startConnLogWriter()
 startRetentionPruner()
 	startUserHostsFlusher()
@@ -2190,6 +2192,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	isForSelf := (host == "" || isSelf(host, r.Host))
 
 	if isForSelf {
+		// Diagnostics carry real operational data, so they need credentials — the
+		// PAC file has to stay open because iPadOS fetches it before it has a proxy
+		// and cannot authenticate.
+		if selfPathAccess(path) == selfNeedsAuth && !diagAuthorized(w, r) {
+			return
+		}
 		if path == "/proxy.pac" || path == "/wpad.dat" {
 			servePAC(w, r)
 			return
@@ -2453,7 +2461,9 @@ hr{border:0;border-top:1px solid #222;margin:25px 0}
 	const connect = () => {
 		const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 		let backoff = 1000;
-		const ws = new WebSocket(protocol + '//' + location.host + '/ws');
+		// Carry the page's query string so a ?token=<DIAG_TOKEN> also opens the
+		// live socket when the browser does not resend cached credentials.
+		const ws = new WebSocket(protocol + '//' + location.host + '/ws' + location.search);
 		ws.onopen = () => {
 			backoff = 1000;
 			document.getElementById('ws_status').textContent = 'ws_live';
@@ -3695,6 +3705,113 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics access
+//
+// /geo-check, /geo-bench, /logs, /ws and the dashboard expose live tunnels,
+// client IPs, egress addresses and the domain lists, so they are closed by
+// default now:
+//
+//   * requests made on this host pass (the deploy script curls 127.0.0.1),
+//     unless they arrive through a reverse proxy (which would make every
+//     internet request look local)
+//   * ADMIN_USER/ADMIN_PASS basic auth passes (browser prompt)
+//   * DIAG_TOKEN=... lets a script use `Authorization: Bearer <token>` or
+//     `?token=<token>`
+//   * DIAG_PUBLIC=1 opens them again (not recommended on a public port)
+//
+// /proxy.pac and /wpad.dat stay public on purpose: iPadOS fetches the PAC file
+// before any proxy exists and cannot send credentials.
+// ---------------------------------------------------------------------------
+
+var (
+	diagTokenVal string
+	diagOpen     bool
+)
+
+func initDiagAccess() {
+	diagTokenVal = strings.TrimSpace(os.Getenv("DIAG_TOKEN"))
+	v := strings.TrimSpace(os.Getenv("DIAG_PUBLIC"))
+	diagOpen = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "on")
+	if diagOpen {
+		log.Printf("%s[DIAG]%s diagnostics are PUBLIC (DIAG_PUBLIC=1): /geo-check, /geo-bench, /logs, /ws and the dashboard", colorYellow, colorReset)
+		return
+	}
+	mode := "admin credentials (ADMIN_USER/ADMIN_PASS)"
+	if diagTokenVal != "" {
+		mode += " or DIAG_TOKEN"
+	}
+	log.Printf("%s[DIAG]%s diagnostics need %s; requests from this host are always allowed (DIAG_PUBLIC=1 opens them)", colorGreen, colorReset, mode)
+}
+
+// selfAccess says how a request addressed to the proxy itself is handled.
+type selfAccess int
+
+const (
+	selfNeedsAuth selfAccess = iota // the diagnostics gate (this file) decides
+	selfOwnAuth                     // the handler authenticates itself
+	selfPublic                      // never needs credentials
+)
+
+// selfPathAccess classifies a self-addressed path. Anything unknown needs
+// credentials, so a new endpoint cannot leak by accident.
+func selfPathAccess(path string) selfAccess {
+	switch {
+	case path == "/proxy.pac" || path == "/wpad.dat" || path == "/welcome" ||
+		path == "/favicon.ico" || path == "/favicon.svg" || path == "/robots.txt":
+		return selfPublic
+	case path == "/settings" || strings.HasPrefix(path, "/admin"):
+		// These enforce their own credentials (proxy user, admin) — gating them
+		// here too would just make the browser ask twice.
+		return selfOwnAuth
+	default:
+		return selfNeedsAuth
+	}
+}
+
+// isLoopbackClient is true for requests made on the box itself. A request that
+// carries forwarding headers came through a reverse proxy, so it is not local
+// even though its socket is.
+func isLoopbackClient(r *http.Request) bool {
+	if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("X-Real-Ip") != "" || r.Header.Get("Forwarded") != "" {
+		return false
+	}
+	ip := strings.Trim(getClientIP(r), "[]")
+	return ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
+}
+
+func diagRequestToken(r *http.Request) string {
+	if tok := strings.TrimSpace(r.Header.Get("X-NetNinja-Token")); tok != "" {
+		return tok
+	}
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	}
+	return strings.TrimSpace(r.URL.Query().Get("token"))
+}
+
+// diagAuthorized guards the diagnostics endpoints and answers the request with a
+// 401 challenge when it refuses.
+func diagAuthorized(w http.ResponseWriter, r *http.Request) bool {
+	if diagOpen {
+		return true
+	}
+	if isLoopbackClient(r) {
+		return true
+	}
+	if diagTokenVal != "" {
+		if tok := diagRequestToken(r); tok != "" && credsEqual(tok, diagTokenVal) {
+			return true
+		}
+	}
+	if adminCredsOK(r) {
+		return true
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="NetNinja Diagnostics"`)
+	http.Error(w, "Authentication required — use ADMIN_USER/ADMIN_PASS or a DIAG_TOKEN", http.StatusUnauthorized)
+	return false
+}
+
+// ---------------------------------------------------------------------------
 // Admin interface: manage proxy users + view per-user usage (ADMIN_PASS env)
 // ---------------------------------------------------------------------------
 
@@ -3711,25 +3828,30 @@ func loadAdminCreds() {
 	adminPass = os.Getenv("ADMIN_PASS")
 }
 
+// credsEqual compares secrets without leaking length/prefix differences through
+// timing.
+func credsEqual(got, want string) bool {
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// adminCredsOK reports whether the request carries valid admin credentials.
+func adminCredsOK(r *http.Request) bool {
+	if adminPass == "" {
+		return false
+	}
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	return credsEqual(user, adminUser) && credsEqual(pass, adminPass)
+}
+
 func adminAuthRequired(w http.ResponseWriter, r *http.Request) bool {
 	if adminPass == "" {
 		http.Error(w, "Admin not configured", http.StatusForbidden)
 		return false
 	}
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Basic ") {
-		w.Header().Set("WWW-Authenticate", `Basic realm="NetNinja Admin"`)
-		http.Error(w, "Admin Authentication Required", http.StatusUnauthorized)
-		return false
-	}
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
-	if err != nil {
-		w.Header().Set("WWW-Authenticate", `Basic realm="NetNinja Admin"`)
-		http.Error(w, "Admin Authentication Required", http.StatusUnauthorized)
-		return false
-	}
-	parts := strings.SplitN(string(raw), ":", 2)
-	if len(parts) != 2 || parts[0] != adminUser || parts[1] != adminPass {
+	if !adminCredsOK(r) {
 		w.Header().Set("WWW-Authenticate", `Basic realm="NetNinja Admin"`)
 		http.Error(w, "Admin Authentication Required", http.StatusUnauthorized)
 		return false

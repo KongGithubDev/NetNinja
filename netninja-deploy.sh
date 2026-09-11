@@ -121,7 +121,12 @@ journalctl -u netninja-proxy -n 120 --no-pager | grep -E "GEO|HOP|BW|LIMIT|PANIC
 
 echo
 echo "== geo-check (จากในเครื่อง server) =="
+# local request → ไม่ต้องมี credential (diagnostics ถูกปิดจากข้างนอกแล้ว)
 curl -s --max-time 40 http://127.0.0.1:5988/geo-check || true
+
+echo
+echo "== geo-bench (วัดความเร็วจริง: direct vs pool) =="
+curl -s --max-time 60 http://127.0.0.1:5988/geo-bench || true
 
 echo
 echo "== เสร็จแล้ว: ตรวจซ้ำจากเครื่องคุณได้ที่ http://<SERVER_IP>:5988/geo-check =="

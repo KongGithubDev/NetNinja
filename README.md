@@ -148,9 +148,9 @@ subdomain match อัตโนมัติ และ entry ที่มี labe
 
 DNS ยัง resolve ที่ proxy (มี DoH fallback) ดังนั้น Cisco Umbrella ฝั่ง client ไม่เห็น query
 
-ตรวจทุกอย่างได้ที่ `http://<server>:5988/geo-check` — แสดง node แต่ละตัว
-(`CURRENT` / `ok` / `unusable`, ประเทศ, RTT, fails), โหมด session, ที่มา/จำนวนโดเมน
-และประเทศของ egress จริงทั้ง direct และผ่าน pool
+ตรวจทุกอย่างได้ที่ `http://<server>:5988/geo-check` (เรียกจากนอกเครื่องจะถาม admin credentials —
+ดูหัวข้อ Endpoint access) — แสดง node แต่ละตัว (`CURRENT` / `ok` / `unusable`, ประเทศ, RTT, fails),
+โหมด session, ที่มา/จำนวนโดเมน และประเทศของ egress จริงทั้ง direct และผ่าน pool
 
 ### Performance (วัดจริง)
 
@@ -186,6 +186,29 @@ Wi-Fi → (i) → Configure Proxy → Automatic → URL: http://<SERVER_IP>:5988
 - PAC มีผลกับ HTTP/HTTPS (Safari และแอปที่ใช้ CFNetwork) เหมือนโหมด Manual ทุกอย่างที่วิ่งผ่าน proxy
 - ไฟล์ PAC ต้องโหลดได้ **โดยไม่ผ่าน proxy** — เปิด `http://<SERVER_IP>:5988/proxy.pac`
   ใน Safari บน iPad ควรเห็นสคริปต์ก่อนตั้งค่า (ถ้าเห็น = Auto ใช้ได้แน่นอน)
+
+## Endpoint access (closed by default)
+
+The endpoints the proxy serves itself leak real operational data (egress IP/country, open tunnels,
+client IPs, visited hosts, domain lists), so they are **closed by default**:
+
+| Path | Who may use it |
+|---|---|
+| `/proxy.pac`, `/wpad.dat` | public — iPadOS fetches the PAC file before a proxy exists and cannot authenticate |
+| `/welcome` | public (it only echoes the client's own address) |
+| `/geo-check`, `/geo-bench`, `/logs`, `/ws`, `/`, `/status` | local requests, admin credentials, or `DIAG_TOKEN` |
+| `/admin*`, `/settings` | admin credentials / proxy user (as before) |
+
+- A request made **on the server** (the deploy script curls `http://127.0.0.1:5988/geo-check`) always
+  passes — but a request carrying `X-Forwarded-For` / `X-Real-Ip` / `Forwarded` came through a reverse
+  proxy, so it is *not* treated as local even though its socket is.
+- `DIAG_TOKEN=<secret>` lets a script in: `curl -H "Authorization: Bearer <secret>" …` (or `?token=`).
+- `DIAG_PUBLIC=1` opens them all again — not recommended while the port is reachable from the internet.
+- Unknown paths need credentials too (fail-closed), so a new endpoint cannot leak by accident.
+- The dashboard hands its own query string to the live socket, so `http://<server>:5988/?token=<DIAG_TOKEN>`
+  also opens `/ws` when the browser does not resend cached credentials.
+- `/geo-bench` answers one request at a time (single-flight) so it cannot be used to hammer the
+  tunnels or the country lookup.
 
 ## Bandwidth Management
 
@@ -287,13 +310,17 @@ limits survive the move.
 | `ADBLOCK_URL` | - | URL to ad blocklist |
 | `PROXY_ADDR` | - | Server public address |
 | `KEEPALIVE_HOST` | - | Hostname logged specially as a keepalive ping (keeps real domains out of the source) |
+| `DIAG_TOKEN` | - | Bearer/`?token=` secret that may read the diagnostics endpoints |
+| `DIAG_PUBLIC` | `0` | `1` = serve `/geo-check`, `/geo-bench`, `/logs`, `/ws`, `/` without credentials |
 | `TH_ROTATE_CMD` | `/opt/vpngate/vpngate-rotate.sh --force` | (deploy script) command used to rotate the egress on the server |
 | `HOP_SOCKS5` / `GEO_SOCKS5` | - | (server env) address the deploy script probes after rotating |
 
 ## Troubleshooting
 
-วัดความเร็วก่อนตัดสินใจอะไร: `http://<server>:5988/geo-bench` (อ่าน `total` ของแต่ละ node
-เทียบ `direct` — ถ้าเกิน 2-3 เท่าให้ทิ้ง node นั้น หรือลด `GEO_POOL_MAX_RTT`)
+วัดความเร็วก่อนตัดสินใจอะไร: `http://<server>:5988/geo-bench` (ต้องมี credential — ดู Endpoint
+access; อ่าน `total` ของแต่ละ node เทียบ `direct` — ถ้าเกิน 2-3 เท่าให้ทิ้ง node นั้นหรือลด `GEO_POOL_MAX_RTT`)
+เรียกจากในเครื่อง server เองได้เลยโดยไม่ต้องมี credential:
+`curl -s http://127.0.0.1:5988/geo-bench`
 
 `TROUBLESHOOTING.md` is kept **local only** (not tracked in this repository), so the quick checks
 live here:
