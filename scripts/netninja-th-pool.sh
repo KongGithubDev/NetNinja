@@ -185,8 +185,14 @@ publish() {   # endpoints...
   tmp="$(mktemp "${POOL_FILE}.XXXXXX")" || die "cannot create a temp file next to $POOL_FILE"
   {
     printf '# managed by netninja-th-pool.sh — the proxy hot reloads this file\n'
-    local ep
-    for ep in "$@"; do printf '%s\n' "$ep"; done
+    # A configured slot and the discovery pass can both hand over the same
+    # endpoint, so the same address must not be published twice.
+    local ep seen=" "
+    for ep in "$@"; do
+      case "$seen" in *" $ep "*) continue ;; esac
+      seen="$seen$ep "
+      printf '%s\n' "$ep"
+    done
   } > "$tmp"
   if [ -f "$POOL_FILE" ] && cmp -s "$tmp" "$POOL_FILE"; then
     rm -f "$tmp"
