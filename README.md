@@ -13,6 +13,7 @@ High-performance Go forward proxy with CGNAT keepalive for mobile devices.
 - Thai egress pool: several Thai nodes + backups, auto-rotating on death or slowdown
 - Geo sessions — the site *and* its ad slots egress Thai, so ads come out Thai too
 - Domain lists are data (file/URL, hot reloaded), never compiled into the binary
+- Keepalive page that reports Thailand status and which server you are on (address masked)
 - PAC (Auto) support — iPadOS Wi-Fi proxy without installing anything
 - Per-user auth & quota management
 - Admin dashboard
@@ -88,6 +89,23 @@ TOT FTTH uses CGNAT with ~4-5 min idle timeout. The keepalive page sends periodi
 - **Audio loop**: Keeps Safari JS alive when backgrounded
 - **Auto-reconnect**: Resumes on `visibilitychange` / `pageshow`
 
+### What the page reports
+
+Beyond the keepalive loop the page shows **which server** you are going through and whether geo traffic
+is exiting Thailand right now:
+
+- 🇹🇭 **Thailand Connected** — the pool's current node is verified as `GEO_EXPECT_COUNTRY`
+- **Thai egress unavailable (CC)** — the current node drifted to another country, or is down
+- **Direct connection** — no Thai egress configured yet
+
+The address is always partial (`20.24.xxx.xxx`): `MASK_KEEP_OCTETS` (default 2) decides how many IPv4 octets
+stay visible, and masking happens **on the server**, so the full address never reaches the
+browser. Nothing is compiled in — the address comes from `PROXY_ADDR` / `SERVER_ADDR` when set and is
+otherwise looked up once per `SERVER_LOOKUP_TTL`. The Thai state comes from the proxy's cached
+`/geo-status.json` (one `127.0.0.1` call per `GEO_STATUS_TTL`, never a dial or a country lookup), because
+only the proxy knows which egress node is current — the page itself deliberately never travels the Thai
+path.
+
 ## Geo Routing — stable Thai egress via a Thai egress pool
 
 A forward proxy always shows the destination the **proxy's own IP**, so a server in Malaysia looks
@@ -160,7 +178,7 @@ them all — and the **ad slot is where the country shows most clearly**, becaus
 from the IP it sees. When a client visits a geo domain the proxy **marks that client's session**
 (`GEO_SESSION_TTL`, default 15m) and everything the page loads afterwards egresses Thai too, except for
 
-- domains the PAC already sends `DIRECT` (speedtest/apple/googlevideo) plus video/CDN — full speed kept
+- domains the PAC already sends `DIRECT` (speedtest/apple/googlevideo, plus Google's ad stack) and video/CDN — full speed kept
 - the server itself (keepalive/dashboard) — never pushed through the VPN
 - hosts listed in `GEO_SESSION_EXCLUDE`
 
@@ -168,6 +186,15 @@ from the IP it sees. When a client visits a geo domain the proxy **marks that cl
 (`ADBLOCK_URL` / `ADBLOCK_PATH`, e.g. HaGeZi), not a hardcoded list — an ad host inside a geo session is
 **not blocked but egressed Thai**, which is what makes Thai ads appear (set `GEO_ADS_EGRESS=1` to route
 ads Thai for every client, or `GEO_SESSION=ads|off` to pick the mode).
+
+**Google's ad stack is the exception — it stays direct.** `doubleclick.net`, `googlesyndication.com`,
+`googleadservices.com`, `googletagservices.com` and `adservice.google.*` are on the built-in direct set,
+so the PAC hands them straight to the client and the session router never sends them Thai. Google fills a
+slot from the edge closest to the requesting IP, and a VPN edge is the wrong kind of close: it often
+answers with an empty slot, at tunnel latency. The clients this proxy serves are already on a Thai last
+mile, so direct still means Thai ads. While the ad flow is active those hosts are let through the blocker
+instead of being refused; outside it they are blocked like any other ad host. Add more with
+`PAC_DIRECT_DOMAINS` — no rebuild needed.
 
 ### 3. Geo domain list — nothing is built into the code
 
@@ -223,7 +250,7 @@ Wi-Fi → (i) → Configure Proxy → Automatic → URL: http://<SERVER_IP>:5988
   type iPadOS silently ignores Auto mode, and a cached PAC keeps pointing at the old address after
   `PROXY_ADDR` changes
 - the PAC returns `PROXY <server>:5988` by default and `DIRECT` only for LAN/loopback and the domains in
-  `PAC_DIRECT_DOMAINS` (speedtest/apple/googlevideo by default) — **the proxy picks the Thai egress
+  `PAC_DIRECT_DOMAINS` (speedtest/apple/googlevideo and Google's ad stack by default) — **the proxy picks the Thai egress
   itself, so the PAC needs to know nothing about geo**
 - the alias `/wpad.dat` serves the same file
 - the PAC affects HTTP/HTTPS (Safari and any app using CFNetwork) exactly like Manual mode — everything
@@ -240,7 +267,7 @@ client IPs, visited hosts, domain lists), so they are **closed by default**:
 |---|---|
 | `/proxy.pac`, `/wpad.dat` | public — iPadOS fetches the PAC file before a proxy exists and cannot authenticate |
 | `/welcome` | public (it only echoes the client's own address) |
-| `/geo-check`, `/geo-bench`, `/logs`, `/ws`, `/`, `/status` | local requests, admin credentials, or `DIAG_TOKEN` |
+| `/geo-check`, `/geo-status.json`, `/geo-bench`, `/logs`, `/ws`, `/`, `/status` | local requests, admin credentials, or `DIAG_TOKEN` |
 | `/admin*`, `/settings` | admin credentials / proxy user (as before) |
 
 - A request made **on the server** (the deploy script curls `http://127.0.0.1:5988/geo-check`) always
@@ -356,6 +383,12 @@ survive the move.
 | `ADBLOCK_URL` | - | URL to ad blocklist |
 | `PROXY_ADDR` | - | Server public address |
 | `KEEPALIVE_HOST` | - | Hostname logged specially as a keepalive ping (keeps real domains out of the source) |
+| `PROXY_ADDR` / `SERVER_ADDR` | - | (keepalive page) address to show, already masked — no lookup at all |
+| `SERVER_LOOKUP_URL` | `http://ip-api.com/json/?fields=query,countryCode` | (keepalive page) where to ask when neither address is set |
+| `SERVER_LOOKUP_TTL` | `10m` | (keepalive page) how long that lookup is reused |
+| `GEO_STATUS_URL` | `http://127.0.0.1:5988/geo-status.json` | (keepalive page) where to read the Thai state from |
+| `GEO_STATUS_TTL` | `15s` | (keepalive page) how long a proxy answer is reused |
+| `MASK_KEEP_OCTETS` | `2` | (keepalive page) IPv4 octets left visible, max 3 |
 | `DIAG_TOKEN` | - | Bearer/`?token=` secret that may read the diagnostics endpoints |
 | `DIAG_PUBLIC` | `0` | `1` = serve `/geo-check`, `/geo-bench`, `/logs`, `/ws`, `/` without credentials |
 | `TH_ROTATE_CMD` | `/opt/vpngate/vpngate-rotate.sh --force` | (deploy script) command used to rotate the egress on the server |

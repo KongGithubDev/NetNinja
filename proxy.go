@@ -2240,6 +2240,9 @@ p{color:#888;margin-bottom:25px}
 		if path == "/geo-check" {
 			serveGeoCheck(w, r)
 			return
+		} else if path == "/geo-status.json" {
+			serveGeoStatusJSON(w, r)
+			return
 		} else if path == "/geo-bench" {
 			serveGeoBench(w, r)
 			return
@@ -6501,6 +6504,37 @@ func geoDirectIP(ip string) bool {
 	return false
 }
 
+// googleAdsDomains is Google's ad stack, deliberately kept on the direct path.
+// Google fills a slot from the edge closest to the requesting IP, and the Thai
+// tunnel is the wrong kind of close: it is a VPN edge that frequently answers
+// with an empty slot and always at tunnel latency. The clients this proxy serves
+// are already on a Thai last mile, so direct still yields Thai ads — just
+// without the detour. While the ad flow is on, these hosts are also let through
+// the blocker (see geoHandlesAd), otherwise the slot would be refused instead of
+// localised.
+var googleAdsDomains = []string{
+	"doubleclick.net",       // googleads.g. / securepubads.g. / pagead46.l.doubleclick.net
+	"googlesyndication.com", // pagead2. / tpc.googlesyndication.com
+	"googleadservices.com",  // www. / pagead2.googleadservices.com
+	"googletagservices.com", // www.googletagservices.com
+	"adservice.google.com",  // ad render / consent endpoint
+	"adservice.google.co.th",
+}
+
+// isGoogleAdHost reports whether a host belongs to that stack (subdomains too).
+func isGoogleAdHost(host string) bool {
+	h := normalizeAdHost(host)
+	if h == "" {
+		return false
+	}
+	for _, d := range googleAdsDomains {
+		if h == d || strings.HasSuffix(h, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
 // pacDirectDomains is the single source of truth for "go direct" on both sides:
 // the PAC file hands these straight to the client, and the session router keeps
 // them direct if they arrive anyway (manual-proxy mode). Built once, because the
@@ -6512,6 +6546,7 @@ func pacDirectDomains() []string {
 			"apple-cloudkit.com", "mzstatic.com", "itunes.com",
 			"ookla.com", "speedtest.net", "ooklaserver.net",
 		}
+		direct = append(direct, googleAdsDomains...)
 		for _, d := range strings.Split(os.Getenv("PAC_DIRECT_DOMAINS"), ",") {
 			if d = normalizeGeoDomain(d); d != "" {
 				direct = append(direct, d)
@@ -6591,11 +6626,25 @@ func geoEgressFor(ctx context.Context, host, address string) (bool, string) {
 	return false, ""
 }
 
-// geoHandlesAd reports whether an ad/tracking host is carried by the Thai egress
-// instead of being refused, so the block sites can let it through.
+// adsFlowActive says whether ads are being localised for this request: for every
+// client (GEO_ADS_EGRESS=1) or because the client is inside a geo session.
+func adsFlowActive(ctx context.Context) bool {
+	if geoAdsGlobal {
+		return true
+	}
+	return geoSessionMode != "off" && geoSessionFresh(geoKeyFromCtx(ctx))
+}
+
+// geoHandlesAd reports whether the ad localisation flow is dealing with an
+// ad/tracking host, so the block sites can let it through instead of refusing it:
+// either the Thai egress carries it, or it is one of the hosts that must stay on
+// the direct path (Google's ad stack) while that flow is active. Outside that
+// flow Google's ad hosts stay blocked like any other ad host.
 func geoHandlesAd(ctx context.Context, host string) bool {
-	via, _ := geoEgressFor(ctx, host, "")
-	return via
+	if via, _ := geoEgressFor(ctx, host, ""); via {
+		return true
+	}
+	return isGoogleAdHost(host) && adsFlowActive(ctx)
 }
 
 var geoEgressLogged sync.Map
@@ -6784,6 +6833,51 @@ func serveGeoBench(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(w, "\nอ่านผล: 'total' ที่เกิน direct มาก ๆ = tunnel นั้นช้า (pool จะหมุนออกเองเมื่อช้าเกิน %v ติดกัน %d ครั้ง)\n",
 		geoPoolMaxRTT, geoPoolSlowHits)
+}
+
+// serveGeoStatusJSON reports the *cached* geo state as JSON — no dials, no
+// country lookups — so the keepalive page and any local monitor can poll it for
+// free. It rides the same diagnostics gate as /geo-check, which means requests
+// from this host pass without credentials.
+func serveGeoStatusJSON(w http.ResponseWriter, r *http.Request) {
+	type poolInfo struct {
+		On      bool   `json:"on"`
+		Nodes   int    `json:"nodes"`
+		Current string `json:"current,omitempty"`
+	}
+	type status struct {
+		Expect   string   `json:"expect"`
+		Thai     bool     `json:"thai"`
+		Country  string   `json:"country,omitempty"`
+		Pool     poolInfo `json:"pool"`
+		Sessions int64    `json:"sessions"`
+		Domains  int      `json:"domains"`
+	}
+
+	st := status{
+		Expect:   geoExpectCountry(),
+		Pool:     poolInfo{On: geoPoolOn, Nodes: geoPoolSize()},
+		Sessions: atomic.LoadInt64(&geoSessionLive),
+		Domains:  geoDomainCount(),
+	}
+	if cur := geoPoolCurrentAddr(); cur != "" {
+		st.Pool.Current = cur
+		for _, n := range geoPoolSnapshot() {
+			if n.addr != cur {
+				continue
+			}
+			up, cc, _, _, _, _, _ := n.snapshot()
+			st.Country = cc
+			st.Thai = up && cc == st.Expect
+			break
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(st); err != nil {
+		log.Printf("[GEO] status json: %v", err)
+	}
 }
 
 // serveGeoCheck renders the geo routing state plus the real egress IP/country

@@ -7,7 +7,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -174,13 +176,26 @@ func TestGeoEgressAdsFollowSession(t *testing.T) {
 	const key = "ip:203.0.113.9"
 	ctx := ctxWithGeoKey(context.Background(), key)
 
-	if via, why := geoEgressFor(ctx, "ads.doubleclick.net", ""); via {
+	if via, why := geoEgressFor(ctx, "ads.example", ""); via {
 		t.Fatalf("ad host egressed Thai before any geo session (%s)", why)
+	}
+	if geoHandlesAd(ctx, "ads.doubleclick.net") {
+		t.Fatal("outside the ad flow a Google ad host must still be refused like any other ad host")
 	}
 	noteGeoSession(key)
 
-	if via, why := geoEgressFor(ctx, "ads.doubleclick.net", ""); !via || why != "ad" {
+	if via, why := geoEgressFor(ctx, "ads.example", ""); !via || why != "ad" {
 		t.Fatalf("ad host in a session = (%v,%q), want (true,ad)", via, why)
+	}
+	// Google's ad stack is the exception: let through, but never through the tunnel.
+	if via, why := geoEgressFor(ctx, "ads.doubleclick.net", ""); via {
+		t.Fatalf("Google's ad stack must stay direct inside a session (%s)", why)
+	}
+	if via, why := geoEgressFor(ctx, "pagead2.googlesyndication.com", ""); via {
+		t.Fatalf("google syndication must stay direct inside a session (%s)", why)
+	}
+	if !geoHandlesAd(ctx, "ads.doubleclick.net") {
+		t.Fatal("inside the ad flow a Google ad host must be let through, not refused")
 	}
 	if via, why := geoEgressFor(ctx, "assets.third-party.example", ""); !via || why != "session" {
 		t.Fatalf("session host = (%v,%q), want (true,session)", via, why)
@@ -201,7 +216,7 @@ func TestGeoEgressAdsFollowSession(t *testing.T) {
 func TestGeoAdsGlobalRoutesEveryClient(t *testing.T) {
 	adBlockMu.Lock()
 	prevDoms, prevAllow := adBlockDomains, adBlockAllow
-	adBlockDomains = map[string]struct{}{"doubleclick.net": {}}
+	adBlockDomains = map[string]struct{}{"doubleclick.net": {}, "ads.example": {}}
 	adBlockAllow = nil
 	adBlockMu.Unlock()
 	defer func() {
@@ -218,8 +233,15 @@ func TestGeoAdsGlobalRoutesEveryClient(t *testing.T) {
 	defer func() { geoAdsGlobal, geoSessionMode = prevAds, prevMode }()
 
 	ctx := ctxWithGeoKey(context.Background(), "ip:203.0.113.9")
-	if via, why := geoEgressFor(ctx, "static.doubleclick.net", ""); !via || why != "ad" {
+	if via, why := geoEgressFor(ctx, "static.ads.example", ""); !via || why != "ad" {
 		t.Fatalf("GEO_ADS_EGRESS=1 must localise ads for every client, got (%v,%q)", via, why)
+	}
+	// Google's ad stack is carried direct even then — but it must not be refused.
+	if via, why := geoEgressFor(ctx, "pagead2.googlesyndication.com", ""); via {
+		t.Fatalf("Google ad host must stay direct with GEO_ADS_EGRESS=1 (%s)", why)
+	}
+	if !geoHandlesAd(ctx, "pagead2.googlesyndication.com") {
+		t.Fatal("Google ad host must be let through while the ad flow is on")
 	}
 }
 
@@ -301,9 +323,84 @@ func TestServePACIsUsableByIPadOS(t *testing.T) {
 		t.Fatalf("Cache-Control = %q, want no-store", cc)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"FindProxyForURL", "PROXY ", "dnsDomainIs(host, \"speedtest.net\")", "dnsDomainIs(host, \"googlevideo.com\")"} {
+	for _, want := range []string{"FindProxyForURL", "PROXY ", "dnsDomainIs(host, \"speedtest.net\")", "dnsDomainIs(host, \"googlevideo.com\")", "dnsDomainIs(host, \"googlesyndication.com\")", "dnsDomainIs(host, \"doubleclick.net\")"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("PAC body is missing %q:\n%s", want, body)
 		}
+	}
+}
+
+// /geo-status.json is what the keepalive page polls to say "Thailand Connected"
+// and which server is in use, so it has to answer from cached state — no dials,
+// no country lookups — and stay honest when the current node is not Thai.
+func TestGeoStatusJSONReportsThaiEgress(t *testing.T) {
+	prevOn := geoPoolOn
+	geoPoolMu.Lock()
+	prevPool, prevCur := geoPool, geoPoolCur
+	geoPool, geoPoolCur = nil, nil
+	geoPoolMu.Unlock()
+	geoPoolOn = false // earlier tests in this package enable the pool
+	defer func() {
+		geoPoolMu.Lock()
+		geoPool, geoPoolCur = prevPool, prevCur
+		geoPoolMu.Unlock()
+		geoPoolOn = prevOn
+	}()
+
+	type payload struct {
+		Expect  string `json:"expect"`
+		Thai    bool   `json:"thai"`
+		Country string `json:"country"`
+		Pool    struct {
+			On      bool   `json:"on"`
+			Nodes   int    `json:"nodes"`
+			Current string `json:"current"`
+		} `json:"pool"`
+	}
+	fetch := func() payload {
+		rec := httptest.NewRecorder()
+		serveGeoStatusJSON(rec, httptest.NewRequest(http.MethodGet, "/geo-status.json", nil))
+		if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("Content-Type = %q, want application/json", ct)
+		}
+		var got payload
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
+		}
+		return got
+	}
+
+	if got := fetch(); got.Pool.On || got.Thai || got.Pool.Nodes != 0 {
+		t.Fatalf("with no pool configured the status should be off/not-Thai, got %+v", got)
+	}
+
+	node := newGeoNode("node-a:1080")
+	node.mu.Lock()
+	node.country, node.up = "TH", true
+	node.mu.Unlock()
+	geoPoolMu.Lock()
+	geoPool, geoPoolCur = []*geoNode{node}, node
+	geoPoolMu.Unlock()
+	geoPoolOn = true
+
+	got := fetch()
+	if !got.Thai || got.Country != got.Expect || !got.Pool.On || got.Pool.Nodes != 1 {
+		t.Fatalf("status = %+v, want thai=true, country==expect, pool on with one node", got)
+	}
+
+	// A node that drifted to another country must never be advertised as Thai.
+	node.mu.Lock()
+	node.country = "MY"
+	node.mu.Unlock()
+	if got := fetch(); got.Thai || got.Country != "MY" {
+		t.Fatalf("status = %+v, want thai=false and country=MY", got)
+	}
+
+	// A node that is down is not usable either.
+	node.mu.Lock()
+	node.country, node.up = "TH", false
+	node.mu.Unlock()
+	if got := fetch(); got.Thai {
+		t.Fatalf("status = %+v, want thai=false for a node that is down", got)
 	}
 }

@@ -22,7 +22,7 @@ func TestSelfPathAccessClassification(t *testing.T) {
 			t.Errorf("selfPathAccess(%q) = %v, want selfOwnAuth", p, got)
 		}
 	}
-	for _, p := range []string{"", "/", "/status", "/logs", "/ws", "/geo-check", "/geo-bench", "/block-check", "/metrics", "/anything-new"} {
+	for _, p := range []string{"", "/", "/status", "/logs", "/ws", "/geo-check", "/geo-status.json", "/geo-bench", "/block-check", "/metrics", "/anything-new"} {
 		if got := selfPathAccess(p); got != selfNeedsAuth {
 			t.Errorf("selfPathAccess(%q) = %v, want selfNeedsAuth (fail closed)", p, got)
 		}
