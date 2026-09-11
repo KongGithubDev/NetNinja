@@ -5,28 +5,32 @@
 # at the server with either
 #
 #   * environment variables  NETNINJA_SERVER / NETNINJA_USER, or
-#   * a local netninja.local.ps1 next to this script (git-ignored), e.g.
+#   * a local netninja.local.ps1 in the repository root (git-ignored), e.g.
 #         $env:NETNINJA_SERVER = '<server-ip-or-host>'
 #         $env:NETNINJA_USER   = '<ssh-user>'
 #
 # Run it yourself (it needs the remote root credential, which stays on this
 # machine — it is read as a SecureString and piped straight into ssh):
 #
-#   powershell -ExecutionPolicy Bypass -File .\netninja-deploy.ps1 -ThaiEgress
-#   powershell -ExecutionPolicy Bypass -File .\netninja-deploy.ps1 -ThaiPool
+#   powershell -ExecutionPolicy Bypass -File .\scripts\netninja-deploy.ps1 -ThaiEgress
+#   powershell -ExecutionPolicy Bypass -File .\scripts\netninja-deploy.ps1 -ThaiPool
 #
 # What it does:
-#   1. scp the freshly built binary (dist\proxy_linux by default) to /tmp on the VM
+#   1. scp the freshly built binary (dist\proxy_linux, see `make`) to /tmp on the VM
 #   2. run /tmp/netninja-deploy.sh there with root privileges
 #      (backup → install → restart → optional Thai egress rotate → verify)
-#   2b. when netninja-th-pool.sh sits next to this script it is uploaded too, and
-#      -ThaiPool installs/enables the systemd service that supervises the tunnels
+#   2b. it also uploads scripts/netninja-th-pool.sh (plus
+#      examples/netninja-th-pool.conf.example), and -ThaiPool installs and
+#      enables the systemd service that supervises the tunnels
 #   3. print /geo-check so you can confirm geo traffic exits from Thailand
+#
+# Secrets and per-deployment data (azure-sg.key, netninja.local.ps1,
+# geo-nodes.txt, geo-domains.txt) live untracked in the repository root.
 param(
     [string]$Server = $env:NETNINJA_SERVER,
     [string]$User   = $env:NETNINJA_USER,
-    [string]$Key    = "$PSScriptRoot\azure-sg.key",
-    [string]$Binary = "$PSScriptRoot\dist\proxy_linux",
+    [string]$Key    = '',
+    [string]$Binary = '',
     [string]$ThaiNodes = '',
     [switch]$ThaiEgress,
     [switch]$ThaiPool,
@@ -35,8 +39,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# This script lives in scripts/; everything it uploads lives in the repository
+# root, next to the Makefile.
+$Repo = Split-Path -Parent $PSScriptRoot
+if (-not $Key)    { $Key    = Join-Path $Repo 'azure-sg.key' }
+if (-not $Binary) { $Binary = Join-Path $Repo 'dist\proxy_linux' }
+
 # Local, uncommitted settings win over the environment.
-$localSettings = Join-Path $PSScriptRoot 'netninja.local.ps1'
+$localSettings = Join-Path $Repo 'netninja.local.ps1'
 if (Test-Path $localSettings) { . $localSettings }
 if (-not $Server) { $Server = $env:NETNINJA_SERVER }
 if (-not $User)   { $User   = $env:NETNINJA_USER }
@@ -45,7 +55,7 @@ if (-not $Server -or -not $User) {
 Target host not configured. Set it outside the repository:
   `$env:NETNINJA_SERVER = '<server-ip-or-host>'
   `$env:NETNINJA_USER   = '<ssh-user>'
-...or create netninja.local.ps1 next to this script (already git-ignored) with those two lines.
+...or create netninja.local.ps1 in the repository root (already git-ignored) with those two lines.
 "@
 }
 
@@ -64,13 +74,13 @@ if (-not $SkipUpload) {
 # The Thai egress pool and the geo domain list are data files on the server.
 # Upload the local copies when they exist (geo-nodes.txt = one host:port per
 # line, optional; geo-domains.txt = the domain list, replaced if present).
-$poolFile = "$PSScriptRoot\geo-nodes.txt"
+$poolFile = Join-Path $Repo 'geo-nodes.txt'
 if (Test-Path $poolFile) {
     Write-Host "== uploading Thai egress pool file ($poolFile) ==" -ForegroundColor Cyan
     scp @sshOpts -- $poolFile "${target}:/tmp/geo-nodes.txt"
     if ($LASTEXITCODE -ne 0) { throw "scp of geo-nodes.txt failed" }
 }
-$domainsFile = "$PSScriptRoot\geo-domains.txt"
+$domainsFile = Join-Path $Repo 'geo-domains.txt'
 if (Test-Path $domainsFile) {
     Write-Host "== uploading geo domain list ($domainsFile) ==" -ForegroundColor Cyan
     scp @sshOpts -- $domainsFile "${target}:/tmp/geo-domains.txt"
@@ -80,12 +90,12 @@ if (Test-Path $domainsFile) {
 # The pool supervisor (optional): it keeps the tunnels listed in the pool file
 # alive by itself. Its real config (/etc/netninja/th-pool.conf) stays on the
 # server — only the script and the example config are uploaded here.
-$supervisor = "$PSScriptRoot\netninja-th-pool.sh"
+$supervisor = Join-Path $Repo 'scripts\netninja-th-pool.sh'
 if (Test-Path $supervisor) {
     Write-Host "== uploading Thai pool supervisor ($supervisor) ==" -ForegroundColor Cyan
     scp @sshOpts -- $supervisor "${target}:/tmp/netninja-th-pool.sh"
     if ($LASTEXITCODE -ne 0) { throw "scp of netninja-th-pool.sh failed" }
-    $supervisorConf = "$PSScriptRoot\netninja-th-pool.conf.example"
+    $supervisorConf = Join-Path $Repo 'examples\netninja-th-pool.conf.example'
     if (Test-Path $supervisorConf) {
         scp @sshOpts -- $supervisorConf "${target}:/tmp/netninja-th-pool.conf.example"
         if ($LASTEXITCODE -ne 0) { throw "scp of netninja-th-pool.conf.example failed" }

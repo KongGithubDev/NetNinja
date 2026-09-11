@@ -558,6 +558,7 @@ func startAdBlockRefresher() {
 		}
 	}()
 }
+
 var userTracker sync.Map // map[string]time.Time (IP -> last seen)
 
 // Per-user usage stats (keyed by proxy auth username)
@@ -571,6 +572,7 @@ type userStat struct {
 	devices    map[string]bool // distinct device keys (clientIP + UA)
 	lastDevice string
 }
+
 var userStats sync.Map // map[string]*userStat
 
 func authedUser(r *http.Request) string {
@@ -653,6 +655,7 @@ type userHostStat struct {
 	firstSeen time.Time
 	lastSeen  time.Time
 }
+
 var userHosts sync.Map // map[string]*userHostStat  (key = username + "\x00" + host)
 
 // Per-user account settings (persisted in user_settings table)
@@ -663,6 +666,7 @@ type userSetting struct {
 	adblockEnabled int // -1 inherit global, 0 off, 1 on
 	updatedAt      time.Time
 }
+
 var userSettings sync.Map // map[string]*userSetting (key = username)
 
 // Global master switches (settings table). 1 = enabled (default).
@@ -814,14 +818,15 @@ func touchUserHost(user, host string, up, down int64, conns int64) {
 // Connection audit log — batched writes via a background goroutine.
 // Entries: (username, client_ip, host, status, bytes_up, bytes_down, duration_ms)
 type connLogEntry struct {
-	username string
-	clientIP string
-	host     string
-	status   string
-	bytesUp  int64
+	username  string
+	clientIP  string
+	host      string
+	status    string
+	bytesUp   int64
 	bytesDown int64
-	durMs    int64
+	durMs     int64
 }
+
 var connLogCh = make(chan connLogEntry, 4096)
 var connLogWriterStarted bool
 
@@ -997,6 +1002,7 @@ type hostStat struct {
 	bytes int64
 	last  time.Time
 }
+
 var hostStats sync.Map // map[string]*hostStat
 
 // activityConn wraps a net.Conn and tracks when bytes last flowed on it, so an
@@ -1007,7 +1013,7 @@ type activityConn struct {
 	last atomic.Int64 // unix nanos of last read OR write activity
 }
 
-func (c *activityConn) mark()      { c.last.Store(time.Now().UnixNano()) }
+func (c *activityConn) mark()           { c.last.Store(time.Now().UnixNano()) }
 func (c *activityConn) Last() time.Time { return time.Unix(0, c.last.Load()) }
 func (c *activityConn) Read(p []byte) (int, error) {
 	if n, err := c.Conn.Read(p); n > 0 {
@@ -1650,6 +1656,7 @@ func hopDial(ctx context.Context, network, hostname, address string) (net.Conn, 
 	}
 	return customDialer.DialContext(ctx, network, address)
 }
+
 // Custom transport — God-Mode concurrency for heavy video streaming
 var proxyTransport = &http.Transport{
 	DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -1950,8 +1957,8 @@ func main() {
 	enableWindowsANSI()
 	initDB()
 	defer db.Close()
-loadAppSettings()
-loadHopConfig()
+	loadAppSettings()
+	loadHopConfig()
 	initGeoDomains()
 	initGeoSession()
 	startGeoPool()
@@ -1964,7 +1971,7 @@ loadHopConfig()
 	loadAdminCreds()
 	initDiagAccess()
 	startConnLogWriter()
-startRetentionPruner()
+	startRetentionPruner()
 	startUserHostsFlusher()
 	startHeartbeatStats()
 	reloadAdBlock()
@@ -3672,34 +3679,34 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 			}
 
 			data := map[string]interface{}{
-				"uptime":        time.Since(startTime).Round(time.Second).String(),
-				"users":         userCount,
-				"user_ips":      activeIPs,
-				"active_conn":   atomic.LoadInt64(&activeConns),
-				"total_req":     atomic.LoadInt64(&totalRequests),
-				"bytes_up":      atomic.LoadInt64(&totalBytesUp),
-				"bytes_down":    atomic.LoadInt64(&totalBytesDown),
-				"dns_hits":      atomic.LoadInt64(&dnsHits),
-				"dns_misses":    atomic.LoadInt64(&dnsMisses),
-				"doh_calls":     atomic.LoadInt64(&dohCalls),
-				"err_count":     atomic.LoadInt64(&errCount),
-				"mem_alloc":     fmt.Sprintf("%.2f MB", float64(m.Alloc)/1024/1024),
-				"mem_sys":       fmt.Sprintf("%.2f MB", float64(m.Sys)/1024/1024),
-				"mem_heap":      fmt.Sprintf("%.2f MB", float64(m.HeapAlloc)/1024/1024),
-				"goroutines":    runtime.NumGoroutine(),
-				"cpus":          runtime.NumCPU(),
-				"go_ver":        runtime.Version(),
-				"rules":         rules,
-				"cisco":         cisco,
-				"db_size":       dbSize,
-				"recent":        recent,
-				"top_hosts":     topHosts,
-				"tunnels":       tunnels,
-				"bw_history":    bw,
+				"uptime":         time.Since(startTime).Round(time.Second).String(),
+				"users":          userCount,
+				"user_ips":       activeIPs,
+				"active_conn":    atomic.LoadInt64(&activeConns),
+				"total_req":      atomic.LoadInt64(&totalRequests),
+				"bytes_up":       atomic.LoadInt64(&totalBytesUp),
+				"bytes_down":     atomic.LoadInt64(&totalBytesDown),
+				"dns_hits":       atomic.LoadInt64(&dnsHits),
+				"dns_misses":     atomic.LoadInt64(&dnsMisses),
+				"doh_calls":      atomic.LoadInt64(&dohCalls),
+				"err_count":      atomic.LoadInt64(&errCount),
+				"mem_alloc":      fmt.Sprintf("%.2f MB", float64(m.Alloc)/1024/1024),
+				"mem_sys":        fmt.Sprintf("%.2f MB", float64(m.Sys)/1024/1024),
+				"mem_heap":       fmt.Sprintf("%.2f MB", float64(m.HeapAlloc)/1024/1024),
+				"goroutines":     runtime.NumGoroutine(),
+				"cpus":           runtime.NumCPU(),
+				"go_ver":         runtime.Version(),
+				"rules":          rules,
+				"cisco":          cisco,
+				"db_size":        dbSize,
+				"recent":         recent,
+				"top_hosts":      topHosts,
+				"tunnels":        tunnels,
+				"bw_history":     bw,
 				"recent_traffic": recentTraffic,
 			}
 
-				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			if err := conn.WriteJSON(data); err != nil {
 				return
 			}
@@ -4155,7 +4162,10 @@ func adminCharts(snaps []userSnap) string {
 	bwHistoryMu.Unlock()
 
 	// top hosts by bytes (biggest first)
-	type hrow struct{ host string; bytes int64 }
+	type hrow struct {
+		host  string
+		bytes int64
+	}
 	var hosts []hrow
 	hostStats.Range(func(k, v interface{}) bool {
 		st := v.(*hostStat)
@@ -4502,7 +4512,11 @@ func serveAdminUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Aggregate host totals for this user
-	type hostRow struct{ Host string; Up, Down, Conns int64; First, Last string }
+	type hostRow struct {
+		Host            string
+		Up, Down, Conns int64
+		First, Last     string
+	}
 	var hosts []hostRow
 	userHosts.Range(func(k, v interface{}) bool {
 		parts := strings.SplitN(k.(string), "\x00", 2)
@@ -4566,7 +4580,7 @@ func serveAdminUser(w http.ResponseWriter, r *http.Request) {
 		conns += h.Conns
 	}
 
-	top := adminPageTop("user_detail // " + name, r.URL.Path)
+	top := adminPageTop("user_detail // "+name, r.URL.Path)
 	body := fmt.Sprintf(`
 	<div class="tots">
 		<div class="tot"><div class="k">user</div><div class="v" style="color:#7af">%s</div></div>
@@ -4650,7 +4664,10 @@ func serveAdminLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	type rw struct{ Ts, User, IP, Host, Status string; Up, Down, Dur string }
+	type rw struct {
+		Ts, User, IP, Host, Status string
+		Up, Down, Dur              string
+	}
 	var list []rw
 	for rows.Next() {
 		var ts, u, ip, h, st string
@@ -5414,7 +5431,7 @@ var (
 	bwGlobalDown   *bwLimiter
 	bwUserUp       int64 // bytes/sec per user (0 = off)
 	bwUserDown     int64
-	bwBurstBytes   int64 = 256 * 1024
+	bwBurstBytes   int64    = 256 * 1024
 	userBwLimiters sync.Map // user -> *userBwLimit
 )
 

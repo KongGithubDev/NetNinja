@@ -1,0 +1,21 @@
+# Line endings: LF in the repository, and LF on checkout for the files whose
+# tooling cares. Go sources must be LF — with CRLF in the working tree `gofmt -l`
+# reports every file as unformatted, so a single `gofmt -w` turns into a
+# whole-file diff. Windows tooling (.ps1) keeps the platform default.
+* text=auto
+Makefile text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+*.go   text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.mod  text eol=lf
+*.sum  text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+
+# Binary assets: never touched by the diff/eol machinery.
+*.png  binary
+*.jpg  binary
+*.db   binary
+*.exe  binary

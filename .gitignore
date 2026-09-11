@@ -1,54 +1,59 @@
-# Dependencies
-node_modules/
-
-# Environment
+# ---------------------------------------------------------------------------
+# Secrets and local machine state — never commit any of this
+# ---------------------------------------------------------------------------
 .env
-
-# Secrets - NEVER commit
-azure-sg.key
 *.key
-
-# Go binary
-*.exe
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Certificates
+azure-sg.key
 fullchain.pem
 privkey.pem
 
-# Build artifacts
-dist/
-proxy_linux*
-netninja-proxy-linux
-netninja-keepalive-linux
-
-# Test scripts
-test_*.ps1
-
-# Local-only docs (kept on disk, never published)
-TROUBLESHOOTING.md
-
-# Per-deployment server data (uploaded by the deploy scripts, not shared)
-geo-nodes.txt
-geo-domains.txt
-
-# Thai pool supervisor config — holds the real tunnel endpoints/commands
-th-pool.conf
-netninja-th-pool.conf
-
-# Local deploy settings — the real server host/user lives here, never in a
-# tracked script (the repository is public)
+# Local deploy settings: the real server host/user lives here, never in a
+# tracked script (this repository is public)
 netninja.local.ps1
 *.local.ps1
 netninja.local.sh
 *.local.sh
 
+# Local-only notes, kept on disk and deliberately never published
+TROUBLESHOOTING.md
+
+# ---------------------------------------------------------------------------
+# Per-deployment server data (scp'd by the deploy scripts, not shared)
+# ---------------------------------------------------------------------------
+geo-nodes.txt
+geo-domains.txt
+th-pool.conf
+netninja-th-pool.conf
+
+# ---------------------------------------------------------------------------
+# Build output — `make` regenerates all of it into dist/
+# ---------------------------------------------------------------------------
+dist/
+*.exe
+proxy_linux*
+netninja-proxy-linux
+netninja-keepalive-linux
+netninja-proxy-hub-linux
+
+# ---------------------------------------------------------------------------
 # Runtime data
+# ---------------------------------------------------------------------------
 proxy_cache.db
 proxy_cache.db-shm
 proxy_cache.db-wal
+
+# ---------------------------------------------------------------------------
+# Scratch scripts used while probing a Windows box
+# ---------------------------------------------------------------------------
+test_*.ps1
+
+# ---------------------------------------------------------------------------
+# Tooling and OS noise
+# ---------------------------------------------------------------------------
+node_modules/
 __pycache__/
 *.pyc
+.freebuff/
+.claude/
+.DS_Store
+Thumbs.db

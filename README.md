@@ -35,30 +35,54 @@ iPad (Wi-Fi proxy:5988) ──→ Azure VM (proxy:5988) ──→ Internet
 
 ## Components
 
-| Component | Port | Purpose |
-|-----------|------|---------|
-| `proxy.go` | 5988 | Forward proxy (CONNECT + HTTP) |
-| Caddy | 443 | HTTPS termination + reverse proxy |
-| `keepalive_server.go` | 8080 | CGNAT keepalive page |
+| Component | Source | Port | Purpose |
+|-----------|--------|------|---------|
+| Forward proxy | `cmd/proxy` | 5988 | CONNECT + HTTP proxy, geo routing, admin dashboard |
+| Keepalive page | `cmd/keepalive` | 8080 | CGNAT keepalive page + Thailand status |
+| Caddy | — | 443 | HTTPS termination + reverse proxy |
+
+## Repository layout
+
+```
+cmd/proxy/       the forward proxy      — go build ./cmd/proxy
+cmd/keepalive/   the keepalive page     — go build ./cmd/keepalive
+scripts/         netninja-deploy.sh / .ps1, the Thai pool supervisor + its offline test
+examples/        templates to copy: geo-domains, th-pool.conf, netninja.local.ps1
+Makefile         make · test · selftest · check · clean
+dist/            build output, git-ignored — `make` regenerates it
+```
+
+Secrets, per-deployment data and local notes — `azure-sg.key`, `netninja.local.ps1`, `geo-nodes.txt`,
+`geo-domains.txt`, `TROUBLESHOOTING.md` — live **untracked in the repository root**, next to the
+Makefile (see [Moving to another machine](#moving-to-another-machine)).
 
 ## Quick Start
 
 ### Build
 
 ```bash
-# Linux binary
-$env:GOOS="linux"; $env:GOARCH="amd64"; go build -o netninja-proxy-linux proxy.go keepalive_linux.go ansi_other.go
+make                 # linux binaries -> dist/proxy_linux, dist/keepalive_linux
+make host            # the same two for the machine you are on (quick run)
+make test            # offline unit tests
+make selftest        # offline test of the Thai pool supervisor
+make check           # gofmt + vet + test
+make clean           # drop dist/
 
-# Keepalive server
-$env:GOOS="linux"; $env:GOARCH="amd64"; go build -o netninja-keepalive-linux keepalive_server.go
+# or, without make:
+GOOS=linux GOARCH=amd64 go build -trimpath -o dist/proxy_linux ./cmd/proxy
+GOOS=linux GOARCH=amd64 go build -trimpath -o dist/keepalive_linux ./cmd/keepalive
+go test ./cmd/...
 ```
+
+The build stamp is compiled in, so `/geo-check` and the dashboard print exactly which binary is
+running.
 
 ### Deploy to Azure VM
 
 ```bash
 # Copy binaries
-scp -i azure-sg.key netninja-proxy-linux <USER>@<SERVER_IP>:/tmp/proxy_linux
-scp -i azure-sg.key netninja-keepalive-linux <USER>@<SERVER_IP>:/tmp/keepalive_server
+scp -i azure-sg.key dist/proxy_linux <USER>@<SERVER_IP>:/tmp/proxy_linux
+scp -i azure-sg.key dist/keepalive_linux <USER>@<SERVER_IP>:/tmp/keepalive_server
 
 # Deploy
 ssh -i azure-sg.key <USER>@<SERVER_IP> "
@@ -137,10 +161,10 @@ The node list is **data**: `/opt/netninja/geo-nodes.txt` (one `host:port` per li
 ~20 seconds, so a tunnel that comes up later joins the pool with no redeploy. It can also come straight
 from the environment, e.g. `GEO_SOCKS5_POOL="<node1-host:port>,<node2-host:port>"`.
 
-#### Supply side: `netninja-th-pool.sh`
+#### Supply side: `scripts/netninja-th-pool.sh`
 
 The proxy looks after the destination end (probe/rotate) but **never builds a tunnel itself** —
-`netninja-th-pool.sh` is the other half: it keeps the tunnels *underneath* `/opt/netninja/geo-nodes.txt`
+`scripts/netninja-th-pool.sh` is the other half: it keeps the tunnels *underneath* `/opt/netninja/geo-nodes.txt`
 alive on its own, every `CHECK_INTERVAL` (default 60s).
 
 1. checks the endpoint (is SOCKS5 reachable?) and **which country it really exits from**
@@ -153,23 +177,21 @@ alive on its own, every `CHECK_INTERVAL` (default 60s).
 
 Nothing about the VPN stack is assumed: a slot is one endpoint plus an optional command that (re)creates
 it — leave the command out if the tunnel already exists. Configuration lives in
-`/etc/netninja/th-pool.conf`; start from `netninja-th-pool.conf.example`, which carries three patterns
-(tunnels already exist / rebuild each slot / discover listeners that are up).
+`/etc/netninja/th-pool.conf`; start from `examples/netninja-th-pool.conf.example`, which carries three
+patterns (tunnels already exist / rebuild each slot / discover listeners that are up).
 
 ```bash
-sudo ./netninja-th-pool.sh --status          # every slot, its verified country, the published file
-sudo ./netninja-th-pool.sh --dry-run --once  # report only — no replace, no write
-sudo ./netninja-th-pool.sh --once            # check → repair → publish (good for a systemd timer)
-sudo ./netninja-th-pool.sh --daemon          # keep checking every CHECK_INTERVAL (systemd service)
+sudo ./scripts/netninja-th-pool.sh --status          # every slot, its country, the published file
+sudo ./scripts/netninja-th-pool.sh --dry-run --once  # report only — no replace, no write
+sudo ./scripts/netninja-th-pool.sh --once            # check → repair → publish (systemd timer)
+sudo ./scripts/netninja-th-pool.sh --daemon          # keep checking every CHECK_INTERVAL (service)
 ```
 
-The deploy script installs it too — scp `netninja-th-pool.sh` and `netninja-th-pool.conf.example` to
-`/tmp` and run `sudo bash /tmp/netninja-deploy.sh --th-pool` (it places
-`/opt/netninja/netninja-th-pool.sh`, installs the example config, and creates + enables
-`netninja-th-pool.service` — but only once `/etc/netninja/th-pool.conf` exists).
+On the server it is installed as `/opt/netninja/netninja-th-pool.sh` by the deploy script, which also
+uploads `examples/netninja-th-pool.conf.example` and — with `--th-pool`, and only once
+`/etc/netninja/th-pool.conf` exists — creates and enables `netninja-th-pool.service`.
 
-It can be tested offline, with no real tunnel: `bash netninja-th-pool.selftest.sh`
-(stub probe + stub replace commands).
+It can be tested offline, with no real tunnel: `make selftest` (stub probe + stub replace commands).
 
 ### 2. Geo session — Thai ads as well
 
@@ -207,7 +229,7 @@ instead of being refused; outside it they are blocked like any other ad host. Ad
 | `GEO_DOMAINS_URL` | fetched remotely at boot + refreshed every `GEO_REFRESH_HOURS` (default 24h), cached on disk |
 
 A source that fails to load **does not wipe what is already there** (the cache / last known list stays
-in use). Copy `geo-domains.example.txt` to `/opt/netninja/geo-domains.txt` and edit it directly. It
+in use). Copy `examples/geo-domains.example.txt` to `/opt/netninja/geo-domains.txt` and edit it directly. It
 accepts adblock/hosts formats (`||example.com^`, `*.example.com`, `example.com:8080`), matches subdomains
 automatically, and rejects single-label entries (so `tv` cannot match half the internet).
 
@@ -222,8 +244,8 @@ direct and through the pool.
 ### Performance (measured)
 
 - **the dial path of every connection costs only ~211 ns and 0 allocations** (benchmark: a 100k-domain
-  geo list + a 50k ad list, `go test -run '^$' -bench GeoEgressForDialPath -benchmem …`) — millions of
-  times less than the dial RTT (ms)
+  geo list + a 50k ad list, `go test -run '^$' -bench GeoEgressForDialPath -benchmem ./cmd/proxy`) —
+  millions of times less than the dial RTT (ms)
 - a connection that actually egresses Thai adds ~1 µs — insignificant next to a handshake
 - a dead node costs one round trip (failover happens inside the dial), not a long timeout
 - probing is 1 TCP connect / node / 20s + a country check / node / 5m — a tiny load
@@ -291,38 +313,38 @@ client IPs, visited hosts, domain lists), so they are **closed by default**:
 ## Deploy
 
 ```bash
-# tests first (offline: list parsing, pool rotation, session/ads routing, PAC)
-go test proxy.go ansi_windows.go keepalive_windows.go proxy_geo_test.go
+make check                                   # offline: list parsing, pool rotation, ads routing, PAC
+make                                         # -> dist/proxy_linux
 
-go build -o /tmp/proxy_linux_new proxy.go keepalive_linux.go ansi_other.go
-scp -i azure-sg.key /tmp/proxy_linux_new netninja-deploy.sh <USER>@<SERVER_IP>:/tmp/
+# the script must land at /tmp/netninja-deploy.sh, the binary at /tmp/proxy_linux
+scp -i azure-sg.key dist/proxy_linux scripts/netninja-deploy.sh <USER>@<SERVER_IP>:/tmp/
 ssh -i azure-sg.key <USER>@<SERVER_IP> 'sudo bash /tmp/netninja-deploy.sh [--th-egress]'
 
 # ...and hand the server its Thai pool / domain list in the same run:
 ssh -i azure-sg.key <USER>@<SERVER_IP> \
   'sudo bash /tmp/netninja-deploy.sh --th-nodes "<node1-host:port>,<node2-host:port>" --th-pool'
-
 ```
 
-On Windows there is a PowerShell helper (`netninja-deploy.ps1`) that scp's `dist\proxy_linux`
-(plus `geo-nodes.txt` / `geo-domains.txt` when present) and runs the same script over ssh. It carries
-**no server address**: the target comes from `NETNINJA_SERVER` / `NETNINJA_USER` or from a git-ignored
-`netninja.local.ps1` next to the script — so the public host never ends up in this repository (or its
-history).
+On Windows there is a PowerShell helper (`scripts\netninja-deploy.ps1`) that scp's `dist\proxy_linux`
+(plus `geo-nodes.txt` / `geo-domains.txt` when present, and the pool supervisor) and runs the same script
+over ssh. It carries **no server address**: the target comes from `NETNINJA_SERVER` / `NETNINJA_USER` or
+from a git-ignored `netninja.local.ps1` in the repository root — so the public host never ends up in this
+repository (or its history).
 
 Pool and domain list are plain files on the server, so a tunnel that comes up later only needs its
 `host:port` appended to `/opt/netninja/geo-nodes.txt` — the proxy joins it within ~20s. Or let the
-supervisor do that: scp `netninja-th-pool.sh` / `netninja-th-pool.conf.example` along with the binary
-and add `--th-pool` (see *Supply side: `netninja-th-pool.sh`* above).
+supervisor do that: it uploads `scripts/netninja-th-pool.sh` and
+`examples/netninja-th-pool.conf.example` along with the binary, and `--th-pool` installs and enables the
+service (see *Supply side: `scripts/netninja-th-pool.sh`* above).
 
 ### Moving to another machine
 
 Nothing deployment-specific is tracked in this repository, so a new machine just needs the local files
-copied across (all git-ignored):
+copied across (all git-ignored) and a `make` to rebuild `dist/`:
 
 | File | Why |
 |---|---|
-| `netninja.local.ps1` | server host/user for the deploy helper — start from `netninja.local.example.ps1` |
+| `netninja.local.ps1` | server host/user for the deploy helper — start from `examples/netninja.local.example.ps1` |
 | `azure-sg.key` | SSH key for the VM |
 | `geo-nodes.txt` | Thai egress pool, one `host:port` per line |
 | `geo-domains.txt` | geo domain list |
