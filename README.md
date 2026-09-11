@@ -188,8 +188,11 @@ sudo ./scripts/netninja-th-pool.sh --daemon          # keep checking every CHECK
 ```
 
 On the server it is installed as `/opt/netninja/netninja-th-pool.sh` by the deploy script, which also
-uploads `examples/netninja-th-pool.conf.example` and — with `--th-pool`, and only once
-`/etc/netninja/th-pool.conf` exists — creates and enables `netninja-th-pool.service`.
+uploads `examples/netninja-th-pool.conf.example` and — with `--th-pool` — creates and enables
+`netninja-th-pool.service`. When `/etc/netninja/th-pool.conf` does not exist yet it writes a
+discovery-mode one (no slots: every SOCKS5 listener that is up and really exits `EXPECT_COUNTRY` is
+published, which is the zero-config path), and then runs one pass immediately so
+`/opt/netninja/geo-nodes.txt` exists *before* the proxy restarts.
 
 It can be tested offline, with no real tunnel: `make selftest` (stub probe + stub replace commands).
 
@@ -314,20 +317,35 @@ client IPs, visited hosts, domain lists), so they are **closed by default**:
 
 ```bash
 make check                                   # offline: list parsing, pool rotation, ads routing, PAC
-make                                         # -> dist/proxy_linux
+make                                         # -> dist/proxy_linux + dist/keepalive_linux
 
-# the script must land at /tmp/netninja-deploy.sh, the binary at /tmp/proxy_linux
-scp -i azure-sg.key dist/proxy_linux scripts/netninja-deploy.sh <USER>@<SERVER_IP>:/tmp/
+# the script must land at /tmp/netninja-deploy.sh, the binaries at the names the
+# script expects (/tmp/proxy_linux_new, /tmp/keepalive_server_new)
+scp -i azure-sg.key dist/proxy_linux     <USER>@<SERVER_IP>:/tmp/proxy_linux_new
+scp -i azure-sg.key dist/keepalive_linux <USER>@<SERVER_IP>:/tmp/keepalive_server_new
+scp -i azure-sg.key scripts/netninja-deploy.sh <USER>@<SERVER_IP>:/tmp/netninja-deploy.sh
 ssh -i azure-sg.key <USER>@<SERVER_IP> 'sudo bash /tmp/netninja-deploy.sh [--th-egress]'
 
 # ...and hand the server its Thai pool / domain list in the same run:
 ssh -i azure-sg.key <USER>@<SERVER_IP> \
   'sudo bash /tmp/netninja-deploy.sh --th-nodes "<node1-host:port>,<node2-host:port>" --th-pool'
+
+# ...or let the pool be discovered on the server (--th-pool writes a discovery
+# config the first time) and keep the domain list in the repository:
+ssh -i azure-sg.key <USER>@<SERVER_IP> \
+  'sudo bash /tmp/netninja-deploy.sh --th-pool \
+     --geo-url https://raw.githubusercontent.com/<you>/<repo>/main/data/geo-domains.txt'
 ```
 
+One run updates **both** services: the geo data is written *first* (the pool file has to be on disk
+before the proxy starts, because its pool loop only follows edits while it is running), then the proxy
+and the keepalive binary are installed and restarted — each one rolled back on its own if it fails to
+come up. `--no-keepalive` deploys the proxy only; `--geo-url` writes
+`/etc/systemd/system/netninja-proxy.service.d/geo-url.conf` so `GEO_DOMAINS_URL` survives unit edits.
+
 On Windows there is a PowerShell helper (`scripts\netninja-deploy.ps1`) that scp's `dist\proxy_linux`
-(plus `geo-nodes.txt` / `geo-domains.txt` when present, and the pool supervisor) and runs the same script
-over ssh. It carries **no server address**: the target comes from `NETNINJA_SERVER` / `NETNINJA_USER` or
+**and** `dist\keepalive_linux` (plus `geo-nodes.txt` / `geo-domains.txt` when present, and the pool
+supervisor) and runs the same script over ssh. It carries **no server address**: the target comes from `NETNINJA_SERVER` / `NETNINJA_USER` or
 from a git-ignored `netninja.local.ps1` in the repository root — so the public host never ends up in this
 repository (or its history).
 
@@ -355,9 +373,10 @@ tar czf netninja-local.tgz netninja.local.ps1 azure-sg.key geo-nodes.txt geo-dom
 ```
 
 The proxy's own runtime settings live on the **server**, not in this repo: copy
-`/etc/systemd/system/netninja-proxy.service` (plus any `EnvironmentFile=` it points at) so
+`/etc/systemd/system/netninja-proxy.service` (plus everything in
+`/etc/systemd/system/netninja-proxy.service.d/` and any `EnvironmentFile=` it points at) so
 `GEO_SOCKS5_POOL`, `GEO_DOMAINS_FILE`/`GEO_DOMAINS_URL`, `KEEPALIVE_HOST` and the bandwidth limits
-survive the move.
+survive the move — and `/etc/netninja/th-pool.conf` for the pool supervisor.
 
 ## Environment Variables
 

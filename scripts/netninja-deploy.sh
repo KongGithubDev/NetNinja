@@ -1,32 +1,47 @@
 #!/bin/bash
 # NetNinja deploy helper — run as root on the proxy VM.
 #
-#   bash netninja-deploy.sh                        # install /tmp/proxy_linux_new + restart + verify
+#   bash netninja-deploy.sh                        # install /tmp/proxy_linux_new +
+#                                                  # /tmp/keepalive_server_new, restart both, verify
+#   bash netninja-deploy.sh --no-keepalive         # proxy only
 #   bash netninja-deploy.sh --th-egress            # ...and rotate the VPNGate egress to a Thai node
 #   bash netninja-deploy.sh --th-nodes "a:1080,b:1080"
 #                                                  # ...and (re)write the Thai egress pool file
 #   bash netninja-deploy.sh --th-pool               # ...and enable the pool supervisor service
+#   bash netninja-deploy.sh --geo-url "https://raw.githubusercontent.com/<you>/<repo>/main/data/geo-domains.txt"
+#                                                  # ...and point GEO_DOMAINS_URL at a remote list
 #
-# The new binary is expected at /tmp/proxy_linux_new (scp it first), or set
-# NEW_BIN=/path/to/binary. The previous binary is kept as proxy_linux.bak-<timestamp>
-# and is restored automatically if the new one fails to start.
+# The new binaries are expected at /tmp/proxy_linux_new and /tmp/keepalive_server_new
+# (scp them first), or set NEW_BIN= / KEEPALIVE_BIN=. Each previous binary is kept as
+# <name>.bak-<timestamp> and restored automatically if its service fails to start.
 #
-# The Thai pool is data, not code: /opt/netninja/geo-nodes.txt lists one
-# host:port SOCKS5 egress per line and the proxy hot reloads it, so a tunnel
-# that comes up on the server joins the pool without a redeploy.
+# Geo data is written first and the services are restarted last, so a fresh proxy
+# always boots with its domain list and egress pool already on disk — the pool file
+# is only re-read by a pool loop that has to be running, so it must exist at boot.
+#
+# The Thai pool is data, not code: /opt/netninja/geo-nodes.txt lists one host:port
+# SOCKS5 egress per line and the proxy hot reloads it, so a tunnel that comes up on
+# the server joins the pool without a redeploy. With --th-pool the supervisor below
+# publishes that file by itself (discovering live listeners, or the slots you define).
 set -euo pipefail
 
 DEST=/opt/netninja/proxy_linux
 NEW=${NEW_BIN:-/tmp/proxy_linux_new}
+KEEP_DEST=/opt/netninja/keepalive_server
+KEEP_NEW=${KEEPALIVE_BIN:-/tmp/keepalive_server_new}
 TH_EGRESS=0
 TH_NODES=""
 TH_POOL=0
+KEEPALIVE=1
+GEO_URL=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --th-egress) TH_EGRESS=1 ;;
-    --th-nodes)  shift; TH_NODES="${1:-}" ;;
-    --th-pool)   TH_POOL=1 ;;
+    --th-egress)     TH_EGRESS=1 ;;
+    --th-nodes)      shift; TH_NODES="${1:-}" ;;
+    --th-pool)       TH_POOL=1 ;;
+    --geo-url)       shift; GEO_URL="${1:-}" ;;
+    --no-keepalive)  KEEPALIVE=0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
   shift || true
@@ -47,29 +62,23 @@ if [ ! -f "$NEW" ]; then
 fi
 
 STAMP=$(date +%Y%m%d-%H%M%S)
-echo "== backup =="
-cp -a "$DEST" "$DEST.bak-$STAMP"
-ls -l "$DEST" "$DEST.bak-$STAMP"
 
-echo
-echo "== install new binary =="
-systemctl stop netninja-proxy || true
-install -m 0755 "$NEW" "$DEST"
-systemctl start netninja-proxy
-sleep 3
+# ---------------------------------------------------------------------------
+# geo data first: it has to be on disk before the proxy starts
+# ---------------------------------------------------------------------------
 
-if [ "$(systemctl is-active netninja-proxy)" != "active" ]; then
-  echo "!! new binary failed to start — rolling back"
-  journalctl -u netninja-proxy -n 40 --no-pager || true
-  cp -a "$DEST.bak-$STAMP" "$DEST"
-  systemctl start netninja-proxy || true
-  sleep 2
-  echo -n "after rollback service: "
-  systemctl is-active netninja-proxy || true
-  echo "rollback done — binary reverted, geo changes not applied"
-  exit 1
+if [ -n "$GEO_URL" ]; then
+  echo "== proxy drop-in: GEO_DOMAINS_URL =="
+  install -d -m 0755 /etc/systemd/system/netninja-proxy.service.d
+  cat > /etc/systemd/system/netninja-proxy.service.d/geo-url.conf <<CONF
+[Service]
+Environment=GEO_DOMAINS_URL=$GEO_URL
+CONF
+  chmod 0644 /etc/systemd/system/netninja-proxy.service.d/geo-url.conf
+  systemctl daemon-reload
+  echo "GEO_DOMAINS_URL=$GEO_URL"
+  echo "(a list that fails to fetch never wipes the list already on disk)"
 fi
-echo "service: active"
 
 if [ -n "$TH_NODES" ]; then
   echo
@@ -105,12 +114,32 @@ if [ -f /tmp/netninja-th-pool.sh ]; then
   install -m 0755 /tmp/netninja-th-pool.sh /opt/netninja/netninja-th-pool.sh
   [ -f /tmp/netninja-th-pool.conf.example ] && \
     install -m 0644 /tmp/netninja-th-pool.conf.example /etc/netninja/th-pool.conf.example
-  if [ -f /etc/netninja/th-pool.conf ]; then
-    SLOTS=$(grep -cE '^[[:space:]]*SLOT_[0-9]+_SOCKS=' /etc/netninja/th-pool.conf || true)
-    echo "config: /etc/netninja/th-pool.conf (${SLOTS:-0} slot(s) defined)"
-  else
-    echo "no /etc/netninja/th-pool.conf yet — cp /etc/netninja/th-pool.conf.example /etc/netninja/th-pool.conf and edit it"
+  if [ ! -f /etc/netninja/th-pool.conf ]; then
+    echo "-- no /etc/netninja/th-pool.conf — writing the auto-discovery one"
+    cat > /etc/netninja/th-pool.conf <<'CONF'
+# written by netninja-deploy.sh — discovery mode.
+# No slot is managed here: every SOCKS5 listener that is up AND really exits
+# EXPECT_COUNTRY (proven through the tunnel itself) is published to POOL_FILE.
+# Add SLOT_<n>_SOCKS= and SLOT_<n>_REPLACE= to have the script rebuild tunnels
+# too — /etc/netninja/th-pool.conf.example carries the patterns.
+POOL_FILE=/opt/netninja/geo-nodes.txt
+STATE_DIR=/var/lib/netninja-th-pool
+LOG_FILE=/var/log/netninja-th-pool.log
+CHECK_INTERVAL=60
+CHECK_TIMEOUT=12
+EXPECT_COUNTRY=TH
+PROBE_URL="http://ip-api.com/json/?fields=query,country,countryCode,city,isp"
+REPLACE_COOLDOWN=180
+MAX_REPLACES_PER_HOUR=6
+# \$4 is escaped on purpose: this file is *sourced*, so a bare $4 would be
+# expanded away (and trip `set -u`) before the command is ever run.
+DISCOVER_CMD="ss -ltn | awk 'NR>1 {print \$4}' | grep -E ':(1080|1081|1082)$'"
+CONF
+    chmod 0644 /etc/netninja/th-pool.conf
+    echo "(--th-pool will enable the service that publishes /opt/netninja/geo-nodes.txt)"
   fi
+  SLOTS=$(grep -cE '^[[:space:]]*SLOT_[0-9]+_SOCKS=' /etc/netninja/th-pool.conf || true)
+  echo "config: /etc/netninja/th-pool.conf (${SLOTS:-0} managed slot(s))"
 fi
 
 if [ "$TH_POOL" = "1" ]; then
@@ -138,12 +167,66 @@ WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
     systemctl enable --now netninja-th-pool
-    sleep 2
+    sleep 3
     echo -n "netninja-th-pool: "
     systemctl is-active netninja-th-pool || true
     echo "(log: /var/log/netninja-th-pool.log — หรือ journalctl -u netninja-th-pool)"
+    # Publish once now so the pool file exists *before* the proxy restarts: the
+    # proxy only follows pool edits while its pool loop is running, and that loop
+    # starts only when the pool was non-empty at boot.
+    /opt/netninja/netninja-th-pool.sh --once || true
     /opt/netninja/netninja-th-pool.sh --status || true
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# binaries — install and restart, rolling each service back on failure
+# ---------------------------------------------------------------------------
+
+deploy_bin() {
+  local svc="$1" dest="$2" src="$3"
+  echo
+  echo "== $svc: install $(basename "$src") =="
+  if [ -f "$dest" ]; then
+    cp -a "$dest" "$dest.bak-$STAMP"
+    ls -l "$dest" "$dest.bak-$STAMP"
+  else
+    echo "($dest does not exist yet — no backup taken)"
+  fi
+  systemctl stop "$svc" || true
+  install -m 0755 "$src" "$dest"
+  systemctl start "$svc"
+  sleep 3
+  if [ "$(systemctl is-active "$svc")" != "active" ]; then
+    echo "!! $svc failed to start with the new binary — rolling back"
+    journalctl -u "$svc" -n 40 --no-pager || true
+    if [ -f "$dest.bak-$STAMP" ]; then
+      cp -a "$dest.bak-$STAMP" "$dest"
+      systemctl start "$svc" || true
+      sleep 2
+    fi
+    echo -n "after rollback $svc: "
+    systemctl is-active "$svc" || true
+    echo "rollback done — binary reverted"
+    exit 1
+  fi
+  echo "$svc: active"
+}
+
+deploy_bin netninja-proxy "$DEST" "$NEW"
+
+if [ "$KEEPALIVE" = "1" ]; then
+  if [ -f "$KEEP_NEW" ]; then
+    deploy_bin netninja-keepalive "$KEEP_DEST" "$KEEP_NEW"
+    echo -n "keepalive http check: "
+    curl -fsS -o /dev/null -w '%{http_code}\n' --max-time 8 http://127.0.0.1:8080/ || echo "(no answer — journalctl -u netninja-keepalive)"
+  else
+    echo
+    echo "!! $KEEP_NEW missing — keepalive left as it is (scp it first, or set KEEPALIVE_BIN=...)"
+  fi
+else
+  echo
+  echo "(keepalive deploy skipped by --no-keepalive)"
 fi
 
 if [ "$TH_EGRESS" = "1" ]; then

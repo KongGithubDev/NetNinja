@@ -16,12 +16,17 @@
 #   powershell -ExecutionPolicy Bypass -File .\scripts\netninja-deploy.ps1 -ThaiPool
 #
 # What it does:
-#   1. scp the freshly built binary (dist\proxy_linux, see `make`) to /tmp on the VM
+#   1. scp the freshly built binaries (dist\proxy_linux and, when present,
+#      dist\keepalive_linux - see `make`) to /tmp on the VM, so one run updates
+#      the proxy *and* the keepalive page (proxy-only deploys are how the two
+#      drift apart; -NoKeepalive is the explicit opt-out)
 #   2. run /tmp/netninja-deploy.sh there with root privileges
-#      (backup → install → restart → optional Thai egress rotate → verify)
+#      (geo data first -> backup -> install -> restart each service -> optional
+#      Thai egress rotate -> verify, each binary rolled back on its own on failure)
 #   2b. it also uploads scripts/netninja-th-pool.sh (plus
 #      examples/netninja-th-pool.conf.example), and -ThaiPool installs and
-#      enables the systemd service that supervises the tunnels
+#      enables the systemd service that supervises the tunnels (writing a
+#      discovery config when /etc/netninja/th-pool.conf does not exist yet)
 #   3. print /geo-check so you can confirm geo traffic exits from Thailand
 #
 # Secrets and per-deployment data (azure-sg.key, netninja.local.ps1,
@@ -31,9 +36,12 @@ param(
     [string]$User   = $env:NETNINJA_USER,
     [string]$Key    = '',
     [string]$Binary = '',
+    [string]$KeepaliveBinary = '',
     [string]$ThaiNodes = '',
+    [string]$GeoDomainsUrl = '',
     [switch]$ThaiEgress,
     [switch]$ThaiPool,
+    [switch]$NoKeepalive,
     [switch]$SkipUpload
 )
 
@@ -44,6 +52,7 @@ $ErrorActionPreference = 'Stop'
 $Repo = Split-Path -Parent $PSScriptRoot
 if (-not $Key)    { $Key    = Join-Path $Repo 'azure-sg.key' }
 if (-not $Binary) { $Binary = Join-Path $Repo 'dist\proxy_linux' }
+if (-not $KeepaliveBinary) { $KeepaliveBinary = Join-Path $Repo 'dist\keepalive_linux' }
 
 # Local, uncommitted settings win over the environment.
 $localSettings = Join-Path $Repo 'netninja.local.ps1'
@@ -61,6 +70,10 @@ Target host not configured. Set it outside the repository:
 
 if (-not (Test-Path $Key))    { throw "SSH key not found: $Key" }
 if (-not $SkipUpload -and -not (Test-Path $Binary)) { throw "Binary not found: $Binary (build it first, or use -SkipUpload)" }
+if (-not $SkipUpload -and -not $NoKeepalive -and -not (Test-Path $KeepaliveBinary)) {
+    Write-Host "keepalive binary not found ($KeepaliveBinary) - proxy only; build it with `make`, or pass -NoKeepalive to silence this" -ForegroundColor Yellow
+    $NoKeepalive = $true
+}
 
 $target  = "$User@$Server"
 $sshOpts = @('-i', $Key, '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=15')
@@ -69,6 +82,12 @@ if (-not $SkipUpload) {
     Write-Host "== uploading binary ($Binary) ==" -ForegroundColor Cyan
     scp @sshOpts -- $Binary "${target}:/tmp/proxy_linux_new"
     if ($LASTEXITCODE -ne 0) { throw "scp failed" }
+
+    if (-not $NoKeepalive) {
+        Write-Host "== uploading keepalive binary ($KeepaliveBinary) ==" -ForegroundColor Cyan
+        scp @sshOpts -- $KeepaliveBinary "${target}:/tmp/keepalive_server_new"
+        if ($LASTEXITCODE -ne 0) { throw "scp of the keepalive binary failed" }
+    }
 }
 
 # The Thai egress pool and the geo domain list are data files on the server.
@@ -103,9 +122,11 @@ if (Test-Path $supervisor) {
 }
 
 $remoteCmd = 'bash /tmp/netninja-deploy.sh'
-if ($ThaiEgress) { $remoteCmd += ' --th-egress' }
-if ($ThaiNodes)  { $remoteCmd += " --th-nodes '$ThaiNodes'" }
-if ($ThaiPool)   { $remoteCmd += ' --th-pool' }
+if ($ThaiEgress)    { $remoteCmd += ' --th-egress' }
+if ($ThaiNodes)     { $remoteCmd += " --th-nodes '$ThaiNodes'" }
+if ($ThaiPool)      { $remoteCmd += ' --th-pool' }
+if ($GeoDomainsUrl) { $remoteCmd += " --geo-url '$GeoDomainsUrl'" }
+if ($NoKeepalive)   { $remoteCmd += ' --no-keepalive' }
 
 Write-Host "== remote root password for $target (only used for this command) ==" -ForegroundColor Yellow
 $secure = Read-Host -AsSecureString -Prompt "password"
