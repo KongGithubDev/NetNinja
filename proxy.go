@@ -1874,7 +1874,7 @@ func setDomainRule(host string, rule string, cisco bool) {
 
 // unwrapCiscoDomain extracts the original domain or IP from Cisco SSE wrapped hostnames
 // Case 1: web.cloudmoonapp.com.x.bdd7...sse.cisco-secure.com -> web.cloudmoonapp.com
-// Case 2: bc2c576109ac804ca...sse.cisco-secure.com -> <SERVER_IP> (Hex IP)
+// Case 2: bc2c576109ac804ca...sse.cisco-secure.com -> <resolved-ip> (Hex IP)
 func unwrapCiscoDomain(host string) string {
 	if !strings.Contains(host, ".sse.cisco-secure.com") {
 		return host

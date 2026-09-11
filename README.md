@@ -113,7 +113,7 @@ OmeTV ──TLS/WS──> proxy (MY) ──SOCKS5──> Thai pool ──> OmeTV
 
 รายชื่อ node เป็น **data**: `/opt/netninja/geo-nodes.txt` (บรรทัดละ `host:port`) proxy
 hot reload ทุก ~20 วินาที → tunnel ที่ server เพิ่งเปิดจะเข้าร่วม pool เองโดยไม่ต้อง deploy ซ้ำ
-(หรือส่งผ่าน `GEO_SOCKS5_POOL="<TH_EGRESS_1>:1080,<TH_EGRESS_2>:1080"` ก็ได้)
+(หรือส่งผ่าน env ตรง ๆ ก็ได้ เช่น `GEO_SOCKS5_POOL="<node1-host:port>,<node2-host:port>"`)
 
 ### 2. Geo session — ให้ ad slot ออกไทยด้วย
 
@@ -193,7 +193,7 @@ ssh -i azure-sg.key <USER>@<SERVER_IP> 'sudo bash /tmp/netninja-deploy.sh [--th-
 
 # ...and hand the server its Thai pool / domain list in the same run:
 ssh -i azure-sg.key <USER>@<SERVER_IP> \
-  'sudo bash /tmp/netninja-deploy.sh --th-nodes "<TH_EGRESS_1>:1080,<TH_EGRESS_2>:1080"'
+  'sudo bash /tmp/netninja-deploy.sh --th-nodes "<node1-host:port>,<node2-host:port>"'
 
 ```
 
@@ -205,6 +205,28 @@ ends up in this repository (or its history).
 
 Pool and domain list are plain files on the server, so a tunnel that comes up later only needs
 its `host:port` appended to `/opt/netninja/geo-nodes.txt` — the proxy joins it within ~20s.
+
+### Moving to another machine
+
+Nothing deployment-specific is tracked in this repository, so a new machine just needs the
+local files copied across (all git-ignored):
+
+| File | Why |
+|---|---|
+| `netninja.local.ps1` | server host/user for the deploy helper — start from `netninja.local.example.ps1` |
+| `azure-sg.key` | SSH key for the VM |
+| `geo-nodes.txt` | Thai egress pool, one `host:port` per line |
+| `geo-domains.txt` | geo domain list |
+| `TROUBLESHOOTING.md` | local notes (deliberately not in the repo) |
+
+```bash
+tar czf netninja-local.tgz netninja.local.ps1 azure-sg.key geo-nodes.txt geo-domains.txt TROUBLESHOOTING.md
+```
+
+The proxy's own runtime settings live on the **server**, not in this repo: copy
+`/etc/systemd/system/netninja-proxy.service` (plus any `EnvironmentFile=` it points at) so
+`GEO_SOCKS5_POOL`, `GEO_DOMAINS_FILE`/`GEO_DOMAINS_URL`, `KEEPALIVE_HOST` and the bandwidth
+limits survive the move.
 
 ## Environment Variables
 
@@ -252,6 +274,8 @@ its `host:port` appended to `/opt/netninja/geo-nodes.txt` — the proxy joins it
 | `ADBLOCK_URL` | - | URL to ad blocklist |
 | `PROXY_ADDR` | - | Server public address |
 | `KEEPALIVE_HOST` | - | Hostname logged specially as a keepalive ping (keeps real domains out of the source) |
+| `TH_ROTATE_CMD` | `/opt/vpngate/vpngate-rotate.sh --force` | (deploy script) command used to rotate the egress on the server |
+| `HOP_SOCKS5` / `GEO_SOCKS5` | - | (server env) address the deploy script probes after rotating |
 
 ## Troubleshooting
 

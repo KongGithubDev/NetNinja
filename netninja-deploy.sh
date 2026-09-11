@@ -92,14 +92,26 @@ if [ -f /tmp/geo-domains.txt ]; then
 fi
 
 if [ "$TH_EGRESS" = "1" ]; then
+  # No egress address is hardcoded here: take it from HOP_SOCKS5, from the geo
+  # pool file, or from GEO_SOCKS5 in the proxy's own environment.
+  EGRESS="${HOP_SOCKS5:-${GEO_SOCKS5:-}}"
+  if [ -z "$EGRESS" ] && [ -s /opt/netninja/geo-nodes.txt ]; then
+    EGRESS=$(grep -vE '^[[:space:]]*(#|$)' /opt/netninja/geo-nodes.txt | head -1 | tr -d ' \r\n')
+  fi
+  ROTATE_CMD="${TH_ROTATE_CMD:-/opt/vpngate/vpngate-rotate.sh --force}"
   echo
-  echo "== rotate VPNGate egress, preferring Thailand =="
-  /opt/vpngate/vpngate-rotate.sh --force || true
+  echo "== rotate egress, preferring Thailand ($ROTATE_CMD) =="
+  # shellcheck disable=SC2086
+  $ROTATE_CMD || true
   sleep 2
-  echo -n "hop egress now: "
-  curl -s --max-time 12 --socks5-hostname <TH_EGRESS_1>:1080 https://ipinfo.io/json | tr -d '\n ' | head -c 220
-  echo
-  echo "(ดู /var/log/vpngate-rotate.log ถ้ามันไม่ยอมออกไทย — VPNGate ไม่มี node ไทยที่ใช้ได้เสมอ)"
+  if [ -n "$EGRESS" ]; then
+    echo -n "egress ($EGRESS) now: "
+    curl -s --max-time 12 --socks5-hostname "$EGRESS" https://ipinfo.io/json | tr -d '\n ' | head -c 220
+    echo
+  else
+    echo "(no egress address known — ตั้ง HOP_SOCKS5 หรือใส่ node ลง /opt/netninja/geo-nodes.txt ก่อน)"
+  fi
+  echo "(ดู log ของสคริปต์หมุน (ค่าเริ่มต้น /var/log/vpngate-rotate.log) ถ้ามันไม่ยอมออกไทย — VPNGate ไม่มี node ไทยที่ใช้ได้เสมอ)"
   echo "สำหรับ pool หลาย node: ให้สคริปต์ฝั่ง server ของคุณ append host:port ลง /opt/netninja/geo-nodes.txt"
 fi
 
