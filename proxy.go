@@ -2232,6 +2232,9 @@ p{color:#888;margin-bottom:25px}
 		if path == "/geo-check" {
 			serveGeoCheck(w, r)
 			return
+		} else if path == "/geo-bench" {
+			serveGeoBench(w, r)
+			return
 		} else if path == "/block-check" {
 			serveBlockCheck(w, r)
 			return
@@ -6438,14 +6441,26 @@ func geoTargetExcluded(host, address string) bool {
 // actually inside a geo session.
 func geoEgressFor(ctx context.Context, host, address string) (bool, string) {
 	if inGeoDomains(host) {
+		// Only a self/CDN host on the geo list is sent direct; everything else
+		// on the list has to exit Thai.
+		if geoTargetExcluded(host, address) {
+			return false, ""
+		}
 		return true, "geo"
+	}
+
+	// Fast path for the vast majority of dials: no geo session open and global ad
+	// localisation off means nothing else can be routed, so the CDN/blocklist
+	// checks are skipped entirely.
+	key := geoKeyFromCtx(ctx)
+	inSession := geoSessionMode != "off" && geoSessionFresh(key)
+	if !geoAdsGlobal && !inSession {
+		return false, ""
 	}
 	if geoTargetExcluded(host, address) {
 		return false, ""
 	}
-	key := geoKeyFromCtx(ctx)
-	inSession := geoSessionMode != "off" && geoSessionFresh(key)
-	if (geoAdsGlobal || inSession) && isAdBlockedHost(host) {
+	if isAdBlockedHost(host) {
 		return true, "ad"
 	}
 	if inSession && geoSessionMode == "all" {
@@ -6496,21 +6511,9 @@ func geoLookupCountry(dial func(ctx context.Context) (net.Conn, error)) string {
 
 // geoLookup returns both the human readable egress info and the country code
 // ("TH", "JP", …). cc is empty when the lookup failed.
-func geoLookup(dial func(ctx context.Context) (net.Conn, error)) (info string, cc string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	c, err := dial(ctx)
-	if err != nil {
-		return "error: " + err.Error(), ""
-	}
-	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(8 * time.Second))
-	req := "GET /json/?fields=query,country,countryCode,city,isp HTTP/1.0\r\nHost: ip-api.com\r\nUser-Agent: netninja-geo\r\nConnection: close\r\n\r\n"
-	if _, err := c.Write([]byte(req)); err != nil {
-		return "error: " + err.Error(), ""
-	}
-	body, _ := io.ReadAll(io.LimitReader(c, 8192))
-	s := string(body)
+const geoProbeRequest = "GET /json/?fields=query,country,countryCode,city,isp HTTP/1.0\r\nHost: ip-api.com\r\nUser-Agent: netninja-geo\r\nConnection: close\r\n\r\n"
+
+func parseGeoProbe(s string) (info, cc string) {
 	if i := strings.Index(s, "\r\n\r\n"); i >= 0 {
 		s = s[i+4:]
 	} else if i := strings.Index(s, "\n\n"); i >= 0 {
@@ -6528,6 +6531,33 @@ func geoLookup(dial func(ctx context.Context) (net.Conn, error)) (info string, c
 		return "unparsable: " + s, ""
 	}
 	return fmt.Sprintf("%s (%s, %s, %s)", out.Query, out.CountryCode, out.City, out.ISP), strings.ToUpper(out.CountryCode)
+}
+
+// geoProbe measures one egress end to end: how long the connection took to
+// open, how long a complete answer took, and which country it really exits from.
+func geoProbe(dial func(ctx context.Context) (net.Conn, error)) (info, cc string, connect, total time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	c, err := dial(ctx)
+	if err != nil {
+		return "error: " + err.Error(), "", time.Since(start), 0
+	}
+	defer c.Close()
+	connect = time.Since(start)
+	_ = c.SetDeadline(time.Now().Add(8 * time.Second))
+	if _, err := c.Write([]byte(geoProbeRequest)); err != nil {
+		return "error: " + err.Error(), "", connect, 0
+	}
+	body, _ := io.ReadAll(io.LimitReader(c, 8192))
+	total = time.Since(start)
+	info, cc = parseGeoProbe(string(body))
+	return info, cc, connect, total
+}
+
+func geoLookup(dial func(ctx context.Context) (net.Conn, error)) (info string, cc string) {
+	info, cc, _, _ = geoProbe(dial)
+	return info, cc
 }
 
 func logGeoEgressCountry() {
@@ -6552,6 +6582,86 @@ func logGeoEgressCountry() {
 		status = "WRONG COUNTRY — the pool will stop using this node"
 	}
 	log.Printf("%s[GEO]%s egress check — direct: %s | geo(%s): %s (expect %s → %s)", colorGreen, colorReset, direct, server, via, want, status)
+}
+
+var geoBenchMu sync.Mutex
+
+func geoTCPRTT(addr string) time.Duration {
+	d := &net.Dialer{Timeout: geoPoolTimeout}
+	start := time.Now()
+	c, err := d.Dial("tcp", addr)
+	if err != nil {
+		return 0
+	}
+	c.Close()
+	return time.Since(start)
+}
+
+// serveGeoBench measures every path side by side — direct and each pool node —
+// so "is the Thai egress slower, and by how much?" is answered with numbers from
+// the server instead of a guess. It is read-only: pool health and the current
+// node are not touched.
+func serveGeoBench(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	if !geoBenchMu.TryLock() {
+		fmt.Fprintln(w, "bench already running — try again in a moment")
+		return
+	}
+	defer geoBenchMu.Unlock()
+
+	fmt.Fprintf(w, "netninja geo-bench (build %s)\n", buildTime)
+	fmt.Fprintf(w, "expect country: %s   pool: %d node(s)   current: %s\n", geoExpectCountry(), geoPoolSize(), geoPoolCurrentAddr())
+	fmt.Fprintf(w, "(connect = time to open the egress connection, total = time to a full answer through it)\n\n")
+	fmt.Fprintf(w, "%-26s %-11s %-11s %-11s %s\n", "target", "tcp", "connect", "total", "country")
+
+	row := func(target string, tcp, connect, total time.Duration, cc, note string) {
+		dash := func(d time.Duration) string {
+			if d <= 0 {
+				return "-"
+			}
+			return d.Round(time.Millisecond).String()
+		}
+		flag := ""
+		if cc != "" && !strings.EqualFold(cc, geoExpectCountry()) {
+			flag = "  <-- NOT " + geoExpectCountry()
+		}
+		fmt.Fprintf(w, "%-26s %-11s %-11s %-11s %s%s%s\n", target, dash(tcp), dash(connect), dash(total), geoCountryOrDash(cc), flag, note)
+	}
+
+	_, ccDirect, connectDirect, totalDirect := geoProbe(func(ctx context.Context) (net.Conn, error) {
+		return customDialer.DialContext(ctx, "tcp", "ip-api.com:80")
+	})
+	row("direct (this server)", geoTCPRTT("ip-api.com:80"), connectDirect, totalDirect, ccDirect, "")
+
+	cur := geoPoolCurrentAddr()
+	for _, n := range geoPoolSnapshot() {
+		_, cc, connect, total := geoProbe(func(ctx context.Context) (net.Conn, error) {
+			return dialSocks5(ctx, n.addr, "ip-api.com:80")
+		})
+		_, _, _, _, slows, lerr, _ := n.snapshot()
+		note := ""
+		if n.addr == cur {
+			note = "  CURRENT"
+		}
+		if slows > 0 {
+			note += fmt.Sprintf("  slow=%d", slows)
+		}
+		if lerr != "" {
+			note += "  last_err=" + lerr
+		}
+		row(n.addr, geoTCPRTT(n.addr), connect, total, cc, note)
+	}
+
+	if hopSocks5 != "" && hopSocks5 != cur {
+		_, cc, connect, total := geoProbe(func(ctx context.Context) (net.Conn, error) {
+			return dialSocks5(ctx, hopSocks5, "ip-api.com:80")
+		})
+		row(hopSocks5+" (shared hop)", geoTCPRTT(hopSocks5), connect, total, cc, "")
+	}
+
+	fmt.Fprintf(w, "\nอ่านผล: 'total' ที่เกิน direct มาก ๆ = tunnel นั้นช้า (pool จะหมุนออกเองเมื่อช้าเกิน %v ติดกัน %d ครั้ง)\n",
+		geoPoolMaxRTT, geoPoolSlowHits)
 }
 
 // serveGeoCheck renders the geo routing state plus the real egress IP/country

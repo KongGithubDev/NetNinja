@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -62,7 +63,7 @@ func TestInGeoDomainsMatchesSubdomainsOnly(t *testing.T) {
 	}
 }
 
-func resetGeoPoolForTest(t *testing.T, addrs ...string) []*geoNode {
+func resetGeoPoolForTest(t testing.TB, addrs ...string) []*geoNode {
 	t.Helper()
 	geoPoolMu.Lock()
 	geoPool = nil
@@ -220,6 +221,72 @@ func TestGeoAdsGlobalRoutesEveryClient(t *testing.T) {
 	if via, why := geoEgressFor(ctx, "static.doubleclick.net", ""); !via || why != "ad" {
 		t.Fatalf("GEO_ADS_EGRESS=1 must localise ads for every client, got (%v,%q)", via, why)
 	}
+}
+
+// BenchmarkGeoEgressForDialPath measures what every connection pays for geo
+// routing: with a 100k-entry domain list and a 50k-entry ad list loaded, the
+// common path must stay in the nanosecond range so the pool costs nothing next
+// to the dial itself.
+func BenchmarkGeoEgressForDialPath(b *testing.B) {
+	list := make([]string, 0, 100000)
+	list = append(list, "ome.tv", "chatroulette.com")
+	for i := 0; i < 100000; i++ {
+		list = append(list, fmt.Sprintf("site%d.example%d.com", i, i%997))
+	}
+	geoDomains.Store(buildGeoDomainSet(list))
+	defer geoDomains.Store(&geoDomainSet{set: map[string]struct{}{}})
+
+	adBlockMu.Lock()
+	prevDoms := adBlockDomains
+	doms := make(map[string]struct{}, 50000)
+	for i := 0; i < 50000; i++ {
+		doms[fmt.Sprintf("ad%d.tracker%d.net", i, i%97)] = struct{}{}
+	}
+	adBlockDomains = doms
+	adBlockMu.Unlock()
+	defer func() {
+		adBlockMu.Lock()
+		adBlockDomains = prevDoms
+		adBlockMu.Unlock()
+	}()
+
+	geoPoolMaxRTT = 1500 * time.Millisecond
+	geoPoolSlowHits = 3
+	geoPoolFailHits = 2
+	resetGeoPoolForTest(b, "a:1080", "b:1080", "c:1080")
+
+	prevMode, prevTTL := geoSessionMode, geoSessionTTL
+	geoSessionMode, geoSessionTTL = "all", time.Minute
+	defer func() { geoSessionMode, geoSessionTTL = prevMode, prevTTL }()
+
+	plain := ctxWithGeoKey(context.Background(), "ip:203.0.113.9")
+	session := ctxWithGeoKey(context.Background(), "ip:198.51.100.7")
+	noteGeoSession("ip:198.51.100.7")
+
+	b.Run("no-session-common-path", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if via, _ := geoEgressFor(plain, "www.somewhere.example", "93.184.216.34:443"); via {
+				b.Fatal("unexpected Thai egress")
+			}
+		}
+	})
+	b.Run("geo-domain-hit", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if via, why := geoEgressFor(plain, "www.ome.tv", "93.184.216.34:443"); !via || why != "geo" {
+				b.Fatalf("got (%v,%q)", via, why)
+			}
+		}
+	})
+	b.Run("inside-session", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, why := geoEgressFor(session, "www.somewhere.example", "93.184.216.34:443"); why != "session" {
+				b.Fatalf("got %q", why)
+			}
+		}
+	})
 }
 
 func TestServePACIsUsableByIPadOS(t *testing.T) {

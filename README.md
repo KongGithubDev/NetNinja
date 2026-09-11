@@ -152,6 +152,19 @@ DNS ยัง resolve ที่ proxy (มี DoH fallback) ดังนั้�
 (`CURRENT` / `ok` / `unusable`, ประเทศ, RTT, fails), โหมด session, ที่มา/จำนวนโดเมน
 และประเทศของ egress จริงทั้ง direct และผ่าน pool
 
+### Performance (วัดจริง)
+
+- **dial path ของทุก connection เพิ่มแค่ ~211 ns และ 0 allocation** (benchmark: ลิสต์ 100k โดเมน
+  + ad list 50k, `go test -run '^$' -bench GeoEgressForDialPath -benchmem …`) — น้อยกว่า RTT ของ
+  การ dial (ms) หลายล้านเท่า
+- connection ที่ต้องออกไทยเพิ่ม ~1 µs (ต่อ connection) — ไม่มีนัยสำคัญเทียบ handshake
+- node ตาย = เสียเวลาแค่ round trip เดียว (failover ในตัว dial) ไม่ใช่รอ timeout ยาว
+- probe = 1 TCP connect / node / 20s + เช็คประเทศ 1 ครั้ง / node / 5m → load จิ๋วมาก
+  (ไม่กี่ request ต่อ 5 นาที ไม่กระทบข้อมูล ip-api free tier)
+- ตัวที่ช้าจริงคือ **tunnel เอง ไม่ใช่ proxy** — วัดได้ที่ `http://<server>:5988/geo-bench`
+  (ตาราง direct vs แต่ละ node: `tcp` / `connect` / `total` + ประเทศ) โดยไม่รบกวนสถานะ pool
+- video/CDN และโดเมนที่ PAC ส่ง `DIRECT` อยู่นอกเส้นทางไทยเสมอ → YouTube/Netflix ไม่ถูกดึงผ่าน VPN
+
 ### Country guard
 
 Country guard ยังอยู่ แต่เปลี่ยนหน้าที่: pool หมุนระหว่าง node ที่ยัง live เองอยู่แล้ว guard จึง
@@ -278,6 +291,9 @@ limits survive the move.
 | `HOP_SOCKS5` / `GEO_SOCKS5` | - | (server env) address the deploy script probes after rotating |
 
 ## Troubleshooting
+
+วัดความเร็วก่อนตัดสินใจอะไร: `http://<server>:5988/geo-bench` (อ่าน `total` ของแต่ละ node
+เทียบ `direct` — ถ้าเกิน 2-3 เท่าให้ทิ้ง node นั้น หรือลด `GEO_POOL_MAX_RTT`)
 
 `TROUBLESHOOTING.md` is kept **local only** (not tracked in this repository), so the quick checks
 live here:
