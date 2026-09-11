@@ -28,6 +28,9 @@ netninja-keepalive-linux
 # Test scripts
 test_*.ps1
 
+# Local-only docs (kept on disk, never published)
+TROUBLESHOOTING.md
+
 # Runtime data
 proxy_cache.db
 proxy_cache.db-shm
