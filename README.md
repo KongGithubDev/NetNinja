@@ -196,6 +196,25 @@ published, which is the zero-config path), and then runs one pass immediately so
 
 It can be tested offline, with no real tunnel: `make selftest` (stub probe + stub replace commands).
 
+#### The other half of the supply side: `scripts/vpngate/`
+
+The supervisor decides *what* to publish; `scripts/vpngate/` is the machinery underneath it — the OpenVPN
+`--up`/`--down` hooks that give each slot its own tun, source address, routing table and SOCKS5 listener, the
+failover and watchdog for the legacy slot 1, the per-slot rebuild command (`SLOT_<n>_REPLACE`), the systemd
+template for numbered slots, and the installer that puts them all in place. Slot 1 stays the pre-existing
+`vpngate-th.service`; numbered slots are installed and then owned by the supervisor.
+
+```bash
+scp -r scripts/vpngate <user>@<vm>:/tmp/netninja-slots
+ssh <user>@<vm> 'sudo bash /tmp/netninja-slots/install-slots.sh'    # SLOTS="2 3" to add slots
+```
+
+These scripts only lived on the server before, so a rebuilt VM had to be reverse-engineered from its running
+config. See [`scripts/vpngate/README.md`](scripts/vpngate/README.md) for the install map and for the handful
+of invariants that each cost an outage to learn (success means *exits the expected country*, not *answers 200*;
+one rotation at a time; kill by address rather than by binary name; test tunnels must not outlive their
+attempt).
+
 #### Health check: `scripts/netninja-pool-health.sh`
 
 A pool is only as good as its spare: with two verified nodes one can die and traffic keeps leaving Thai; with

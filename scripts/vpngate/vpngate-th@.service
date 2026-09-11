@@ -1,0 +1,19 @@
+[Unit]
+Description=VPNGate TH OpenVPN slot %i (confined: its own tun + routing table)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --dev tun%i is what the hooks key on (they derive the slot from the device
+# name); --setenv SLOT %i is only a belt-and-braces fallback, because OpenVPN
+# does not hand the unit's environment through to --up/--down scripts.
+Environment=SLOT=%i
+ExecStart=/usr/sbin/openvpn --config /opt/vpngate/slot%i.ovpn --auth-user-pass /opt/vpngate/auth.txt --dev tun%i --setenv SLOT %i --route-nopull --script-security 2 --up /opt/vpngate/slot-up.sh --down /opt/vpngate/slot-down.sh --connect-retry 5 --connect-timeout 10 --ping 10 --ping-restart 30
+ExecStopPost=/opt/vpngate/slot-down.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
