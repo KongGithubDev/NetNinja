@@ -88,104 +88,148 @@ TOT FTTH uses CGNAT with ~4-5 min idle timeout. The keepalive page sends periodi
 - **Audio loop**: Keeps Safari JS alive when backgrounded
 - **Auto-reconnect**: Resumes on `visibilitychange` / `pageshow`
 
-## Geo Routing — ออกไทยเสถียรด้วย Thai egress pool
+## Geo Routing — stable Thai egress via a Thai egress pool
 
-Forward proxy ทำให้ปลายทางเห็น **IP ของ proxy** เสมอ server ที่มาเลเซียจึงดูเป็นมาเลเซียต่อ
-OmeTV → จับคู่ได้แต่คนมาเลเซีย โดเมนที่อยู่ใน **geo list** จะถูก dial ผ่าน Thai egress pool
-แทน ปลายทางจึงเห็นเป็นไทย
+A forward proxy always shows the destination the **proxy's own IP**, so a server in Malaysia looks
+Malaysian to OmeTV and only matches Malaysian peers. Hosts on the **geo list** are dialled through the
+Thai egress pool instead, so the destination sees Thailand.
 
 ```
-OmeTV ──TLS/WS──> proxy (MY) ──SOCKS5──> Thai pool ──> OmeTV เห็นเป็น TH
+OmeTV ──TLS/WS──> proxy (MY) ──SOCKS5──> Thai pool ──> OmeTV sees TH
 ```
 
-### 1. Thai egress pool — หลาย node + node สำรอง + auto-rotate
+### 1. Thai egress pool — several nodes + backups + auto-rotate
 
-`GEO_SOCKS5_POOL` รับ SOCKS5 egress หลายตัว (แต่ละตัวคือ tunnel ไทยหนึ่งเส้นบน server) แล้ว proxy จะ
+`GEO_SOCKS5_POOL` takes several SOCKS5 egress entries (each one is a Thai tunnel on the server), and the proxy
 
-- **probe ทุก node** ทุก `GEO_POOL_PROBE` (ค่าเริ่มต้น 20s) วัด RTT จริง
-- **ยืนยันประเทศจริง**ของแต่ละ node ผ่าน ip-api ทุก `GEO_POOL_GEOCHECK` (ค่าเริ่มต้น 5m) —
-  node ที่ออกประเทศอื่นจะ **ไม่ถูกใช้เลย** ไม่มีการหมุนข้ามชาติแบบเงียบ ๆ
-- **เกาะ node ปัจจุบันไว้** ตราบใดที่ยังเร็วและยังออกไทย (OmeTV จึงไม่ถูกตัดกลางบทสนทนา)
-- **หมุนทันที** เมื่อ node ตาย (`GEO_POOL_FAIL_STRIKES` ครั้งติด) หรือช้ากว่า `GEO_POOL_MAX_RTT`
-  ติดกัน `GEO_POOL_SLOW_STRIKES` ครั้ง และ **failover ภายใน dial เดียว** จึงเสียแค่ round trip เดียว
-- ถ้าไม่มี node ไทยที่ใช้ได้เลย จะเรียก `GEO_ROTATE_CMD` ให้ server สร้าง tunnel ใหม่ (มี cooldown/backoff)
-- `GEO_STRICT=1` (ค่าเริ่มต้น) — ถ้าไม่มี egress ไทย จะ **fail** แทนที่จะหลุดออกจาก IP ของ server เอง
+- **probes every node** every `GEO_POOL_PROBE` (default 20s) and measures real RTT
+- **verifies the country each node really exits from** through ip-api every `GEO_POOL_GEOCHECK`
+  (default 5m) — a node exiting anywhere else is **never used**, so there is no silent cross-country rotation
+- **stays on the current node** for as long as it is fast and still exits Thailand
+  (so OmeTV conversations are not cut in the middle)
+- **rotates immediately** when a node dies (`GEO_POOL_FAIL_STRIKES` in a row) or is slower than
+  `GEO_POOL_MAX_RTT` for `GEO_POOL_SLOW_STRIKES` in a row, and **fails over inside a single dial**,
+  so a dead node costs one round trip instead of a timeout
+- calls `GEO_ROTATE_CMD` to have the server build a new tunnel when no Thai node is usable at all
+  (with cooldown/backoff)
+- `GEO_STRICT=1` (default) — **fails** instead of leaking out through the server's own country
+  when no Thai egress is available
 
-รายชื่อ node เป็น **data**: `/opt/netninja/geo-nodes.txt` (บรรทัดละ `host:port`) proxy
-hot reload ทุก ~20 วินาที → tunnel ที่ server เพิ่งเปิดจะเข้าร่วม pool เองโดยไม่ต้อง deploy ซ้ำ
-(หรือส่งผ่าน env ตรง ๆ ก็ได้ เช่น `GEO_SOCKS5_POOL="<node1-host:port>,<node2-host:port>"`)
+The node list is **data**: `/opt/netninja/geo-nodes.txt` (one `host:port` per line) is hot reloaded every
+~20 seconds, so a tunnel that comes up later joins the pool with no redeploy. It can also come straight
+from the environment, e.g. `GEO_SOCKS5_POOL="<node1-host:port>,<node2-host:port>"`.
 
-### 2. Geo session — ให้ ad slot ออกไทยด้วย
+#### Supply side: `netninja-th-pool.sh`
 
-หน้าเว็บหนึ่งหน้าดึง third-party มาหลายสิบโดเมน (ad slot, captcha, analytics) ซึ่งไม่มีลิสต์ไหนไล่ครบ
-และ **ad slot คือจุดที่ประเทศโผล่ชัดที่สุด** เพราะ ad network ยิงโฆษณาตาม IP ที่มันเห็น
-พอ client เข้าโดเมนใน geo list แล้ว proxy จะ **mark session ของ client นั้น** (`GEO_SESSION_TTL`
-ค่าเริ่มต้น 15m) แล้วทุกอย่างที่โหลดตามมาในหน้านั้นออกไทยตามไปด้วย เว้นแต่
+The proxy looks after the destination end (probe/rotate) but **never builds a tunnel itself** —
+`netninja-th-pool.sh` is the other half: it keeps the tunnels *underneath* `/opt/netninja/geo-nodes.txt`
+alive on its own, every `CHECK_INTERVAL` (default 60s).
 
-- โดเมนที่ PAC ส่ง `DIRECT` อยู่แล้ว (speedtest/apple/googlevideo) และ video/CDN → คงความเร็วเดิม
-- ตัว server เอง (keepalive/dashboard) → ไม่ถูกดันผ่าน VPN
-- โฮสต์ใน `GEO_SESSION_EXCLUDE` ที่กำหนดเพิ่ม
+1. checks the endpoint (is SOCKS5 reachable?) and **which country it really exits from**
+   (asks ip-api **through that tunnel**)
+2. replaces a dead slot or one exiting the wrong country by running that slot's `SLOT_<n>_REPLACE`
+   (cooldown **per slot** plus a shared hourly cap, so a broken slot cannot become a rotate storm)
+3. **publishes only endpoints that just verified** as the expected country, atomically, and writes the
+   pool file only when its content actually changes — with no healthy node at all it **leaves the old
+   file untouched** (exit 3, so monitoring can alert on it)
 
-**โฆษณา:** ตัวตัดสินว่าโฮสต์ไหน "เป็นโฆษณา" คือ **blocklist จริงที่ proxy โหลดอยู่แล้ว**
-(`ADBLOCK_URL` / `ADBLOCK_PATH` เช่น HaGeZi) ไม่ใช่ลิสต์ที่ hardcode ในโค้ด — โฮสต์ที่ถูกตัดสินว่าเป็น
-โฆษณาและอยู่ใน geo session จะ **ไม่ถูกบล็อก แต่ถูกส่งออกไทย** จึงได้โฆษณาไทยในหน้านั้น
-(ตั้ง `GEO_ADS_EGRESS=1` ถ้าอยากให้โฆษณาออกไทยทุก client, `GEO_SESSION=ads|off` เพื่อเลือกโหมด)
+Nothing about the VPN stack is assumed: a slot is one endpoint plus an optional command that (re)creates
+it — leave the command out if the tunnel already exists. Configuration lives in
+`/etc/netninja/th-pool.conf`; start from `netninja-th-pool.conf.example`, which carries three patterns
+(tunnels already exist / rebuild each slot / discover listeners that are up).
 
-### 3. Geo domain list — ไม่มีลิสต์ในโค้ด
+```bash
+sudo ./netninja-th-pool.sh --status          # every slot, its verified country, the published file
+sudo ./netninja-th-pool.sh --dry-run --once  # report only — no replace, no write
+sudo ./netninja-th-pool.sh --once            # check → repair → publish (good for a systemd timer)
+sudo ./netninja-th-pool.sh --daemon          # keep checking every CHECK_INTERVAL (systemd service)
+```
 
-**ไม่มีโดเมนใดถูก compile เข้าไปใน binary** เลย proxy รวมรายการจาก
+The deploy script installs it too — scp `netninja-th-pool.sh` and `netninja-th-pool.conf.example` to
+`/tmp` and run `sudo bash /tmp/netninja-deploy.sh --th-pool` (it places
+`/opt/netninja/netninja-th-pool.sh`, installs the example config, and creates + enables
+`netninja-th-pool.service` — but only once `/etc/netninja/th-pool.conf` exists).
 
-| Source | รายละเอียด |
+It can be tested offline, with no real tunnel: `bash netninja-th-pool.selftest.sh`
+(stub probe + stub replace commands).
+
+### 2. Geo session — Thai ads as well
+
+One web page pulls in dozens of third-party domains (ad slots, captcha, analytics) and no list covers
+them all — and the **ad slot is where the country shows most clearly**, because the ad network picks ads
+from the IP it sees. When a client visits a geo domain the proxy **marks that client's session**
+(`GEO_SESSION_TTL`, default 15m) and everything the page loads afterwards egresses Thai too, except for
+
+- domains the PAC already sends `DIRECT` (speedtest/apple/googlevideo) plus video/CDN — full speed kept
+- the server itself (keepalive/dashboard) — never pushed through the VPN
+- hosts listed in `GEO_SESSION_EXCLUDE`
+
+**Ads:** what counts as an "ad host" is the **real blocklist the proxy already loads**
+(`ADBLOCK_URL` / `ADBLOCK_PATH`, e.g. HaGeZi), not a hardcoded list — an ad host inside a geo session is
+**not blocked but egressed Thai**, which is what makes Thai ads appear (set `GEO_ADS_EGRESS=1` to route
+ads Thai for every client, or `GEO_SESSION=ads|off` to pick the mode).
+
+### 3. Geo domain list — nothing is built into the code
+
+**No domain is compiled into the binary.** The proxy merges its list from
+
+| Source | Details |
 |---|---|
-| `GEO_DOMAINS` | โดเมนคั่นด้วย comma/newline (env) |
-| `GEO_DOMAINS_FILE` | ไฟล์บรรทัดละโดเมน (ค่าเริ่มต้น `/opt/netninja/geo-domains.txt`) hot reload ~20s |
-| `GEO_DOMAINS_URL` | ดึงระยะไกลตอนบูต + refresh ทุก `GEO_REFRESH_HOURS` (ค่าเริ่มต้น 24h) cache ลงดิสก์ |
+| `GEO_DOMAINS` | domains separated by comma/newline (env) |
+| `GEO_DOMAINS_FILE` | one domain per line (default `/opt/netninja/geo-domains.txt`), hot reloaded ~20s |
+| `GEO_DOMAINS_URL` | fetched remotely at boot + refreshed every `GEO_REFRESH_HOURS` (default 24h), cached on disk |
 
-แหล่งที่ดึงไม่สำเร็จจะ **ไม่ล้างของเดิมทิ้ง** (ใช้ cache/รายการล่าสุดต่อ) ไฟล์ตัวอย่างอยู่ที่
-`geo-domains.example.txt` — copy ไปเป็น `/opt/netninja/geo-domains.txt` แล้วแก้ได้ทันที
-รองรับรูปแบบ adblock/hosts (`||example.com^`, `*.example.com`, `example.com:8080`),
-subdomain match อัตโนมัติ และ entry ที่มี label เดียวจะถูกปฏิเสธ (กัน `tv` ไปแมตช์ครึ่งเน็ต)
+A source that fails to load **does not wipe what is already there** (the cache / last known list stays
+in use). Copy `geo-domains.example.txt` to `/opt/netninja/geo-domains.txt` and edit it directly. It
+accepts adblock/hosts formats (`||example.com^`, `*.example.com`, `example.com:8080`), matches subdomains
+automatically, and rejects single-label entries (so `tv` cannot match half the internet).
 
-DNS ยัง resolve ที่ proxy (มี DoH fallback) ดังนั้น Cisco Umbrella ฝั่ง client ไม่เห็น query
+DNS still resolves at the proxy (with a DoH fallback), so Cisco Umbrella on the client side never sees
+the queries.
 
-ตรวจทุกอย่างได้ที่ `http://<server>:5988/geo-check` (เรียกจากนอกเครื่องจะถาม admin credentials —
-ดูหัวข้อ Endpoint access) — แสดง node แต่ละตัว (`CURRENT` / `ok` / `unusable`, ประเทศ, RTT, fails),
-โหมด session, ที่มา/จำนวนโดเมน และประเทศของ egress จริงทั้ง direct และผ่าน pool
+Check everything at `http://<server>:5988/geo-check` (from outside the machine it asks for admin
+credentials — see *Endpoint access*) — it shows every node (`CURRENT` / `ok` / `unusable`, country, RTT,
+fails), the session mode, the origin/count of the domain list, and the country of the real egress both
+direct and through the pool.
 
-### Performance (วัดจริง)
+### Performance (measured)
 
-- **dial path ของทุก connection เพิ่มแค่ ~211 ns และ 0 allocation** (benchmark: ลิสต์ 100k โดเมน
-  + ad list 50k, `go test -run '^$' -bench GeoEgressForDialPath -benchmem …`) — น้อยกว่า RTT ของ
-  การ dial (ms) หลายล้านเท่า
-- connection ที่ต้องออกไทยเพิ่ม ~1 µs (ต่อ connection) — ไม่มีนัยสำคัญเทียบ handshake
-- node ตาย = เสียเวลาแค่ round trip เดียว (failover ในตัว dial) ไม่ใช่รอ timeout ยาว
-- probe = 1 TCP connect / node / 20s + เช็คประเทศ 1 ครั้ง / node / 5m → load จิ๋วมาก
-  (ไม่กี่ request ต่อ 5 นาที ไม่กระทบข้อมูล ip-api free tier)
-- ตัวที่ช้าจริงคือ **tunnel เอง ไม่ใช่ proxy** — วัดได้ที่ `http://<server>:5988/geo-bench`
-  (ตาราง direct vs แต่ละ node: `tcp` / `connect` / `total` + ประเทศ) โดยไม่รบกวนสถานะ pool
-- video/CDN และโดเมนที่ PAC ส่ง `DIRECT` อยู่นอกเส้นทางไทยเสมอ → YouTube/Netflix ไม่ถูกดึงผ่าน VPN
+- **the dial path of every connection costs only ~211 ns and 0 allocations** (benchmark: a 100k-domain
+  geo list + a 50k ad list, `go test -run '^$' -bench GeoEgressForDialPath -benchmem …`) — millions of
+  times less than the dial RTT (ms)
+- a connection that actually egresses Thai adds ~1 µs — insignificant next to a handshake
+- a dead node costs one round trip (failover happens inside the dial), not a long timeout
+- probing is 1 TCP connect / node / 20s + a country check / node / 5m — a tiny load
+  (a few requests per 5 minutes, easy on the ip-api free tier)
+- what is really slow is **the tunnel, not the proxy** — measure it at `http://<server>:5988/geo-bench`
+  (a table of direct vs each node: `tcp` / `connect` / `total` + country) without disturbing pool state
+- video/CDN and the domains the PAC sends `DIRECT` always stay off the Thai path, so YouTube/Netflix are
+  never pulled through the VPN
 
 ### Country guard
 
-Country guard ยังอยู่ แต่เปลี่ยนหน้าที่: pool หมุนระหว่าง node ที่ยัง live เองอยู่แล้ว guard จึง
-ตื่นมาเฉพาะตอนที่ **ไม่มี node ไทยที่ healthy เลย** (และเรียก `GEO_ROTATE_CMD` ให้ server สร้าง tunnel ใหม่)
-มี cooldown/backoff กันหมุนรัว และบันทึกทุกครั้งลง `admin_logs`
+The country guard is still there, but its job changed: the pool now rotates between live nodes by
+itself, so the guard only wakes up when there is **no healthy Thai node at all** (and calls
+`GEO_ROTATE_CMD` to have the server build a new tunnel). It has cooldown/backoff against rotation
+storms and records every rotation in `admin_logs`.
 
-## PAC — ตั้ง iPad แบบ Auto (ไม่ต้องลงแอป)
+## PAC — iPad Auto mode (no app to install)
 
 ```
 Wi-Fi → (i) → Configure Proxy → Automatic → URL: http://<SERVER_IP>:5988/proxy.pac
 ```
 
-- จ่ายด้วย `Content-Type: application/x-ns-proxy-autoconfig` + `no-store` — ถ้า content type ผิด
-  iPadOS จะไม่ยอมใช้ Auto mode แบบเงียบ ๆ และ PAC ที่ cache ไว้จะค้างหลังย้าย `PROXY_ADDR`
-- PAC คืน `PROXY <server>:5988` เป็นค่าเริ่มต้น และ `DIRECT` เฉพาะ LAN/loopback กับโดเมนใน
-  `PAC_DIRECT_DOMAINS` (ค่าเริ่มต้น speedtest/apple/googlevideo) — **proxy เป็นคนเลือก Thai egress
-  เอง PAC จึงไม่ต้องรู้เรื่อง geo เลย**
-- alias `/wpad.dat` ชี้ไปไฟล์เดียวกัน
-- PAC มีผลกับ HTTP/HTTPS (Safari และแอปที่ใช้ CFNetwork) เหมือนโหมด Manual ทุกอย่างที่วิ่งผ่าน proxy
-- ไฟล์ PAC ต้องโหลดได้ **โดยไม่ผ่าน proxy** — เปิด `http://<SERVER_IP>:5988/proxy.pac`
-  ใน Safari บน iPad ควรเห็นสคริปต์ก่อนตั้งค่า (ถ้าเห็น = Auto ใช้ได้แน่นอน)
+- served with `Content-Type: application/x-ns-proxy-autoconfig` and `no-store` — with a wrong content
+  type iPadOS silently ignores Auto mode, and a cached PAC keeps pointing at the old address after
+  `PROXY_ADDR` changes
+- the PAC returns `PROXY <server>:5988` by default and `DIRECT` only for LAN/loopback and the domains in
+  `PAC_DIRECT_DOMAINS` (speedtest/apple/googlevideo by default) — **the proxy picks the Thai egress
+  itself, so the PAC needs to know nothing about geo**
+- the alias `/wpad.dat` serves the same file
+- the PAC affects HTTP/HTTPS (Safari and any app using CFNetwork) exactly like Manual mode — everything
+  goes through the proxy
+- the PAC file must be reachable **without** a proxy: open `http://<SERVER_IP>:5988/proxy.pac` in Safari
+  on the iPad and you should see the script before you configure anything (seeing it means Auto will work)
 
 ## Endpoint access (closed by default)
 
@@ -212,10 +256,10 @@ client IPs, visited hosts, domain lists), so they are **closed by default**:
 
 ## Bandwidth Management
 
-- `BW_GLOBAL_MBPS` / `BW_USER_MBPS` — token bucket pacing ทั้ง upload และ download
-  (per-user นับตาม username หรือ client IP ในโหมด no-auth)
+- `BW_GLOBAL_MBPS` / `BW_USER_MBPS` — token bucket pacing on both upload and download
+  (per-user keys off the username, or the client IP in no-auth mode)
 - `BW_BURST_KB` (default `256`) — burst allowance
-- `MAX_CONNS_PER_IP` — cap tunnel พร้อมกันต่อ IP กันอุปกรณ์ตัวเดียวลากเครื่องล่ม
+- `MAX_CONNS_PER_IP` — caps concurrent tunnels per IP so one device cannot take the box down
 
 ## Deploy
 
@@ -229,23 +273,25 @@ ssh -i azure-sg.key <USER>@<SERVER_IP> 'sudo bash /tmp/netninja-deploy.sh [--th-
 
 # ...and hand the server its Thai pool / domain list in the same run:
 ssh -i azure-sg.key <USER>@<SERVER_IP> \
-  'sudo bash /tmp/netninja-deploy.sh --th-nodes "<node1-host:port>,<node2-host:port>"'
+  'sudo bash /tmp/netninja-deploy.sh --th-nodes "<node1-host:port>,<node2-host:port>" --th-pool'
 
 ```
 
 On Windows there is a PowerShell helper (`netninja-deploy.ps1`) that scp's `dist\proxy_linux`
-(plus `geo-nodes.txt` / `geo-domains.txt` when present) and runs the same script over ssh.
-It carries **no server address**: the target comes from `NETNINJA_SERVER` / `NETNINJA_USER`
-or from a git-ignored `netninja.local.ps1` next to the script — so the public host never
-ends up in this repository (or its history).
+(plus `geo-nodes.txt` / `geo-domains.txt` when present) and runs the same script over ssh. It carries
+**no server address**: the target comes from `NETNINJA_SERVER` / `NETNINJA_USER` or from a git-ignored
+`netninja.local.ps1` next to the script — so the public host never ends up in this repository (or its
+history).
 
-Pool and domain list are plain files on the server, so a tunnel that comes up later only needs
-its `host:port` appended to `/opt/netninja/geo-nodes.txt` — the proxy joins it within ~20s.
+Pool and domain list are plain files on the server, so a tunnel that comes up later only needs its
+`host:port` appended to `/opt/netninja/geo-nodes.txt` — the proxy joins it within ~20s. Or let the
+supervisor do that: scp `netninja-th-pool.sh` / `netninja-th-pool.conf.example` along with the binary
+and add `--th-pool` (see *Supply side: `netninja-th-pool.sh`* above).
 
 ### Moving to another machine
 
-Nothing deployment-specific is tracked in this repository, so a new machine just needs the
-local files copied across (all git-ignored):
+Nothing deployment-specific is tracked in this repository, so a new machine just needs the local files
+copied across (all git-ignored):
 
 | File | Why |
 |---|---|
@@ -261,8 +307,8 @@ tar czf netninja-local.tgz netninja.local.ps1 azure-sg.key geo-nodes.txt geo-dom
 
 The proxy's own runtime settings live on the **server**, not in this repo: copy
 `/etc/systemd/system/netninja-proxy.service` (plus any `EnvironmentFile=` it points at) so
-`GEO_SOCKS5_POOL`, `GEO_DOMAINS_FILE`/`GEO_DOMAINS_URL`, `KEEPALIVE_HOST` and the bandwidth
-limits survive the move.
+`GEO_SOCKS5_POOL`, `GEO_DOMAINS_FILE`/`GEO_DOMAINS_URL`, `KEEPALIVE_HOST` and the bandwidth limits
+survive the move.
 
 ## Environment Variables
 
@@ -314,27 +360,34 @@ limits survive the move.
 | `DIAG_PUBLIC` | `0` | `1` = serve `/geo-check`, `/geo-bench`, `/logs`, `/ws`, `/` without credentials |
 | `TH_ROTATE_CMD` | `/opt/vpngate/vpngate-rotate.sh --force` | (deploy script) command used to rotate the egress on the server |
 | `HOP_SOCKS5` / `GEO_SOCKS5` | - | (server env) address the deploy script probes after rotating |
+| `TH_POOL_CONF` | `/etc/netninja/th-pool.conf` | (supervisor) where the slot definitions live |
+| `SLOTS` / `SLOT_<n>_SOCKS` / `SLOT_<n>_REPLACE` | - | (supervisor) slot count, its endpoint, and the command that rebuilds it |
+| `CHECK_INTERVAL` / `CHECK_TIMEOUT` | `60` / `12` | (supervisor) how often to check, and how long a probe may take |
+| `EXPECT_COUNTRY` | `TH` | (supervisor) country every published node must exit from |
+| `REPLACE_COOLDOWN` / `MAX_REPLACES_PER_HOUR` | `180` / `6` | (supervisor) per-slot cooldown and the hourly rotation budget |
 
 ## Troubleshooting
 
-วัดความเร็วก่อนตัดสินใจอะไร: `http://<server>:5988/geo-bench` (ต้องมี credential — ดู Endpoint
-access; อ่าน `total` ของแต่ละ node เทียบ `direct` — ถ้าเกิน 2-3 เท่าให้ทิ้ง node นั้นหรือลด `GEO_POOL_MAX_RTT`)
-เรียกจากในเครื่อง server เองได้เลยโดยไม่ต้องมี credential:
+Measure before you change anything: `http://<server>:5988/geo-bench` (needs credentials — see *Endpoint
+access*; read each node's `total` against `direct` — more than 2-3× means dropping that node or lowering
+`GEO_POOL_MAX_RTT`). From the server itself no credential is needed:
 `curl -s http://127.0.0.1:5988/geo-bench`
 
-`TROUBLESHOOTING.md` is kept **local only** (not tracked in this repository), so the quick checks
-live here:
+`TROUBLESHOOTING.md` is kept **local only** (not tracked in this repository), so the quick checks live
+here:
 
-- **OmeTV จับคู่ผิดประเทศ** — `http://<server>:5988/geo-check` ต้องมี node ที่ขึ้น `CURRENT` และ
-  `country=TH` ถ้าขึ้น `unusable` หมด: เปิด tunnel เพิ่มแล้ว append `host:port`
-  ลง `/opt/netninja/geo-nodes.txt` (proxy รับเองภายใน ~20s)
-- **geo ไม่ออกไทยเลย** — ใน geo-check ถ้าบรรทัด `domain list` ขึ้น `idle` = ยังไม่มีรายการ:
-  ตั้ง `GEO_DOMAINS_FILE` หรือ `GEO_DOMAINS_URL`
-- **โฆษณาไม่ขึ้นเป็นไทย** — ต้องอยู่ใน geo session (เข้าเว็บในลิสต์ก่อน) หรือตั้ง `GEO_ADS_EGRESS=1`
-- **iPad ใช้ Auto (PAC) ไม่ได้** — เปิด `http://<server>:5988/proxy.pac` ใน Safari ก่อน
-  ถ้าเห็นสคริปต์แต่ยังไม่ออก ให้ปิด/เปิด proxy ในการตั้งค่า Wi-Fi ใหม่ (iPad cache การตั้งค่าไว้)
-- **egress ช้า / node ตาย** — `journalctl -u netninja-proxy -n 120 | grep GEO` แสดงทุกครั้งที่ pool
-  หมุน node พร้อมเหตุผลและ RTT
+- **OmeTV matches the wrong country** — `http://<server>:5988/geo-check` must show a node marked
+  `CURRENT` with `country=TH`. If every node reads `unusable`, bring up another tunnel and append its
+  `host:port` to `/opt/netninja/geo-nodes.txt` (the proxy picks it up within ~20s).
+- **nothing egresses Thai at all** — in geo-check, a `domain list` line reading `idle` means there is no
+  list yet: set `GEO_DOMAINS_FILE` or `GEO_DOMAINS_URL`.
+- **ads are not Thai** — the client has to be inside a geo session (visit a listed site first), or set
+  `GEO_ADS_EGRESS=1`.
+- **iPad Auto (PAC) does not work** — open `http://<server>:5988/proxy.pac` in Safari first. If you can
+  see the script but traffic still does not go through, toggle the Wi-Fi proxy setting off and on
+  (iPadOS caches it).
+- **slow egress / dead node** — `journalctl -u netninja-proxy -n 120 | grep GEO` logs every pool
+  rotation with its reason and RTT.
 
 ## License
 
