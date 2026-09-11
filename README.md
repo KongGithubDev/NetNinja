@@ -197,9 +197,11 @@ ssh -i azure-sg.key <USER>@<SERVER_IP> \
 
 ```
 
-On Windows there is a local PowerShell helper (`netninja-deploy.ps1`) that scp's
-`dist\proxy_linux` (plus `geo-nodes.txt` / `geo-domains.txt` when present) and runs the same
-script over ssh. It is kept out of the repository on purpose: it carries the server address.
+On Windows there is a PowerShell helper (`netninja-deploy.ps1`) that scp's `dist\proxy_linux`
+(plus `geo-nodes.txt` / `geo-domains.txt` when present) and runs the same script over ssh.
+It carries **no server address**: the target comes from `NETNINJA_SERVER` / `NETNINJA_USER`
+or from a git-ignored `netninja.local.ps1` next to the script — so the public host never
+ends up in this repository (or its history).
 
 Pool and domain list are plain files on the server, so a tunnel that comes up later only needs
 its `host:port` appended to `/opt/netninja/geo-nodes.txt` — the proxy joins it within ~20s.
@@ -249,6 +251,7 @@ its `host:port` appended to `/opt/netninja/geo-nodes.txt` — the proxy joins it
 | `MAX_CONNS_PER_IP` | `0` | Concurrent tunnels allowed per client IP (`0` = unlimited) |
 | `ADBLOCK_URL` | - | URL to ad blocklist |
 | `PROXY_ADDR` | - | Server public address |
+| `KEEPALIVE_HOST` | - | Hostname logged specially as a keepalive ping (keeps real domains out of the source) |
 
 ## Troubleshooting
 

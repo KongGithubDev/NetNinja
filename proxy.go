@@ -2097,6 +2097,21 @@ func isLocalIP(ip string) bool {
 	return localIPs[ip]
 }
 
+// keepaliveHost is the keepalive hostname that gets its own log line. It is
+// configured with KEEPALIVE_HOST instead of being compiled in, so a deployment's
+// real domain never ships inside a public repository (empty = no special log).
+var (
+	keepaliveHostOnce sync.Once
+	keepaliveHostVal  string
+)
+
+func keepaliveHost() string {
+	keepaliveHostOnce.Do(func() {
+		keepaliveHostVal = strings.ToLower(strings.TrimSpace(os.Getenv("KEEPALIVE_HOST")))
+	})
+	return keepaliveHostVal
+}
+
 func getClientIP(r *http.Request) string {
 	ip := r.RemoteAddr
 	if idx := strings.LastIndex(ip, ":"); idx != -1 {
@@ -2966,7 +2981,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		colorCyan, colorReset,
 		host, clientIP, r.Header.Get("User-Agent"))
 
-	if strings.Contains(host, "<PROXY_HOST>") {
+	if kh := keepaliveHost(); kh != "" && strings.Contains(strings.ToLower(host), kh) {
 		log.Printf("%s[KEEPALIVE]%s %s ← %s",
 			colorGreen, colorReset, host, clientIP)
 	}
