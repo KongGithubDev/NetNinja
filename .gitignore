@@ -33,7 +33,6 @@ dist/
 proxy_linux*
 netninja-proxy-linux
 netninja-keepalive-linux
-netninja-proxy-hub-linux
 
 # ---------------------------------------------------------------------------
 # Runtime data
