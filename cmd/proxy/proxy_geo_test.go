@@ -116,6 +116,257 @@ func TestGeoPoolSticksThenFailsOver(t *testing.T) {
 	}
 }
 
+// resetGeoSiblingForTest clears the missing-sibling findings and restores the
+// switch afterwards, so one test's hits never leak into the next one.
+func resetGeoSiblingForTest(t testing.TB) {
+	t.Helper()
+	geoMissingSiblingMu.Lock()
+	geoMissingSiblingHits = map[string]*geoSiblingHit{}
+	geoMissingSiblingDropped = 0
+	geoMissingSiblingMu.Unlock()
+	prev := geoSiblingOff
+	geoSiblingOff = false
+	t.Cleanup(func() {
+		geoSiblingOff = prev
+		geoMissingSiblingMu.Lock()
+		geoMissingSiblingHits = map[string]*geoSiblingHit{}
+		geoMissingSiblingDropped = 0
+		geoMissingSiblingMu.Unlock()
+	})
+}
+
+func TestGeoBaseName(t *testing.T) {
+	cases := map[string]string{
+		"ometv.com":     "ometv",
+		"ometv.chat":    "ometv",
+		"api.ometv.net": "ometv",
+		"ome.tv":        "ome",
+		"y99.in":        "y99",
+		"a.b.c.example": "c",
+		"localhost":     "",
+		"com":           "",
+		"":              "",
+	}
+	for in, want := range cases {
+		if got := geoBaseName(in); got != want {
+			t.Errorf("geoBaseName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestGeoSiblingOfPicksTheOtherTLD(t *testing.T) {
+	ds := buildGeoDomainSet([]string{"ometv.com", "ome.tv", "y99.in"})
+	cases := []struct {
+		host   string
+		listed string
+		ok     bool
+	}{
+		// the case that started this: ometv.com on the list, the .chat mirror off it
+		{"ometv.chat", "ometv.com", true},
+		{"api.ometv.chat", "ometv.com", true},
+		{"OMETV.NET:443", "ometv.com", true}, // case folded, port stripped by the caller
+		{"www.ometv.app", "ometv.com", true},
+		// hosts the list already covers are never "missing"
+		{"ometv.com", "", false},
+		{"api.ome.tv", "", false},
+		// unrelated names stay quiet
+		{"www.example.com", "", false},
+		{"notome.tv", "", false},
+		{"chatroulette.com.chat", "", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		host := trimHostPort(c.host)
+		if !asciiLower(host) {
+			host = strings.ToLower(host)
+		}
+		listed, ok := geoSiblingOf(ds, host)
+		if ok != c.ok || listed != c.listed {
+			t.Errorf("geoSiblingOf(%q) = (%q,%v), want (%q,%v)", c.host, listed, ok, c.listed, c.ok)
+		}
+	}
+}
+
+func TestNoteMissedGeoSiblingRecordsOncePerHost(t *testing.T) {
+	geoDomains.Store(buildGeoDomainSet([]string{"ometv.com", "ome.tv"}))
+	defer geoDomains.Store(&geoDomainSet{set: map[string]struct{}{}})
+	resetGeoSiblingForTest(t)
+
+	for i := 0; i < 3; i++ {
+		noteMissedGeoSibling("api.ometv.chat:443")
+	}
+	// a listed host, an unrelated host and an empty one must not show up
+	noteMissedGeoSibling("www.ome.tv")
+	noteMissedGeoSibling("www.example.com")
+	noteMissedGeoSibling("")
+
+	hits, dropped := geoMissingSiblingSnapshot()
+	if len(hits) != 1 || dropped != 0 {
+		t.Fatalf("findings = %+v (dropped %d), want exactly one", hits, dropped)
+	}
+	if hits[0].Host != "api.ometv.chat" || hits[0].Listed != "ometv.com" || hits[0].Count != 3 {
+		t.Fatalf("hit = %+v, want api.ometv.chat ← ometv.com counted 3 times", hits[0])
+	}
+
+	status := geoMissingSiblingStatus()
+	if !strings.HasPrefix(status, "missing siblings (1):") || !strings.Contains(status, "api.ometv.chat") {
+		t.Fatalf("geo-check block = %q, want a one-hit section", status)
+	}
+}
+
+func TestNoteMissedGeoSiblingIsBounded(t *testing.T) {
+	geoDomains.Store(buildGeoDomainSet([]string{"ometv.com"}))
+	defer geoDomains.Store(&geoDomainSet{set: map[string]struct{}{}})
+	resetGeoSiblingForTest(t)
+
+	const extra = 7
+	for i := 0; i < geoMissingSiblingMax+extra; i++ {
+		noteMissedGeoSibling(fmt.Sprintf("h%d.ometv.net", i))
+	}
+	hits, dropped := geoMissingSiblingSnapshot()
+	if len(hits) != geoMissingSiblingMax || dropped != extra {
+		t.Fatalf("findings = %d (dropped %d), want %d (dropped %d)", len(hits), dropped, geoMissingSiblingMax, extra)
+	}
+	if status := geoMissingSiblingStatus(); !strings.Contains(status, "capped") {
+		t.Fatalf("overflow must be visible in geo-check, got %q", status)
+	}
+	// an already recorded host keeps counting even when the report is full
+	noteMissedGeoSibling("h0.ometv.net")
+	hits, _ = geoMissingSiblingSnapshot()
+	if hits[0].Count != 2 {
+		t.Fatalf("h0.ometv.net count = %d, want 2", hits[0].Count)
+	}
+}
+
+func TestGeoSiblingFindingsClearWhenTheListCoversThem(t *testing.T) {
+	geoDomains.Store(buildGeoDomainSet([]string{"ometv.com"}))
+	defer geoDomains.Store(&geoDomainSet{set: map[string]struct{}{}})
+	resetGeoSiblingForTest(t)
+
+	noteMissedGeoSibling("api.ometv.chat")
+	if hits, _ := geoMissingSiblingSnapshot(); len(hits) != 1 {
+		t.Fatalf("findings = %+v, want the api.ometv.chat hit", hits)
+	}
+
+	// The operator adds the missing mirror, the list hot-reloads: the warning
+	// has to end by itself instead of repeating until the next restart.
+	fixed := buildGeoDomainSet([]string{"ometv.com", "ometv.chat"})
+	geoSiblingPrune(fixed)
+	if hits, _ := geoMissingSiblingSnapshot(); len(hits) != 0 {
+		t.Fatalf("findings after the list was fixed = %+v, want none", hits)
+	}
+	if status := geoMissingSiblingStatus(); !strings.Contains(status, "none seen") {
+		t.Fatalf("geo-check still reports a finding: %q", status)
+	}
+
+	// A host the list does not cover yet keeps its finding.
+	noteMissedGeoSibling("api.ometv.net")
+	geoSiblingPrune(fixed)
+	hits, _ := geoMissingSiblingSnapshot()
+	if len(hits) != 1 || hits[0].Host != "api.ometv.net" {
+		t.Fatalf("findings = %+v, want only api.ometv.net", hits)
+	}
+}
+
+func TestGeoStatusJSONCarriesMissingSiblings(t *testing.T) {
+	geoDomains.Store(buildGeoDomainSet([]string{"ometv.com"}))
+	defer geoDomains.Store(&geoDomainSet{set: map[string]struct{}{}})
+	resetGeoSiblingForTest(t)
+
+	noteMissedGeoSibling("api.ometv.chat")
+
+	rec := httptest.NewRecorder()
+	serveGeoStatusJSON(rec, httptest.NewRequest("GET", "http://proxy.example/geo-status.json", nil))
+
+	var got struct {
+		Domains  int `json:"domains"`
+		Siblings []struct {
+			Host   string `json:"host"`
+			Listed string `json:"listed"`
+			Dials  int64  `json:"dials"`
+		} `json:"missing_siblings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("status json is not decodable: %v", err)
+	}
+	if len(got.Siblings) != 1 {
+		t.Fatalf("missing_siblings = %+v, want one entry", got.Siblings)
+	}
+	if got.Siblings[0].Host != "api.ometv.chat" || got.Siblings[0].Listed != "ometv.com" || got.Siblings[0].Dials != 1 {
+		t.Fatalf("missing_siblings[0] = %+v, want api.ometv.chat ← ometv.com ×1", got.Siblings[0])
+	}
+	if got.Domains != 1 {
+		t.Fatalf("domains = %d, want the list size to stay untouched", got.Domains)
+	}
+}
+
+// The sibling check sits on the dial path, so the ordinary host — a name that is
+// not on the list — must cost a probe and nothing else.
+func BenchmarkGeoSiblingCheckDialPath(b *testing.B) {
+	list := make([]string, 0, 100000)
+	list = append(list, "ome.tv", "ometv.com")
+	for i := 0; i < 100000; i++ {
+		list = append(list, fmt.Sprintf("site%d.example%d.com", i, i%997))
+	}
+	geoDomains.Store(buildGeoDomainSet(list))
+	defer geoDomains.Store(&geoDomainSet{set: map[string]struct{}{}})
+	resetGeoSiblingForTest(b)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		noteMissedGeoSibling("www.somewhere.example")
+	}
+}
+
+// A dial the client canceled must not be charged to the node: the browser went
+// away, the tunnel did not fail. Counting it retired a healthy node and cut
+// every session riding on it, which is what made a live chat drop and come back
+// on a different egress.
+func TestGeoPoolIgnoresClientCanceledDials(t *testing.T) {
+	geoPoolMaxRTT = 1500 * time.Millisecond
+	geoPoolSlowHits = 3
+	geoPoolFailHits = 2
+	nodes := resetGeoPoolForTest(t, "a:1080", "b:1080")
+	a := nodes[0]
+
+	for i := 0; i < geoPoolFailHits+1; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := dialGeoThai(ctx, "example.com:443", "geo"); err == nil {
+			t.Fatalf("canceled dial %d: err = nil, want the cancellation back", i)
+		}
+	}
+
+	a.mu.Lock()
+	fails, up := a.fails, a.up
+	a.mu.Unlock()
+	if fails != 0 || !up {
+		t.Fatalf("after %d canceled dials: fails=%d up=%v, want 0/true — a client that left must not retire a healthy node", geoPoolFailHits+1, fails, up)
+	}
+}
+
+// The mirror image: a node that really refuses the connection still has to lose
+// its turn, or the pool would never fail over off a dead tunnel.
+func TestGeoPoolStillCountsRealDialFailures(t *testing.T) {
+	geoPoolMaxRTT = 1500 * time.Millisecond
+	geoPoolSlowHits = 3
+	geoPoolFailHits = 2
+	nodes := resetGeoPoolForTest(t, "127.0.0.1:1", "127.0.0.1:2")
+
+	dialGeoThai(context.Background(), "example.com:443", "geo")
+
+	fails := 0
+	for _, n := range nodes {
+		n.mu.Lock()
+		fails += n.fails
+		n.mu.Unlock()
+	}
+	if fails == 0 {
+		t.Fatal("a refused dial left every node at fails=0 — real failures stopped counting")
+	}
+}
+
 func TestGeoPoolRotatesOffSlowNode(t *testing.T) {
 	geoPoolMaxRTT = 100 * time.Millisecond
 	geoPoolSlowHits = 2

@@ -32,12 +32,20 @@
 # egress countries read "unverified" for ~20s, and a blip is not a lost spare.
 : "${ALERT_AFTER:=2}"
 
+# Alert on /geo-check's `missing siblings` too: a host that left with the
+# server's own country while a *listed* site shares its name (api.ometv.chat
+# against a list holding ometv.com). It is a wrong-country leak, not an outage,
+# so it alerts on its own transition and clears itself once the list gains the
+# entry. 0 = keep it in the journal/log only, without leaving the box.
+: "${SIBLING_ALERT:=1}"
+
 # ---------------------------------------------------------------------------
 # where else to shout — empty means journal + log file only
 # ---------------------------------------------------------------------------
 # ALERT_CMD runs through `sh -c` with ALERT_SUBJECT / ALERT_BODY (and
-# POOL_HEALTH_VERIFIED / POOL_HEALTH_NODES) in the environment, and the body on
-# stdin. Single quotes keep the $variables for the alert, not for this file.
+# POOL_HEALTH_VERIFIED / POOL_HEALTH_NODES / POOL_HEALTH_MISSING_SIBLINGS) in
+# the environment, and the body on stdin. Single quotes keep the $variables for
+# the alert, not for this file.
 #
 # ntfy.sh — no account. The topic is the only secret: pick something long and
 # random, then subscribe to https://ntfy.sh/<topic> in the app or the browser.

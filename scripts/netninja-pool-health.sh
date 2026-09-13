@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# netninja-pool-health.sh — alert when the Thai egress pool loses its spare.
+# netninja-pool-health.sh — alert when the Thai egress pool loses its spare, or
+# when a geo-listed site's mirror on another TLD still exits this server.
 #
 #   ./netninja-pool-health.sh             # check + alert on a transition (timer)
 #   ./netninja-pool-health.sh --status    # show what it sees, alert nothing
@@ -13,6 +14,14 @@
 # is also handed to that command (ntfy, Telegram, a webhook — see the .example).
 # It fires on a transition, then at most every ALERT_REPEAT_MIN minutes while the
 # pool stays thin, and once when it recovers.
+#
+# The same path carries one more finding, the only one the routing cannot see by
+# itself: /geo-check's `missing siblings`. The proxy reports a host that left
+# with this server's own country while a *listed* site shares its name
+# (`api.ometv.chat` against a list holding `ometv.com`) — the page looks Thai
+# while the peer matching runs on the wrong country. Those get their own alert
+# (SIBLING_ALERT=0 silences just that one), and they clear on their own once the
+# list gains the entry, because the proxy drops findings the new list covers.
 #
 # Configuration: /etc/netninja/pool-health.conf. Every value can also come from
 # the environment, which is also how to exercise the alert path by hand.
@@ -39,6 +48,7 @@ EXPECT_COUNTRY=${EXPECT_COUNTRY:-TH}
 ALERT_CMD=${ALERT_CMD:-}
 ALERT_REPEAT_MIN=${ALERT_REPEAT_MIN:-60}
 ALERT_AFTER=${ALERT_AFTER:-2}
+SIBLING_ALERT=${SIBLING_ALERT:-1}
 STATE_DIR=${STATE_DIR:-/var/lib/netninja-pool-health}
 LOG_FILE=${LOG_FILE:-/var/log/netninja-pool-health.log}
 MODE=${1:-check}
@@ -62,7 +72,7 @@ alert() {
   if [ -n "$ALERT_CMD" ]; then
     if ALERT_SUBJECT="$subject" ALERT_BODY="$body" \
        POOL_HEALTH_VERIFIED="${verified:-0}" POOL_HEALTH_MIN="$MIN_NODES" \
-       POOL_HEALTH_NODES="${nodes:-}" \
+       POOL_HEALTH_NODES="${nodes:-}" POOL_HEALTH_MISSING_SIBLINGS="${siblings:-0}" \
        sh -c "$ALERT_CMD" >> "$LOG_FILE" 2>&1; then
       log_line "alert delivered via ALERT_CMD"
     else
@@ -76,6 +86,8 @@ verified=0
 configured=0
 nodes=""
 detail=""
+siblings=0
+sibling_detail=""
 
 if [ -z "$raw" ]; then
   status=unknown
@@ -95,6 +107,19 @@ else
     END { printf "%d\t%s", n + 0, (list == "" ? "(none published)" : list) }')
   verified=${parsed%%$'\t'*}
   nodes=${parsed#*$'\t'}
+
+  # `missing siblings (N):` is the proxy naming dials that should have left from
+  # EXPECT_COUNTRY but did not. A proxy too old to print the line reports zero,
+  # which is also what "nothing wrong" looks like — hence the build stamp in the
+  # alert body when there is one.
+  siblings=$(printf '%s\n' "$raw" | sed -n 's/^missing siblings (\([0-9][0-9]*\)).*/\1/p' | head -1)
+  siblings=${siblings:-0}
+  sibling_detail=$(printf '%s\n' "$raw" | awk '
+    /^missing siblings \(/ { insib = 1; next }
+    insib && /^[[:space:]]+/ { sub(/^[[:space:]]+/, ""); body = body (body == "" ? "" : "; ") $0; next }
+    insib { insib = 0 }
+    END { print body }')
+
   if [ "$verified" -ge "$MIN_NODES" ]; then
     status=healthy
   else
@@ -110,6 +135,12 @@ if [ "$MODE" = "--status" ]; then
   printf 'verified    : %s node(s) out of %s required (%s)\n' "$verified" "$MIN_NODES" "$EXPECT_COUNTRY"
   printf 'nodes       :%s\n' "${nodes:- (unknown)}"
   printf 'alert after : %s bad check(s), then every %s min\n' "$ALERT_AFTER" "$ALERT_REPEAT_MIN"
+  if [ "$siblings" -gt 0 ]; then
+    printf 'missing sibs: %s finding(s), alert %s\n' "$siblings" "$([ "$SIBLING_ALERT" = 0 ] && echo off || echo on)"
+    printf 'missing list: %s\n' "$sibling_detail"
+  else
+    printf 'missing sibs: none reported by the proxy\n'
+  fi
   [ -z "$detail" ] || printf 'detail      : %s\n' "$detail"
   [ "$status" = healthy ] && exit 0
   [ "$status" = unhealthy ] && exit 1
@@ -123,10 +154,16 @@ fi
 prev_status=""
 prev_count=0
 prev_epoch=0
+prev_sibs=0
+prev_sibs_epoch=0
 if [ -f "$STATE_FILE" ]; then
-  read -r prev_status prev_count prev_epoch < "$STATE_FILE" 2>/dev/null || true
+  # Older state files carry only the first three fields; the missing ones read as
+  # empty and fall back to zero, so an upgrade does not re-alert on the pool.
+  read -r prev_status prev_count prev_epoch prev_sibs prev_sibs_epoch < "$STATE_FILE" 2>/dev/null || true
   [ -n "$prev_count" ] || prev_count=0
   [ -n "$prev_epoch" ] || prev_epoch=0
+  [ -n "$prev_sibs" ] || prev_sibs=0
+  [ -n "$prev_sibs_epoch" ] || prev_sibs_epoch=0
 fi
 now=$(date +%s)
 mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -167,6 +204,31 @@ if [ "$status" != "healthy" ]; then
   fi
 fi
 
-log_line "pool $status: $verified/$MIN_NODES verified $EXPECT_COUNTRY node(s), configured=${configured:-?}"
-printf '%s %s %s\n' "$status" "$count" "$prev_epoch" > "$STATE_FILE" 2>/dev/null || true
+# --- missing sibling hosts --------------------------------------------------
+# Kept out of the pool status: a thin pool is an outage, this is a wrong-country
+# leak that only the proxy can see, and it heals by editing the domain list.
+if [ "$siblings" -gt 0 ]; then
+  if [ -n "$sibling_detail" ]; then
+    sibling_body="$sibling_detail. Add the missing domain(s) to /opt/netninja/geo-domains.txt — it hot reloads within ~20s, and $PROXY_URL then reports the finding as gone."
+  else
+    sibling_body="$siblings host(s) left with this server's country while a listed site shares their name; see $PROXY_URL"
+  fi
+  if [ "$prev_sibs" -le 0 ]; then
+    [ "$SIBLING_ALERT" = "0" ] || alert "Geo list is missing a sibling host" "$sibling_body"
+    prev_sibs_epoch=$now
+  elif [ $((now - prev_sibs_epoch)) -ge $((ALERT_REPEAT_MIN * 60)) ]; then
+    [ "$SIBLING_ALERT" = "0" ] || alert "Geo list is still missing a sibling host" "$sibling_body"
+    prev_sibs_epoch=$now
+  fi
+  prev_sibs=$siblings
+else
+  if [ "$prev_sibs" -gt 0 ]; then
+    log_line "missing sibling hosts cleared — nothing left that should have egressed $EXPECT_COUNTRY"
+  fi
+  prev_sibs=0
+  prev_sibs_epoch=0
+fi
+
+log_line "pool $status: $verified/$MIN_NODES verified $EXPECT_COUNTRY node(s), configured=${configured:-?}, missing siblings=$siblings"
+printf '%s %s %s %s %s\n' "$status" "$count" "$prev_epoch" "$prev_sibs" "$prev_sibs_epoch" > "$STATE_FILE" 2>/dev/null || true
 exit "$rc"

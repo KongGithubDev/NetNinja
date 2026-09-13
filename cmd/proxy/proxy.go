@@ -1643,6 +1643,10 @@ func hopDial(ctx context.Context, network, hostname, address string) (net.Conn, 
 		}
 		return customDialer.DialContext(ctx, network, address)
 	}
+	// Nothing on the list carries this host, so it leaves with this server's own
+	// country: if a listed site shares its name, that is the list missing a
+	// mirror, and it is worth saying out loud — no other check can see it.
+	noteMissedGeoSibling(hostname)
 	useHop := inHopDomains(hostname)
 	if !useHop {
 		useHop = autoClassify(hostname)
@@ -5561,6 +5565,8 @@ func guardHandler(next http.HandlerFunc) http.HandlerFunc {
 //   GEO_REFRESH_HOURS=24   refresh interval for the URL
 //   GEO_EXPECT_COUNTRY=TH  country a geo egress must exit from
 //   GEO_DOMAINS_DISABLE=1  turn geo routing off
+//   GEO_SIBLING_DISABLE=1  stop reporting siblings of listed sites that still
+//                          leave from this server's country
 // ===========================================================================
 
 // geoDomainSet is an immutable list swapped in atomically. A lookup walks the
@@ -5569,6 +5575,12 @@ func guardHandler(next http.HandlerFunc) http.HandlerFunc {
 type geoDomainSet struct {
 	list []string
 	set  map[string]struct{}
+	// bases maps every listed site's name — the label before the TLD, `ometv`
+	// for `ometv.com` — to the domain that brought it in. It feeds the missing
+	// sibling check below: a *direct* dial of another host with the same name
+	// (`ometv.chat`, `api.ometv.net`) means the list is missing that site's
+	// mirror, which nothing else in the proxy can tell from ordinary traffic.
+	bases map[string]string
 }
 
 var (
@@ -5643,7 +5655,17 @@ func buildGeoDomainSet(list []string) *geoDomainSet {
 		uniq = append(uniq, d)
 	}
 	sort.Strings(uniq)
-	return &geoDomainSet{list: uniq, set: set}
+	bases := make(map[string]string, len(uniq))
+	for _, d := range uniq {
+		b := geoBaseName(d)
+		if b == "" {
+			continue
+		}
+		if _, ok := bases[b]; !ok {
+			bases[b] = d
+		}
+	}
+	return &geoDomainSet{list: uniq, set: set, bases: bases}
 }
 
 func geoDomainCount() int {
@@ -5746,6 +5768,7 @@ func refreshGeoDomains(reason string) {
 
 	ds := buildGeoDomainSet(merged)
 	geoDomains.Store(ds)
+	geoSiblingPrune(ds)
 	geoDomainsLast = ds.list
 	geoDomainsAt = time.Now()
 	geoDomainsSrc = strings.Join(sources, ",")
@@ -5799,6 +5822,10 @@ func initGeoDomains() {
 		geoDomainsOff = true
 		log.Printf("%s[GEO]%s disabled by GEO_DOMAINS_DISABLE", colorYellow, colorReset)
 		return
+	}
+	if v := strings.TrimSpace(os.Getenv("GEO_SIBLING_DISABLE")); v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "off") {
+		geoSiblingOff = true
+		log.Printf("%s[GEO]%s missing-sibling detection off (GEO_SIBLING_DISABLE)", colorYellow, colorReset)
 	}
 	geoDomains.Store(&geoDomainSet{set: map[string]struct{}{}})
 
@@ -5874,6 +5901,216 @@ func inGeoDomains(host string) bool {
 		h = h[i+1:]
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Missing sibling detection
+//
+// A geo session can only fix what the list names. Run ometv.chat while the list
+// holds just ometv.com and every connection of that site leaves with this
+// server's own country, so the peer matching quietly picks the wrong peers — and
+// unlike a dead tunnel or a node exiting the wrong country, nothing else in the
+// proxy can separate that from ordinary traffic. So every dial the route cannot
+// carry is compared against the site names the list *does* know: a hit
+// (same name, other TLD) is logged once, kept for /geo-check, and picked up by
+// the pool-health timer — which is where the alert path (journal + ALERT_CMD)
+// already lives.
+//
+//   GEO_SIBLING_DISABLE=1  turn the detection off
+// ---------------------------------------------------------------------------
+
+// geoBaseName is a host's site name: the label right before the last one, so
+// `ometv.com`, `ometv.chat` and `api.ometv.net` all answer `ometv`. It stops at
+// one label instead of consulting a public-suffix list — the geo list is a
+// handful of single-TLD entries, and a wrong guess here only ever costs one
+// warning line, never a routing decision.
+func geoBaseName(host string) string {
+	i := strings.LastIndexByte(host, '.')
+	if i <= 0 {
+		return ""
+	}
+	rest := host[:i]
+	if j := strings.LastIndexByte(rest, '.'); j >= 0 {
+		rest = rest[j+1:]
+	}
+	return rest
+}
+
+// asciiLower reports a string that needs no case folding, which lets the dial
+// path skip strings.ToLower (and its copy) for essentially every host.
+func asciiLower(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// trimHostPort drops a trailing :port, allocation-free, so the sibling check can
+// look at a host before paying for a normalized copy of it.
+func trimHostPort(host string) string {
+	h := strings.TrimSuffix(host, ".")
+	i := strings.LastIndexByte(h, ':')
+	if i <= 0 {
+		return h
+	}
+	for k := i + 1; k < len(h); k++ {
+		if h[k] < '0' || h[k] > '9' {
+			return h
+		}
+	}
+	return h[:i]
+}
+
+// geoDomainCovered reports a host the list already routes — itself or through a
+// parent label (`api.ome.tv` is covered by `ome.tv`, and never reaches the
+// direct path in the first place).
+func geoDomainCovered(ds *geoDomainSet, host string) bool {
+	for h := host; h != ""; {
+		if _, ok := ds.set[h]; ok {
+			return true
+		}
+		i := strings.IndexByte(h, '.')
+		if i < 0 {
+			return false
+		}
+		h = h[i+1:]
+	}
+	return false
+}
+
+// geoSiblingOf reports the listed domain that shares its site name with host,
+// and whether there is one: with `ometv.com` on the list, `api.ometv.chat`
+// answers (`ometv.com`, true) while `example.com` and `api.ome.tv` answer
+// ("", false) — the second one because the list already covers it, so it is not
+// a missing entry. The name probe comes first so that the (rare) coverage walk
+// only runs for hosts that actually look like a sibling.
+func geoSiblingOf(ds *geoDomainSet, host string) (string, bool) {
+	if ds == nil || len(ds.bases) == 0 || host == "" {
+		return "", false
+	}
+	base := geoBaseName(host)
+	if base == "" {
+		return "", false
+	}
+	if !asciiLower(base) {
+		base = strings.ToLower(base)
+	}
+	listed, ok := ds.bases[base]
+	if !ok || geoDomainCovered(ds, host) {
+		return "", false
+	}
+	return listed, true
+}
+
+type geoSiblingHit struct {
+	Host   string // the host that left with this server's country
+	Listed string // the listed domain that shares its name
+	First  time.Time
+	Count  int64
+}
+
+// Findings are a diagnostic, not a ledger: a bounded map keeps a hostile or
+// broken client from growing it without bound, and the overflow is reported
+// instead of silently dropped.
+const geoMissingSiblingMax = 64
+
+var (
+	geoSiblingOff            bool
+	geoMissingSiblingMu      sync.Mutex
+	geoMissingSiblingHits    = map[string]*geoSiblingHit{}
+	geoMissingSiblingDropped int64
+)
+
+// noteMissedGeoSibling records one host that is leaving with this server's own
+// country (or the non-geo hop) while a listed site shares its name. It runs on
+// the dial path, so the common case — a host whose site name is not on the list
+// — costs one map probe and no allocation.
+func noteMissedGeoSibling(host string) {
+	if geoSiblingOff {
+		return
+	}
+	ds := geoDomains.Load()
+	if ds == nil || len(ds.bases) == 0 {
+		return
+	}
+	h := trimHostPort(host)
+	listed, ok := geoSiblingOf(ds, h)
+	if !ok {
+		return
+	}
+
+	geoMissingSiblingMu.Lock()
+	if hit, seen := geoMissingSiblingHits[h]; seen {
+		hit.Count++
+		geoMissingSiblingMu.Unlock()
+		return
+	}
+	if len(geoMissingSiblingHits) >= geoMissingSiblingMax {
+		geoMissingSiblingDropped++
+		geoMissingSiblingMu.Unlock()
+		return
+	}
+	geoMissingSiblingHits[h] = &geoSiblingHit{Host: h, Listed: listed, First: time.Now(), Count: 1}
+	geoMissingSiblingMu.Unlock()
+
+	log.Printf("%s[GEO][missing]%s %s left with this server's country while %s is on the geo list — same name %q on another TLD; add %s if that site should exit %s",
+		colorYellow, colorReset, h, listed, geoBaseName(listed), h, geoExpectCountry())
+}
+
+// geoSiblingPrune drops the findings a freshly loaded list now covers, so the
+// warning ends the moment the operator adds the missing domain — the list
+// hot-reloads within ~20s, while the process would otherwise keep reporting it
+// until the next restart.
+func geoSiblingPrune(ds *geoDomainSet) {
+	if ds == nil {
+		return
+	}
+	geoMissingSiblingMu.Lock()
+	defer geoMissingSiblingMu.Unlock()
+	for host := range geoMissingSiblingHits {
+		if geoDomainCovered(ds, host) {
+			delete(geoMissingSiblingHits, host)
+		}
+	}
+}
+
+// geoMissingSiblingSnapshot copies the findings out, oldest first, for the
+// diagnostics endpoints and the pool-health timer.
+func geoMissingSiblingSnapshot() ([]geoSiblingHit, int64) {
+	geoMissingSiblingMu.Lock()
+	defer geoMissingSiblingMu.Unlock()
+	out := make([]geoSiblingHit, 0, len(geoMissingSiblingHits))
+	for _, h := range geoMissingSiblingHits {
+		out = append(out, *h)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].First.Equal(out[j].First) {
+			return out[i].Host < out[j].Host
+		}
+		return out[i].First.Before(out[j].First)
+	})
+	return out, geoMissingSiblingDropped
+}
+
+// geoMissingSiblingStatus renders the findings for /geo-check. The first line is
+// its stable interface: scripts parse the count off `missing siblings (N):`.
+func geoMissingSiblingStatus() string {
+	hits, dropped := geoMissingSiblingSnapshot()
+	if len(hits) == 0 {
+		return "missing siblings: none seen — a listed site's mirror on another TLD would be named here"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "missing siblings (%d):", len(hits))
+	for _, h := range hits {
+		fmt.Fprintf(&b, "\n  %s — not on the list, but %s shares the name %q (%d dial(s), first seen %s)",
+			h.Host, h.Listed, geoBaseName(h.Listed), h.Count, h.First.Format("15:04:05"))
+	}
+	if dropped > 0 {
+		fmt.Fprintf(&b, "\n  (+%d more not recorded — findings are capped at %d)", dropped, geoMissingSiblingMax)
+	}
+	return b.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -6342,6 +6579,14 @@ func dialGeoThai(ctx context.Context, address, why string) (net.Conn, error) {
 		start := time.Now()
 		c, err := dialSocks5(ctx, n.addr, address)
 		rtt := time.Since(start)
+		if dialCanceled(err) {
+			// The client closed the tab or refreshed mid-handshake. That says
+			// nothing about the node, and counting it as a strike retires a
+			// healthy node — which drops every session riding on it, so the
+			// client's next attempt lands on a different egress. Stop here too:
+			// no other node can help a client that is already gone.
+			return nil, err
+		}
 		geoMarkResult(n, err, rtt)
 		if err == nil {
 			if geoPoolMaxRTT > 0 && rtt > geoPoolMaxRTT {
@@ -6356,6 +6601,14 @@ func dialGeoThai(ctx context.Context, address, why string) (net.Conn, error) {
 		lastErr = fmt.Errorf("no healthy %s egress available (%d node(s) configured)", geoExpectCountry(), geoPoolSize())
 	}
 	return nil, lastErr
+}
+
+// dialCanceled reports whether a dial failed because the caller went away (the
+// browser closed or refreshed) instead of because the node is unhealthy. Go's
+// net package reports a canceled dial as "operation was canceled" but keeps it
+// Is(context.Canceled), so this sees through the SOCKS5 wrapper as well.
+func dialCanceled(err error) bool {
+	return errors.Is(err, context.Canceled)
 }
 
 func geoPoolStatusLines() []string {
@@ -6862,13 +7115,20 @@ func serveGeoStatusJSON(w http.ResponseWriter, r *http.Request) {
 		Nodes   int    `json:"nodes"`
 		Current string `json:"current,omitempty"`
 	}
+	type siblingInfo struct {
+		Host   string `json:"host"`
+		Listed string `json:"listed"`
+		Dials  int64  `json:"dials"`
+	}
 	type status struct {
-		Expect   string   `json:"expect"`
-		Thai     bool     `json:"thai"`
-		Country  string   `json:"country,omitempty"`
-		Pool     poolInfo `json:"pool"`
-		Sessions int64    `json:"sessions"`
-		Domains  int      `json:"domains"`
+		Expect    string        `json:"expect"`
+		Thai      bool          `json:"thai"`
+		Country   string        `json:"country,omitempty"`
+		Pool      poolInfo      `json:"pool"`
+		Sessions  int64         `json:"sessions"`
+		Domains   int           `json:"domains"`
+		Siblings  []siblingInfo `json:"missing_siblings,omitempty"`
+		SibMissed int64         `json:"missing_siblings_dropped,omitempty"`
 	}
 
 	st := status{
@@ -6876,6 +7136,12 @@ func serveGeoStatusJSON(w http.ResponseWriter, r *http.Request) {
 		Pool:     poolInfo{On: geoPoolOn, Nodes: geoPoolSize()},
 		Sessions: atomic.LoadInt64(&geoSessionLive),
 		Domains:  geoDomainCount(),
+	}
+	if hits, dropped := geoMissingSiblingSnapshot(); len(hits) > 0 || dropped > 0 {
+		st.SibMissed = dropped
+		for _, h := range hits {
+			st.Siblings = append(st.Siblings, siblingInfo{Host: h.Host, Listed: h.Listed, Dials: h.Count})
+		}
 	}
 	if cur := geoPoolCurrentAddr(); cur != "" {
 		st.Pool.Current = cur
@@ -6911,6 +7177,7 @@ func serveGeoCheck(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "hop socks5     : %q (non-geo hop domains)\n", hopSocks5)
 	fmt.Fprintf(w, "hop domains    : %d configured, %d auto-detected\n", len(hopDomains), len(hopAuto))
 	fmt.Fprintf(w, "geo domains(%d): %s\n\n", geoDomainCount(), strings.Join(geoDomainList(), ", "))
+	fmt.Fprintf(w, "%s\n\n", geoMissingSiblingStatus())
 
 	if nodes := geoPoolStatusLines(); len(nodes) > 0 {
 		fmt.Fprintf(w, "egress pool (%d node(s), current %s):\n%s\n\n", len(nodes), geoPoolCurrentAddr(), strings.Join(nodes, "\n"))
