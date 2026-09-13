@@ -326,6 +326,39 @@ reload drops the ones the new list covers. The check is one map probe (~50ns, no
 dial path and never changes routing: the entry is still added by hand, because it is a guess about someone
 else's infrastructure. `GEO_SIBLING_DISABLE=1` turns the detection off.
 
+#### A site's entry point is usually not on its own domain
+
+The list also has to name the hosts a site's *client* uses to be placed, not just the site. OmeTV is the
+worked example: `ome.tv` serves the page, `api.ometv.chat` answers the country list, but the country the
+app itself believes in is decided when its client opens `wss://point-of-entry.com/ws` and then keeps the
+chat on `wss://r-point-of-entry.com:8443` — and neither is a `.ome.tv` host. Those connections only ride
+the session mark, which lasts `GEO_SESSION_TTL` (15m) and needs a listed domain to have been touched
+first, so a cold start, a reconnect or a chat that outlives the window leaves them on the server's own
+country. The result is the split OmeTV showed here: the site (and the country it prints) Thai, the entry
+point Malaysian, and every partner after that Malaysian too.
+
+The check is OmeTV's own endpoint, which moves the caller's country to the front of the list:
+
+```
+$ curl -s https://api.ometv.chat/api/v1/countries | head -c 60       # direct
+[{"id":150,"alias":"my", …                                          # Malaysia first
+$ curl -s --socks5-hostname 172.30.77.3:1080 https://api.ometv.chat/api/v1/countries | head -c 60
+[{"id":206,"alias":"th", …                                          # Thailand first
+```
+
+So the hosts a client is placed by belong in the list next to the site they serve — and there is a trap in
+writing them down: `r-point-of-entry.com` and `x-point-of-entry.com` are **not** subdomains of
+`point-of-entry.com`. The `r-`/`x-` are glued into the second-level label, so each is its own registrable
+domain and the matcher — which walks up real labels, and must — will never reach one from the other. That
+is why this list carries three separate lines, and why the relay that actually carries the chat
+(`r-point-of-entry.com:8443`) has to be named on its own. A lookalike such as
+`point-of-entry.com.evil.example` still stays unlisted; subdomains of a listed name
+(`video-delivery.x-point-of-entry.com`) are covered as usual.
+
+If listing an asset drags something you would rather keep fast onto the Thai node — the landing-page promo
+mp4 under `video-delivery.x-point-of-entry.com` — pull just that host back off the path with
+`GEO_SESSION_EXCLUDE=video-delivery.x-point-of-entry.com`; it is a video file, not part of the match.
+
 DNS still resolves at the proxy (with a DoH fallback), so Cisco Umbrella on the client side never sees
 the queries.
 

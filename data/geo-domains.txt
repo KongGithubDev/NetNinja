@@ -26,6 +26,26 @@ ometv.net
 ometv.chat
 ome-tv.to
 ometv.app
+# OmeTV's client does not stay on .ome.tv: the page calls the entry point at
+# point-of-entry.com, and the chat itself runs on r-point-of-entry.com:8443.
+# The room, and with it the country of every partner, follows the address those
+# connections come from — OmeTV's own endpoint shows it, /api/v1/countries puts
+# the caller's country first (`my` dialled direct, `th` through the Thai pool).
+# Leaving them out is what makes the site say Thailand while the matching runs
+# on the server's country; the 15-minute session mark only covers them after a
+# listed domain has been touched, so a cold start outlives it.
+#
+# Needed as three lines, NOT one: r- and x- are glued into the second-level
+# label, so `r-point-of-entry.com` and `x-point-of-entry.com` are separate
+# registrable domains and `point-of-entry.com` does not cover them (the matcher
+# walks up real labels only, as it must).
+point-of-entry.com
+r-point-of-entry.com
+# Video/asset delivery for the landing page (promo mp4). Listed so no OmeTV
+# host can ever leave from this server's country; if the Thai node's bandwidth
+# matters more than that page being fast, take just this one back off the path
+# with GEO_SESSION_EXCLUDE=video-delivery.x-point-of-entry.com.
+x-point-of-entry.com
 omegle.com
 omegle.tv
 chatroulette.com
