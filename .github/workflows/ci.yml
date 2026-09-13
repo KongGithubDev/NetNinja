@@ -1,0 +1,101 @@
+# Continuous integration for every push and pull request.
+#
+# Same gates `make check` runs locally, plus the shell syntax check the deploy
+# scripts depend on: a broken quote in netninja-deploy.sh only shows up when
+# someone is already on the server, which is the worst possible time.
+#
+# gofmt is checked, never applied: CI must fail on unformatted code, not silently
+# rewrite the tree. `gofmt -l cmd` prints the offending files.
+
+name: CI
+
+on:
+  push: # every branch, plus tags
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes the running job pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: gofmt, vet and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l cmd)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean - run 'make fmt':"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+      - name: go vet
+        run: go vet ./cmd/...
+
+      # -count=1 defeats the test result cache, so a re-run really re-runs.
+      - name: go test
+        run: go test -count=1 ./cmd/...
+
+  shell:
+    name: shell syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Parse every tracked script. This is a syntax gate only: it never executes
+      # a deploy, a pool script, or anything that touches the server.
+      - name: bash -n
+        run: |
+          fail=0
+          while IFS= read -r script; do
+            if bash -n "$script"; then
+              echo "ok   $script"
+            else
+              echo "FAIL $script"
+              fail=1
+            fi
+          done < <(git ls-files '*.sh')
+          exit "$fail"
+
+      # Windows PowerShell 5.1 reads a BOM-less .ps1 with the system ANSI
+      # codepage, not UTF-8. A single UTF-8 dash or Thai character then decodes
+      # into a curly quote, PowerShell takes that as a string delimiter, and the
+      # script stops parsing before it runs - while PowerShell 7 (and anyone
+      # reading it as UTF-8) sees nothing wrong. The deploy helper must stay
+      # ASCII-only, and this is the only check that notices.
+      - name: .ps1 stays ASCII
+        run: |
+          python3 - <<'PY'
+          import pathlib, subprocess, sys
+
+          files = subprocess.check_output(['git', 'ls-files', '*.ps1'], text=True).split()
+          bad = 0
+          for name in files:
+              raw = pathlib.Path(name).read_bytes()
+              if raw[:3] == b'\xef\xbb\xbf':
+                  print(f'note {name}: UTF-8 BOM present')
+              hits = [i + 1 for i, line in enumerate(raw.split(b'\n')) if any(b > 127 for b in line)]
+              if hits:
+                  print(f'FAIL {name}: non-ASCII bytes on line(s) {hits[:5]}')
+                  bad = 1
+              else:
+                  print(f'ok   {name}')
+          if not files:
+              print('no .ps1 files to check')
+          sys.exit(bad)
+          PY
