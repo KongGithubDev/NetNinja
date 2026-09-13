@@ -1,4 +1,11 @@
-# netninja-deploy.ps1 — deploy the new NetNinja proxy binary to the proxy VM.
+# netninja-deploy.ps1 - deploy the new NetNinja proxy binary to the proxy VM.
+#
+# KEEP THIS FILE ASCII-ONLY. Windows PowerShell 5.1 reads a BOM-less .ps1 with
+# the system ANSI codepage, not UTF-8: the three UTF-8 bytes of a dash or of a
+# Thai character decode into curly quotes, PowerShell treats a curly quote as a
+# string delimiter, and the file stops parsing before a single line runs (seen
+# as "Unexpected token ... Missing closing '}'" on a line far below the cause).
+# Plain ASCII is byte-identical in every codepage, so it cannot break this way.
 #
 # The public host address deliberately does NOT live in this file: the
 # repository is public, so the target and the key stay on your machine. Point it
@@ -9,8 +16,8 @@
 #         $env:NETNINJA_SERVER = '<server-ip-or-host>'
 #         $env:NETNINJA_USER   = '<ssh-user>'
 #
-# Run it yourself (it needs the remote root credential, which stays on this
-# machine — it is read as a SecureString and piped straight into ssh):
+# Run it yourself (it needs the remote password, which stays on this machine -
+# it is read as a SecureString and piped straight into ssh):
 #
 #   powershell -ExecutionPolicy Bypass -File .\scripts\netninja-deploy.ps1 -ThaiEgress
 #   powershell -ExecutionPolicy Bypass -File .\scripts\netninja-deploy.ps1 -ThaiPool
@@ -121,7 +128,7 @@ if (-not $domainsFile) {
 
 # The pool supervisor (optional): it keeps the tunnels listed in the pool file
 # alive by itself. Its real config (/etc/netninja/th-pool.conf) stays on the
-# server — only the script and the example config are uploaded here.
+# server - only the script and the example config are uploaded here.
 $supervisor = Join-Path $Repo 'scripts\netninja-th-pool.sh'
 if (Test-Path $supervisor) {
     Write-Host "== uploading Thai pool supervisor ($supervisor) ==" -ForegroundColor Cyan
@@ -155,7 +162,8 @@ if ($ThaiPool)      { $remoteCmd += ' --th-pool' }
 if ($GeoDomainsUrl) { $remoteCmd += " --geo-url '$GeoDomainsUrl'" }
 if ($NoKeepalive)   { $remoteCmd += ' --no-keepalive' }
 
-Write-Host "== remote root password for $target (only used for this command) ==" -ForegroundColor Yellow
+Write-Host "== the password here is the ssh user's, NOT root's: sudo asks for" -ForegroundColor Yellow
+Write-Host "   $target's own password, and it is used for this one command only ==" -ForegroundColor Yellow
 $secure = Read-Host -AsSecureString -Prompt "password"
 $bstr   = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
 try {
@@ -164,7 +172,7 @@ try {
     # sudo -S reads the password from the first line of stdin; the deploy script
     # itself never reads stdin, so the rest of the pipe is free.
     $plain + "`n" | ssh @sshOpts -T $target "sudo -S $remoteCmd"
-    if ($LASTEXITCODE -ne 0) { throw "remote deploy failed (see output above — the script rolls the binary back automatically)" }
+    if ($LASTEXITCODE -ne 0) { throw "remote deploy failed (see output above - the script rolls the binary back automatically)" }
 }
 finally {
     if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
@@ -172,9 +180,9 @@ finally {
 }
 
 Write-Host ""
-Write-Host "== geo-check (ยืนยันว่า ometv จะเห็นประเทศไหน) ==" -ForegroundColor Cyan
+Write-Host "== geo-check (confirm ometv sees a Thai address) ==" -ForegroundColor Cyan
 ssh @sshOpts $target "curl -s --max-time 40 http://127.0.0.1:5988/geo-check"
 
 Write-Host ""
-Write-Host "เสร็จแล้ว — จากเครื่องนี้เปิด http://${Server}:5988/geo-check ได้เลย" -ForegroundColor Green
-Write-Host "(host นี้ไม่ได้ถูกเก็บในไฟล์นี้ — มาจาก env หรือ netninja.local.ps1 เท่านั้น)" -ForegroundColor DarkGray
+Write-Host "done - open http://${Server}:5988/geo-check from this machine" -ForegroundColor Green
+Write-Host "(the host itself is never stored in this file - it comes from the env or netninja.local.ps1)" -ForegroundColor DarkGray
