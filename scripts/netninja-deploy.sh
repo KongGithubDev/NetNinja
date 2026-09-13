@@ -101,6 +101,20 @@ if [ -f /tmp/geo-domains.txt ]; then
   echo -n "domains: "
   grep -cvE '^\s*(#|$)' /opt/netninja/geo-domains.txt || true
   echo "(edit this file directly — it reloads in ~20s; or set GEO_DOMAINS_URL for a shared list)"
+else
+  # Never let a stale list pass silently: without /tmp/geo-domains.txt this run
+  # leaves /opt/netninja/geo-domains.txt untouched, which is how an edit made in
+  # the repository can look like it "did nothing" on the proxy.
+  echo
+  echo "== geo domain list =="
+  if [ -f /opt/netninja/geo-domains.txt ]; then
+    echo "no /tmp/geo-domains.txt in this run — keeping the list already on the server"
+    echo -n "domains: "
+    grep -cvE '^\s*(#|$)' /opt/netninja/geo-domains.txt || true
+    echo "(scp the list to /tmp/geo-domains.txt before this script to replace it)"
+  else
+    echo "no /tmp/geo-domains.txt and no /opt/netninja/geo-domains.txt — geo routing has no domain list"
+  fi
 fi
 
 # The pool *supervisor* is optional: install it when it was scp'd along with the

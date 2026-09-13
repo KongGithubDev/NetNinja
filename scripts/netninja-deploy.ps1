@@ -32,7 +32,9 @@
 #   3. print /geo-check so you can confirm geo traffic exits from Thailand
 #
 # Secrets and per-deployment data (azure-sg.key, netninja.local.ps1,
-# geo-nodes.txt, geo-domains.txt) live untracked in the repository root.
+# geo-nodes.txt, geo-domains.txt) live untracked in the repository root. The geo
+# domain list is also tracked (data\geo-domains.txt), so the shipped list is
+# uploaded when the root copy is absent.
 param(
     [string]$Server = $env:NETNINJA_SERVER,
     [string]$User   = $env:NETNINJA_USER,
@@ -95,14 +97,23 @@ if (-not $SkipUpload) {
 # The Thai egress pool and the geo domain list are data files on the server.
 # Upload the local copies when they exist (geo-nodes.txt = one host:port per
 # line, optional; geo-domains.txt = the domain list, replaced if present).
+# The list this deployment ships is tracked as data\geo-domains.txt; an
+# untracked geo-domains.txt in the repository root overrides it. Checking both
+# is what keeps a local edit (data\...) from silently never reaching the proxy:
+# with only the root copy looked at, the server would keep an old list forever.
 $poolFile = Join-Path $Repo 'geo-nodes.txt'
 if (Test-Path $poolFile) {
     Write-Host "== uploading Thai egress pool file ($poolFile) ==" -ForegroundColor Cyan
     scp @sshOpts -- $poolFile "${target}:/tmp/geo-nodes.txt"
     if ($LASTEXITCODE -ne 0) { throw "scp of geo-nodes.txt failed" }
 }
-$domainsFile = Join-Path $Repo 'geo-domains.txt'
-if (Test-Path $domainsFile) {
+$domainsFile = @(
+    (Join-Path $Repo 'geo-domains.txt'),
+    (Join-Path $Repo 'data\geo-domains.txt')
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $domainsFile) {
+    Write-Host "no geo-domains.txt (root) or data\geo-domains.txt - the server keeps the list it already has" -ForegroundColor Yellow
+} else {
     Write-Host "== uploading geo domain list ($domainsFile) ==" -ForegroundColor Cyan
     scp @sshOpts -- $domainsFile "${target}:/tmp/geo-domains.txt"
     if ($LASTEXITCODE -ne 0) { throw "scp of geo-domains.txt failed" }

@@ -47,7 +47,8 @@ iPad (Wi-Fi proxy:5988) ──→ Azure VM (proxy:5988) ──→ Internet
 cmd/proxy/       the forward proxy      — go build ./cmd/proxy
 cmd/keepalive/   the keepalive page     — go build ./cmd/keepalive
 scripts/         netninja-deploy.sh / .ps1, the Thai pool supervisor + its offline test
-examples/        templates to copy: geo-domains, th-pool.conf, netninja.local.ps1
+examples/        templates to copy: th-pool.conf, netninja.local.ps1
+data/            geo-domains.txt — the geo domain list itself, served over GEO_DOMAINS_URL
 Makefile         make · test · selftest · check · clean
 dist/            build output, git-ignored — `make` regenerates it
 ```
@@ -152,6 +153,9 @@ OmeTV ──TLS/WS──> proxy (MY) ──SOCKS5──> Thai pool ──> OmeTV
 - **rotates immediately** when a node dies (`GEO_POOL_FAIL_STRIKES` in a row) or is slower than
   `GEO_POOL_MAX_RTT` for `GEO_POOL_SLOW_STRIKES` in a row, and **fails over inside a single dial**,
   so a dead node costs one round trip instead of a timeout
+- **never charges a dial the client canceled to a node** — closing the tab or refreshing mid-handshake is
+  the browser going away, not the tunnel failing; counting it retired a healthy node and cut every session
+  riding on it, which is how a live chat dropped and came back on a different egress
 - calls `GEO_ROTATE_CMD` to have the server build a new tunnel when no Thai node is usable at all
   (with cooldown/backoff)
 - `GEO_STRICT=1` (default) — **fails** instead of leaking out through the server's own country
@@ -237,6 +241,12 @@ minutes while the pool stays thin, and once when it recovers. The deploy script 
 `/opt/netninja/netninja-pool-health.sh` behind `netninja-pool-health.timer` (every 2 minutes), and a thin pool
 leaves `netninja-pool-health.service` **failed**, so `systemctl --failed` shows it too.
 
+The same path carries the one finding the pool cannot see: the proxy's `missing siblings` — a listed site's
+mirror on another TLD that is still exiting this server's country. It alerts on its own transition (body:
+the host and the domain to add), repeats with `ALERT_REPEAT_MIN`, clears itself when the list gains the entry,
+and `SIBLING_ALERT=0` silences just that alert while the pool alerts keep working. `ALERT_CMD` also receives
+`POOL_HEALTH_MISSING_SIBLINGS`.
+
 ### 2. Geo session — Thai ads as well
 
 One web page pulls in dozens of third-party domains (ad slots, captcha, analytics) and no list covers
@@ -273,9 +283,30 @@ instead of being refused; outside it they are blocked like any other ad host. Ad
 | `GEO_DOMAINS_URL` | fetched remotely at boot + refreshed every `GEO_REFRESH_HOURS` (default 24h), cached on disk |
 
 A source that fails to load **does not wipe what is already there** (the cache / last known list stays
-in use). Copy `examples/geo-domains.example.txt` to `/opt/netninja/geo-domains.txt` and edit it directly. It
+in use). The list this deployment ships lives in `data/geo-domains.txt`; the deploy helper uploads it, or copy it to `/opt/netninja/geo-domains.txt` and edit it directly. It
 accepts adblock/hosts formats (`||example.com^`, `*.example.com`, `example.com:8080`), matches subdomains
 automatically, and rejects single-label entries (so `tv` cannot match half the internet).
+
+#### A missing entry reports itself — siblings on other TLDs
+
+A geo session can only fix what the list names, and the failure it hides is the quiet one: run `ometv.chat`
+while the list holds just `ometv.com` and every connection of that site leaves with the server's own country —
+the page looks Thai while the peer matching runs on the wrong country. No pool check can see that, because it
+looks exactly like ordinary traffic. So every dial the route *cannot* carry is compared against the names the
+list already knows (`ometv` from `ometv.com`, `ome` from `ome.tv`); a hit is a listed site's mirror on another
+TLD:
+
+```
+[GEO][missing] api.ometv.chat left with this server's country while ometv.com is on the geo list
+               — same name "ometv" on another TLD; add api.ometv.chat if that site should exit TH
+```
+
+It is logged once per host, shown in `/geo-check` as `missing siblings` and in `/geo-status.json` as
+`missing_siblings` (so the keepalive page or any scraper can read it), and `netninja-pool-health.sh` turns it
+into an alert on the box's usual channel. Findings disappear on their own once the list gains the entry — a
+reload drops the ones the new list covers. The check is one map probe (~50ns, no allocation) on the direct
+dial path and never changes routing: the entry is still added by hand, because it is a guess about someone
+else's infrastructure. `GEO_SIBLING_DISABLE=1` turns the detection off.
 
 DNS still resolves at the proxy (with a DoH fallback), so Cisco Umbrella on the client side never sees
 the queries.
@@ -385,8 +416,8 @@ come up. `--no-keepalive` deploys the proxy only; `--geo-url` writes
 `/etc/systemd/system/netninja-proxy.service.d/geo-url.conf` so `GEO_DOMAINS_URL` survives unit edits.
 
 On Windows there is a PowerShell helper (`scripts\netninja-deploy.ps1`) that scp's `dist\proxy_linux`
-**and** `dist\keepalive_linux` (plus `geo-nodes.txt` / `geo-domains.txt` when present, and the pool
-supervisor) and runs the same script over ssh. It carries **no server address**: the target comes from `NETNINJA_SERVER` / `NETNINJA_USER` or
+**and** `dist\keepalive_linux` (plus `geo-nodes.txt` and `geo-domains.txt` — an untracked root copy wins,
+otherwise it uploads the tracked `data\geo-domains.txt` — and the pool supervisor) and runs the same script over ssh. It carries **no server address**: the target comes from `NETNINJA_SERVER` / `NETNINJA_USER` or
 from a git-ignored `netninja.local.ps1` in the repository root — so the public host never ends up in this
 repository (or its history).
 
@@ -453,6 +484,7 @@ survive the move — and `/etc/netninja/th-pool.conf` for the pool supervisor.
 | `GEO_SESSION_EXCLUDE` | - | Extra hosts kept on the direct path |
 | `GEO_ADS_EGRESS` | `0` | `1` = route ad hosts Thai for every client, not just sessions |
 | `GEO_DOMAINS_DISABLE` | `0` | `1` = turn geo routing off |
+| `GEO_SIBLING_DISABLE` | `0` | `1` = stop reporting a listed site's mirror on another TLD that still egresses direct |
 | `PAC_DIRECT_DOMAINS` | built-in set | Extra hosts sent DIRECT by the PAC file and the session router |
 | `GEO_GUARD` | `1` | Re-check the hop's country and rotate the egress when it drifts (`0` = off) |
 | `GEO_ROTATE_CMD` | `/bin/bash /opt/vpngate/vpngate-rotate.sh --force` | Command used to rotate the egress |
@@ -493,7 +525,16 @@ here:
 
 - **OmeTV matches the wrong country** — `http://<server>:5988/geo-check` must show a node marked
   `CURRENT` with `country=TH`. If every node reads `unusable`, bring up another tunnel and append its
-  `host:port` to `/opt/netninja/geo-nodes.txt` (the proxy picks it up within ~20s).
+  `host:port` to `/opt/netninja/geo-nodes.txt` (the proxy picks it up within ~20s). Then check that the
+  host is really on the server's list: `grep -c ometv /opt/netninja/geo-domains.txt`. A session that only
+  half-egresses (the page is Thai, the peer matching is not) is a missing entry; a session that never
+  changes at all is usually a list that was edited in the repository but never uploaded — the deploy
+  script prints which list it installed, and keeps the old one when this run brought none. `missing siblings`
+  in the same geo-check output names the entry to add (e.g. `api.ometv.chat` while `ometv.com` is listed),
+  and clears itself on the next list reload.
+- **a domain-list edit changed nothing** — the proxy reads `/opt/netninja/geo-domains.txt`, not the
+  repository. Run the deploy helper again (it uploads the list and reports `domains: <n>`), or edit the
+  file on the server directly; either way it reloads within ~20s and `geo-check` prints the list size.
 - **nothing egresses Thai at all** — in geo-check, a `domain list` line reading `idle` means there is no
   list yet: set `GEO_DOMAINS_FILE` or `GEO_DOMAINS_URL`.
 - **ads are not Thai** — the client has to be inside a geo session (visit a listed site first), or set

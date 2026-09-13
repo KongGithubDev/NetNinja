@@ -20,6 +20,10 @@
 ome.tv
 ometv.com
 ometv.net
+# The client logs in and loads the match list from its API host, which lives on
+# .chat. Leaving it out makes the site egress Thai while the API keeps the
+# server's own country, so login and the site disagree about where you are.
+ometv.chat
 ome-tv.to
 ometv.app
 omegle.com
