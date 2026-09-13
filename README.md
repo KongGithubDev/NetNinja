@@ -48,8 +48,9 @@ cmd/proxy/       the forward proxy      — go build ./cmd/proxy
 cmd/keepalive/   the keepalive page     — go build ./cmd/keepalive
 scripts/         netninja-deploy.sh / .ps1, the Thai pool supervisor + its offline test
 examples/        templates to copy: th-pool.conf, netninja.local.ps1
-data/            geo-domains.txt — the geo domain list itself, served over GEO_DOMAINS_URL
+.github/         ci.yml — gofmt + vet + tests + shell syntax on every push
 Makefile         make · test · selftest · check · clean
+data/            geo-domains.txt — the geo domain list itself, served over GEO_DOMAINS_URL
 dist/            build output, git-ignored — `make` regenerates it
 ```
 
@@ -77,6 +78,23 @@ go test ./cmd/...
 
 The build stamp is compiled in, so `/geo-check` and the dashboard print exactly which binary is
 running.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs the same gates on **every push and pull request**, so a broken build
+or an unformatted file never waits for the next deploy:
+
+- `gofmt -l cmd` — checked, never applied; the job fails and names the files instead of rewriting them
+- `go vet ./cmd/...`
+- `go test -count=1 ./cmd/...` — `-count=1` defeats the test result cache
+- `bash -n` over every tracked `*.sh` — the deploy, pool and vpngate scripts
+- every tracked `*.ps1` must stay pure ASCII — Windows PowerShell 5.1 reads a BOM-less `.ps1` with the
+  system ANSI codepage, so a single UTF-8 dash (or Thai character) decodes into a curly quote and stops
+  the deploy helper from parsing at all, while PowerShell 7 still reports it as fine
+
+It is a syntax gate only: CI never runs a deploy, a pool script or anything that touches the server,
+and it only needs `contents: read`. Run the same gates by hand with `make check`, `bash -n
+scripts/*.sh` and an ASCII check over `*.ps1`.
 
 ### Deploy to Azure VM
 
@@ -378,6 +396,23 @@ client IPs, visited hosts, domain lists), so they are **closed by default**:
 - `/geo-bench` answers one request at a time (single-flight) so it cannot be used to hammer the
   tunnels or the country lookup.
 
+### Which password opens which page
+
+Two unrelated credential sets, and using the wrong one looks like a login loop rather than a
+authorisation failure:
+
+| Browser prompt | Username | Password |
+|---|---|---|
+| `NetNinja Diagnostics` — `/`, `/status`, `/geo-check`, `/logs`, `/ws` | `ADMIN_USER` (default `admin`) | `ADMIN_PASS` |
+| `NetNinja Admin` — `/admin*` | `ADMIN_USER` | `ADMIN_PASS` |
+| `NetNinja Settings` — `/settings` | a `PROXY_USERS` name | that user's password, or `ADMIN_PASS` |
+
+`PROXY_AUTH_ENABLED=0` does **not** mean "no credentials anywhere": it stops the proxy asking the
+*client* for a username, and `PROXY_USERS` is discarded while it boots (so `/settings` then accepts
+only the admin pair) — the dashboard keeps its own gate either way. It also means **the forward proxy
+port accepts anyone**, including traffic to geo-listed hosts that leaves through the Thai pool, so
+keep that port closed to the internet (firewall or an allowlist) whenever auth is off.
+
 ## Bandwidth Management
 
 - `BW_GLOBAL_MBPS` / `BW_USER_MBPS` — token bucket pacing on both upload and download
@@ -457,8 +492,8 @@ survive the move — and `/etc/netninja/th-pool.conf` for the pool supervisor.
 | `PORT` | `5988` | Proxy listen port(s), comma-separated |
 | `PROXY_AUTH_ENABLED` | `0` | Enable user authentication |
 | `PROXY_USERS` | - | `user:pass` pairs, comma-separated |
-| `ADMIN_USER` | `admin` | Dashboard username |
-| `ADMIN_PASS` | - | Dashboard password |
+| `ADMIN_USER` | `admin` | Dashboard username (the `NetNinja Diagnostics` / `NetNinja Admin` realm) |
+| `ADMIN_PASS` | - | Dashboard password — also opens `/geo-check`, `/logs`, `/ws`, `/status` |
 | `HOP_SOCKS5` | - | SOCKS5 proxy for blocked domains |
 | `HOP_DOMAINS` | - | Domains to route via SOCKS5 |
 | `GEO_SOCKS5_POOL` | - | Thai egress pool entries, `host:port` comma separated |
